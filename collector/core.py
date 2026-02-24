@@ -26,8 +26,11 @@ from serial.tools import list_ports
 from .protocol import (
     FRAME_TYPE_HANDSHAKE,
     FRAME_TYPE_HEARTBEAT,
+    FRAME_TYPE_RX_RAW,
+    PAYLOAD_TYPE_GRP_TXT,
     FrameReader,
 )
+from .crypto import try_decode_group_message
 from .store import CollectorStore
 
 
@@ -67,7 +70,9 @@ class CollectorCore:
         self.on_connected: Callable = None
         self.on_disconnected: Callable = None
         self.on_error: Callable = None
+        self.on_channel_message: Callable = None
 
+        self._channels = []
         self._ser = None
         self._store = None
         self._reader = None
@@ -87,6 +92,10 @@ class CollectorCore:
     @property
     def store(self):
         return self._store
+
+    def set_channels(self, channels):
+        """Set the list of Channel objects for group message decoding."""
+        self._channels = list(channels)
 
     def start(self):
         """Start the collector on a background thread."""
@@ -108,6 +117,15 @@ class CollectorCore:
         self._running = True
         self._store = CollectorStore(self.db_path)
         self._store.open()
+
+        # Load channels from config if none were set explicitly
+        if not self._channels:
+            try:
+                from .config import load_config, load_channels
+                config = load_config()
+                self._channels = load_channels(config)
+            except Exception:
+                pass
 
         try:
             self._connect_and_collect()
@@ -186,10 +204,27 @@ class CollectorCore:
         self._fire_disconnected("Stopped by user")
 
     def _process_frame(self, frame):
-        """Store frame and fire callback."""
+        """Store frame, attempt channel decode, and fire callbacks."""
         self._store.store_frame(frame)
         if self.on_frame:
             self.on_frame(frame)
+
+        # Try to decode group channel messages
+        if (
+            self._channels
+            and frame["type"] == FRAME_TYPE_RX_RAW
+            and frame.get("parsed")
+            and frame["parsed"].get("payload_type") == PAYLOAD_TYPE_GRP_TXT
+        ):
+            raw = frame["parsed"].get("raw")
+            if raw and isinstance(raw, bytes):
+                msg = try_decode_group_message(
+                    raw, self._channels, frame.get("received_at", time.time())
+                )
+                if msg:
+                    self._store.store_channel_message(msg)
+                    if self.on_channel_message:
+                        self.on_channel_message(msg)
 
     def _fire_text(self, line):
         if self.on_text:

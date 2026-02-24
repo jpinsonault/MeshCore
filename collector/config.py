@@ -15,6 +15,7 @@ DEFAULTS = {
     "port": None,
     "baud": 115200,
     "db_path": "collector.db",
+    "channels": [],
 }
 
 
@@ -30,6 +31,31 @@ def load_config(path=None):
         except (json.JSONDecodeError, OSError):
             pass
     return config
+
+
+def load_channels(config):
+    """Parse channel entries from config into Channel objects.
+
+    Config format:
+        {"channels": [{"name": "MeshCore Public", "psk": "base64..."}]}
+
+    Returns list of Channel objects. Silently skips invalid entries.
+    """
+    from .crypto import Channel
+
+    channels = []
+    entries = config.get("channels") or []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name", "")
+        psk = entry.get("psk", "")
+        if name and psk:
+            try:
+                channels.append(Channel.from_psk(name, psk))
+            except (ValueError, Exception):
+                pass
+    return channels
 
 
 def save_config(config, path=None):

@@ -33,3 +33,9 @@ class CollectorError:
     """Fired on non-fatal errors."""
     def __init__(self, message):
         self.message = message
+
+
+class ChannelMessage:
+    """Fired when a group channel message is decoded."""
+    def __init__(self, msg):
+        self.msg = msg

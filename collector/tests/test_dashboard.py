@@ -13,11 +13,13 @@ from pyos.testing import MockScreen, HarnessApplication
 
 from collector.activities.dashboard import DashboardActivity, _fmt_uptime, _fmt_time
 from collector.events import (
+    ChannelMessage,
     CollectorConnected,
     CollectorDisconnected,
     CollectorError,
     CollectorFrame,
 )
+from collector.crypto import GroupMessage
 from collector.protocol import (
     FRAME_TYPE_RX_RAW,
     FRAME_TYPE_TX_RAW,
@@ -298,3 +300,80 @@ class TestDashboardKeyboard:
         initial_idx = activity.display_state["packets"]["selected_index"]
         app.send_key(curses.KEY_DOWN)
         assert activity.display_state["packets"]["selected_index"] == initial_idx + 1
+
+
+def _group_msg(sender="Alice", text="Hello", channel="Public"):
+    return GroupMessage(
+        timestamp=1700000000,
+        sender=sender,
+        text=text,
+        channel_name=channel,
+        channel_hash=0xAA,
+        raw_timestamp=time.time(),
+    )
+
+
+class TestDashboardChannelMessage:
+    def test_channel_message_increments_counter(self, app, mock_screen):
+        activity = _make_dashboard()
+        app.start_activity(activity)
+
+        app.dispatch_event(ChannelMessage(_group_msg()))
+        app.drain()
+
+        assert activity._channel_msg_count == 1
+        assert activity._channel_count == 1
+
+    def test_multiple_channel_messages(self, app, mock_screen):
+        activity = _make_dashboard()
+        app.start_activity(activity)
+
+        app.dispatch_event(ChannelMessage(_group_msg(channel="Public")))
+        app.dispatch_event(ChannelMessage(_group_msg(channel="Private")))
+        app.dispatch_event(ChannelMessage(_group_msg(channel="Public")))
+        app.drain()
+
+        assert activity._channel_msg_count == 3
+        assert activity._channel_count == 2
+
+    def test_channel_stats_shown_after_message(self, app, mock_screen):
+        activity = _make_dashboard()
+        app.start_activity(activity)
+
+        app.dispatch_event(ChannelMessage(_group_msg()))
+        app.drain()
+
+        mock_screen.assert_text_on_screen("Channels")
+        mock_screen.assert_text_on_screen("1 msgs decoded")
+
+    def test_channel_stats_not_shown_when_zero(self, app, mock_screen):
+        activity = _make_dashboard()
+        app.start_activity(activity)
+        # No channel messages — stats line should not include "Channels"
+        lines = activity._stats_lines()
+        assert not any("Channels" in line for line in lines)
+
+    def test_channel_stats_plural(self, app, mock_screen):
+        activity = _make_dashboard()
+        app.start_activity(activity)
+
+        app.dispatch_event(ChannelMessage(_group_msg(channel="A")))
+        app.dispatch_event(ChannelMessage(_group_msg(channel="B")))
+        app.drain()
+
+        mock_screen.assert_text_on_screen("2 channels")
+
+
+class TestDashboardChannelKey:
+    def test_help_shows_channels_key(self, app, mock_screen):
+        app.start_activity(_make_dashboard())
+        mock_screen.assert_text_on_screen("c:channels")
+
+    def test_c_key_does_not_crash_without_service(self, app, mock_screen):
+        """Pressing 'c' when no collector service is registered should not crash."""
+        activity = _make_dashboard()
+        app.start_activity(activity)
+        # No service registered, should handle gracefully
+        app.send_key(ord("c"))
+        # Still alive
+        assert app.activity_stack_depth() >= 1

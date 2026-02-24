@@ -18,7 +18,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -85,6 +85,22 @@ CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
 CREATE INDEX IF NOT EXISTS idx_heartbeats_ts ON heartbeats(timestamp);
 """
 
+SCHEMA_V2_SQL = """
+CREATE TABLE IF NOT EXISTS channel_messages (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      REAL    NOT NULL,
+    msg_timestamp  INTEGER,
+    channel_name   TEXT    NOT NULL,
+    channel_hash   INTEGER NOT NULL,
+    sender         TEXT,
+    text           TEXT,
+    raw_packet_id  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_messages_ts ON channel_messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_channel ON channel_messages(channel_name);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -99,11 +115,27 @@ class CollectorStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA_SQL)
+        # Insert base version (1) for fresh DBs; existing DBs keep their value
         self._conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
-            ("schema_version", str(SCHEMA_VERSION)),
+            ("schema_version", "1"),
         )
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self):
+        """Run schema migrations if needed."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        current = int(row["value"]) if row else 1
+
+        if current < 2:
+            self._conn.executescript(SCHEMA_V2_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(2),),
+            )
 
     def close(self):
         if self._conn:
@@ -194,6 +226,50 @@ class CollectorStore:
                 ),
             )
 
+    def store_channel_message(self, msg, raw_packet_id=None):
+        """Store a decoded channel message."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO channel_messages "
+                "(timestamp, msg_timestamp, channel_name, channel_hash, sender, text, raw_packet_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    msg.raw_timestamp, msg.timestamp,
+                    msg.channel_name, msg.channel_hash,
+                    msg.sender, msg.text, raw_packet_id,
+                ),
+            )
+
+    def get_channel_messages(self, channel_name=None, limit=100, offset=0):
+        """Return channel messages, optionally filtered by channel."""
+        sql = "SELECT * FROM channel_messages WHERE 1=1"
+        params = []
+        if channel_name:
+            sql += " AND channel_name = ?"
+            params.append(channel_name)
+        sql += " ORDER BY timestamp ASC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_channel_summary(self):
+        """Return per-channel summary: count, last_activity, unique senders."""
+        rows = self._conn.execute(
+            "SELECT channel_name, channel_hash, "
+            "COUNT(*) as msg_count, "
+            "MAX(timestamp) as last_activity, "
+            "COUNT(DISTINCT sender) as unique_senders "
+            "FROM channel_messages "
+            "GROUP BY channel_name "
+            "ORDER BY last_activity DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_channel_message_count(self):
+        """Return total number of decoded channel messages."""
+        row = self._conn.execute("SELECT COUNT(*) as cnt FROM channel_messages").fetchone()
+        return row["cnt"]
+
     # --- Query methods (used by API and dashboard) ---
 
     def get_stats(self):
@@ -213,6 +289,9 @@ class CollectorStore:
         hb = c.execute("SELECT * FROM heartbeats ORDER BY timestamp DESC LIMIT 1").fetchone()
         latest_heartbeat = dict(hb) if hb else None
 
+        row = c.execute("SELECT COUNT(*) as cnt FROM channel_messages").fetchone()
+        channel_msg_count = row["cnt"]
+
         return {
             "total_packets": total_packets,
             "rx_count": rx_count,
@@ -220,6 +299,7 @@ class CollectorStore:
             "node_count": node_count,
             "advert_count": advert_count,
             "latest_heartbeat": latest_heartbeat,
+            "channel_msg_count": channel_msg_count,
         }
 
     def get_nodes(self):

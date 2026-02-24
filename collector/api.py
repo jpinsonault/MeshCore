@@ -10,13 +10,15 @@ Usage:
     python -m collector.api --port /dev/ttyUSB0 --http-port 8080
 
 Endpoints:
-    GET /api/status          — collector status + latest heartbeat
-    GET /api/stats           — summary statistics
-    GET /api/nodes           — all known nodes
-    GET /api/packets         — recent packets (?limit=50&direction=rx&payload_type=5)
-    GET /api/advertisements  — recent advertisements (?limit=50)
-    GET /api/heartbeats      — heartbeat history (?limit=50)
-    GET /api/traffic         — packet counts by type
+    GET /api/status             — collector status + latest heartbeat
+    GET /api/stats              — summary statistics
+    GET /api/nodes              — all known nodes
+    GET /api/packets            — recent packets (?limit=50&direction=rx&payload_type=5)
+    GET /api/advertisements     — recent advertisements (?limit=50)
+    GET /api/heartbeats         — heartbeat history (?limit=50)
+    GET /api/traffic            — packet counts by type
+    GET /api/channels           — channel summary (decoded group messages)
+    GET /api/channels/messages  — channel messages (?channel=X&limit=N)
 """
 
 import argparse
@@ -83,6 +85,18 @@ class CollectorAPI:
             return []
         return store.get_traffic_by_type()
 
+    def get_channels(self):
+        store = self.core.store
+        if not store:
+            return []
+        return store.get_channel_summary()
+
+    def get_channel_messages(self, channel=None, limit=100):
+        store = self.core.store
+        if not store:
+            return []
+        return store.get_channel_messages(channel_name=channel, limit=limit)
+
 
 def make_handler(api: CollectorAPI):
     """Create a request handler class bound to the given API instance."""
@@ -109,6 +123,11 @@ def make_handler(api: CollectorAPI):
                     limit=int(params.get("limit", [50])[0]),
                 ),
                 "/api/traffic": lambda: api.get_traffic(),
+                "/api/channels": lambda: api.get_channels(),
+                "/api/channels/messages": lambda: api.get_channel_messages(
+                    channel=params.get("channel", [None])[0],
+                    limit=int(params.get("limit", [100])[0]),
+                ),
             }
 
             handler = routes.get(path)

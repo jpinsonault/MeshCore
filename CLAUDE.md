@@ -160,7 +160,8 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] pyos TUI — port selection with persistence, live dashboard (app.py)
 - [x] JSON HTTP API server for headless mode (api.py)
 - [x] Automated UI tests using pyos testing harness (tests/)
-- [ ] Channel key configuration and group message decoding
+- [x] Channel key configuration and group message decoding
+- [x] Channel browser TUI activity with live updates
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -172,10 +173,12 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/core.py` — Standalone CollectorCore (serial + store, callback-driven)
 - `collector/mesh_service.py` — pyos Service wrapper around CollectorCore
 - `collector/activities/port_select.py` — Serial port picker with remembered selection
+- `collector/crypto.py` — Channel decryption (AES-128-ECB, HMAC-SHA256 MAC)
 - `collector/activities/dashboard.py` — Live mesh traffic dashboard
+- `collector/activities/channels.py` — Channel message browser with live updates
 - `collector/app.py` — TUI entry point (`python -m collector`)
 - `collector/api.py` — JSON API server (`python -m collector.api`)
-- `collector/tests/` — 73 automated tests (protocol, store, TUI activities)
+- `collector/tests/` — 172 automated tests (protocol, store, crypto, config, core integration, TUI activities)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running

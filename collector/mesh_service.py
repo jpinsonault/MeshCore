@@ -13,6 +13,7 @@ from pyos.Service import Service
 
 from .core import CollectorCore
 from .events import (
+    ChannelMessage,
     CollectorConnected,
     CollectorDisconnected,
     CollectorError,
@@ -59,6 +60,15 @@ class MeshCollectorService(Service):
         self._core.on_connected = self._on_connected
         self._core.on_disconnected = self._on_disconnected
         self._core.on_error = self._on_error
+        self._core.on_channel_message = self._on_channel_message
+
+        # Load channels from config
+        try:
+            from .config import load_config, load_channels
+            config = load_config()
+            self._core.set_channels(load_channels(config))
+        except Exception:
+            pass
 
         # Start core on its own daemon thread (non-blocking)
         self._core.start()
@@ -78,6 +88,9 @@ class MeshCollectorService(Service):
 
     def _on_disconnected(self, reason):
         self.dispatch_event(CollectorDisconnected(reason))
+
+    def _on_channel_message(self, msg):
+        self.dispatch_event(ChannelMessage(msg))
 
     def _on_error(self, msg):
         self.dispatch_event(CollectorError(msg))

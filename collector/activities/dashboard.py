@@ -26,6 +26,7 @@ from pyos.printers.Table import Table
 from pyos.printers.MultilineText import MultilineText
 
 from ..events import (
+    ChannelMessage,
     CollectorConnected,
     CollectorDisconnected,
     CollectorError,
@@ -82,6 +83,8 @@ class DashboardActivity(Activity):
         self._recent_packets = []  # last N packet summaries
         self._nodes = {}  # pub_key_hex -> info
         self._last_heartbeat = None
+        self._channel_msg_count = 0
+        self._channel_count = 0
         self._status = "Connecting..."
         self._max_recent = 100
         self.tab_order = ["packets", "nodes"]
@@ -94,6 +97,7 @@ class DashboardActivity(Activity):
         self.application.subscribe(CollectorDisconnected, self, self._on_disconnected)
         self.application.subscribe(CollectorFrame, self, self._on_frame)
         self.application.subscribe(CollectorError, self, self._on_error)
+        self.application.subscribe(ChannelMessage, self, self._on_channel_message)
 
         self._build_display()
 
@@ -174,7 +178,7 @@ class DashboardActivity(Activity):
             ),
             "bottom": BottomBar.display_state(items={
                 "status": self._status,
-                "help": "TAB:switch  ESC:back  q:quit",
+                "help": "TAB:switch  c:channels  ESC:back  q:quit",
             }),
         }
 
@@ -199,6 +203,11 @@ class DashboardActivity(Activity):
             f"  Captured: {self._frame_count} frames  "
             f"({self._rx_count} RX, {self._tx_count} TX, {self._adv_count} ADV)"
         )
+        if self._channel_msg_count > 0:
+            lines.append(
+                f"  Channels: {self._channel_msg_count} msgs decoded "
+                f"({self._channel_count} channel{'s' if self._channel_count != 1 else ''})"
+            )
         return lines
 
     def _packet_line(self, pkt):
@@ -254,6 +263,9 @@ class DashboardActivity(Activity):
         if event.key == ord("q") or event.key == ord("Q"):
             from pyos.EventTypes import StopApplication
             self.event_queue.put(StopApplication())
+            return
+        if event.key == ord("c") or event.key == ord("C"):
+            self._open_channels()
             return
         if event.key == Keys.TAB:
             self.cycle_focus()
@@ -322,3 +334,23 @@ class DashboardActivity(Activity):
             self._recent_packets = self._recent_packets[-self._max_recent:]
 
         self._update_display()
+
+    def _on_channel_message(self, event):
+        self._channel_msg_count += 1
+        ch_name = event.msg.channel_name
+        if not hasattr(self, "_channel_names"):
+            self._channel_names = set()
+        self._channel_names.add(ch_name)
+        self._channel_count = len(self._channel_names)
+        self._update_display()
+
+    def _open_channels(self):
+        """Open the channel browser."""
+        try:
+            svc = self.application.service("collector")
+            store = svc.store
+        except (KeyError, RuntimeError):
+            store = None
+        if store:
+            from .channels import ChannelBrowserActivity
+            self.application.segue_to(ChannelBrowserActivity(store=store))
