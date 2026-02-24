@@ -3,10 +3,6 @@
 import time
 import pytest
 
-import sys, os
-sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
 from pyos import Keys
 from pyos.testing import MockScreen, HarnessApplication
 

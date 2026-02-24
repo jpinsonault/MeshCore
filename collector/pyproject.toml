@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshcore-collector"
+version = "0.1.0"
+description = "Passive mesh network observer — stores MeshCore traffic in SQLite"
+requires-python = ">=3.9"
+dependencies = [
+  "loguru>=0.7",
+  "pycryptodome>=3.20",
+  "pygments>=2.17",
+  "pyserial>=3.5",
+  "pyos-tui>=0.1",
+]
+
+[tool.uv.sources]
+pyos-tui = { path = "../../pyos", editable = true }
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = [
+  "collector",
+  "collector.*",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".."]

@@ -1,11 +1,6 @@
 """Shared fixtures for collector tests."""
 
-import sys
-import os
 import pytest
-
-sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from pyos.testing import MockScreen, HarnessApplication
 

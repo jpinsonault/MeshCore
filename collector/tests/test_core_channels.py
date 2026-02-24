@@ -6,9 +6,6 @@ import tempfile
 import time
 import pytest
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
 from collector.core import CollectorCore
 from collector.crypto import Channel, encrypt_then_mac, PAYLOAD_TYPE_GRP_TXT, ROUTE_TYPE_FLOOD
 from collector.protocol import FRAME_TYPE_RX_RAW, FRAME_TYPE_TX_RAW

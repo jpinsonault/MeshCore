@@ -4,9 +4,6 @@ import struct
 import time
 import pytest
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
 from collector.protocol import (
     FRAME_START,
     FRAME_TYPE_HANDSHAKE,

@@ -4,9 +4,6 @@ import tempfile
 import time
 import pytest
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
 from collector.store import CollectorStore
 from collector.protocol import (
     FRAME_TYPE_RX_RAW,
