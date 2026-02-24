@@ -143,27 +143,59 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - Zero impact when disabled — just a bool check per packet
 
 **Host** (Python + SQLite, `collector/` directory):
-- Serial reader that separates binary frames from text CLI output
-- SQLite tables: raw_packets, channel_messages, advertisements, nodes, network_stats
-- Decoded public channel messages (requires known channel keys)
-- Web UI or CLI dashboard (future)
+- Modular architecture: core service runs without TUI (headless RPi-ready)
+- SQLite storage: raw_packets, advertisements, nodes, heartbeats
+- pyos-based TUI with port selection and live dashboard
+- JSON HTTP API for browser access from another machine
+- 73 automated tests (protocol, store, TUI activities)
 
 ### Current Status
 
 - [x] Binary frame protocol (CollectorSerial.h)
 - [x] Firmware hooks (logRxRaw, logTx, onAdvertRecv, heartbeat, CLI commands)
 - [x] Python test script validating the device-to-PC API (collector_test.py)
-- [ ] Python serial reader / frame parser module (extract from test into reusable lib)
-- [ ] SQLite schema and storage layer
+- [x] Protocol module — frame constants, parsers, FrameReader (protocol.py)
+- [x] SQLite schema and storage layer (store.py)
+- [x] Standalone collector core — serial + store, no TUI dependency (core.py)
+- [x] pyos TUI — port selection with persistence, live dashboard (app.py)
+- [x] JSON HTTP API server for headless mode (api.py)
+- [x] Automated UI tests using pyos testing harness (tests/)
 - [ ] Channel key configuration and group message decoding
-- [ ] Long-running collector daemon
-- [ ] Analysis queries / dashboard
+- [ ] Analysis queries / richer dashboard views
 
 ### Key Files
 
 - `examples/simple_repeater/CollectorSerial.h` — Binary frame protocol
 - `examples/simple_repeater/MyMesh.cpp` — Firmware hooks (search for `_collector`)
-- `collector/collector_test.py` — API validation test
+- `collector/protocol.py` — Frame constants, parsers, FrameReader state machine
+- `collector/store.py` — SQLite schema and query methods
+- `collector/core.py` — Standalone CollectorCore (serial + store, callback-driven)
+- `collector/mesh_service.py` — pyos Service wrapper around CollectorCore
+- `collector/activities/port_select.py` — Serial port picker with remembered selection
+- `collector/activities/dashboard.py` — Live mesh traffic dashboard
+- `collector/app.py` — TUI entry point (`python -m collector`)
+- `collector/api.py` — JSON API server (`python -m collector.api`)
+- `collector/tests/` — 73 automated tests (protocol, store, TUI activities)
+- `collector/collector_test.py` — Device-to-PC API validation test
+
+### Running
+
+```bash
+# Activate the collector venv
+source collector/.venv/bin/activate
+
+# TUI mode (interactive port selection)
+python -m collector
+
+# TUI mode (skip to dashboard)
+python -m collector --port /dev/cu.usbserial-0001
+
+# Headless mode (JSON API on port 8080)
+python -m collector.api --port /dev/cu.usbserial-0001
+
+# Run tests
+python -m pytest collector/tests/ -v
+```
 
 ## Contributing
 
