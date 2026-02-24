@@ -165,6 +165,11 @@ class ChannelBrowserActivity(Activity):
             self._update_display()
             return
 
+        if event.key == ord("?"):
+            from .help_overlay import HelpActivity
+            self.application.segue_to(HelpActivity(context="channels"))
+            return
+
         self.delegate_to_focused(event)
         self.refresh_screen()
 

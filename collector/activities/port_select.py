@@ -108,6 +108,11 @@ class PortSelectActivity(Activity):
             self._select_port()
             return
 
+        if event.key == ord("?"):
+            from .help_overlay import HelpActivity
+            self.application.segue_to(HelpActivity(context="port_select"))
+            return
+
         handle_scroll_list_input("ports", self.display_state["ports"], event, self.event_queue)
         self.refresh_screen()
 

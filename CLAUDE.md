@@ -162,6 +162,11 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] Automated UI tests using pyos testing harness (tests/)
 - [x] Channel key configuration and group message decoding
 - [x] Channel browser TUI activity with live updates
+- [x] Dashboard enhancements: packet rate, traffic sparkline, payload type tracking
+- [x] Packet detail view with hex dump (ENTER on packet)
+- [x] Node detail view with SNR sparkline (ENTER on node)
+- [x] Context-aware help overlay (? key from any screen)
+- [x] Debug log viewer with live firmware text (d key)
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -178,7 +183,11 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/channels.py` — Channel message browser with live updates
 - `collector/app.py` — TUI entry point (`python -m collector`)
 - `collector/api.py` — JSON API server (`python -m collector.api`)
-- `collector/tests/` — 172 automated tests (protocol, store, crypto, config, core integration, TUI activities)
+- `collector/activities/packet_detail.py` — Packet detail view with hex dump
+- `collector/activities/node_detail.py` — Node detail view with SNR sparkline
+- `collector/activities/help_overlay.py` — Context-aware help screen (? key)
+- `collector/activities/debug_log.py` — Live firmware debug log viewer
+- `collector/tests/` — 295 automated tests (protocol, store, crypto, config, core integration, TUI activities)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running

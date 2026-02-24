@@ -7,6 +7,7 @@ Subscribes to CollectorFrame events from the MeshCollectorService.
 
 import curses
 import time
+from collections import deque
 from datetime import datetime, timezone
 from functools import partial
 
@@ -43,6 +44,10 @@ from ..protocol import (
     ROUTE_TYPES,
 )
 
+SPARK_CHARS = " ▁▂▃▄▅▆▇█"
+SPARKLINE_BUCKETS = 30
+SPARKLINE_WINDOW = 60  # seconds
+
 
 def _fmt_time(ts):
     """Format a unix timestamp as HH:MM:SS."""
@@ -68,6 +73,56 @@ def _fmt_uptime(secs):
     return f"{s}s"
 
 
+def make_sparkline(timestamps, now=None, window=SPARKLINE_WINDOW, buckets=SPARKLINE_BUCKETS):
+    """Generate a sparkline string from a list of timestamps.
+
+    Divides the last `window` seconds into `buckets` time slots and maps
+    each bucket's count to a block character.
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - window
+    bucket_width = window / buckets
+    counts = [0] * buckets
+    for ts in timestamps:
+        if ts < cutoff:
+            continue
+        idx = int((ts - cutoff) / bucket_width)
+        if 0 <= idx < buckets:
+            counts[idx] += 1
+    max_count = max(counts) if counts else 0
+    if max_count == 0:
+        return SPARK_CHARS[0] * buckets
+    chars = []
+    for c in counts:
+        level = int(c / max_count * (len(SPARK_CHARS) - 1))
+        chars.append(SPARK_CHARS[level])
+    return "".join(chars)
+
+
+def calc_packet_rate(timestamps, now=None, window=10):
+    """Calculate packets per second over the last `window` seconds."""
+    if now is None:
+        now = time.time()
+    cutoff = now - window
+    count = sum(1 for ts in timestamps if ts >= cutoff)
+    return count / window
+
+
+def make_type_distribution(type_counts, width=20):
+    """Build a mini payload-type bar from a dict of {name: count}."""
+    if not type_counts:
+        return ""
+    total = sum(type_counts.values())
+    if total == 0:
+        return ""
+    parts = []
+    for name, count in sorted(type_counts.items(), key=lambda kv: -kv[1]):
+        bar_len = max(1, int(count / total * width))
+        parts.append(f"{name}:{'|' * bar_len}")
+    return "  ".join(parts[:4])  # top 4 types
+
+
 class DashboardActivity(Activity):
     """Main collector dashboard showing live mesh data."""
 
@@ -80,13 +135,17 @@ class DashboardActivity(Activity):
         self._rx_count = 0
         self._tx_count = 0
         self._adv_count = 0
-        self._recent_packets = []  # last N packet summaries
+        self._recent_packets = []  # last N packet dicts (with full frame data)
         self._nodes = {}  # pub_key_hex -> info
+        self._node_snr_history = {}  # pub_key_hex -> deque of (timestamp, snr)
         self._last_heartbeat = None
         self._channel_msg_count = 0
         self._channel_count = 0
         self._status = "Connecting..."
-        self._max_recent = 100
+        self._max_recent = 200
+        self._packet_times = deque(maxlen=1000)  # timestamps for rate/sparkline
+        self._payload_type_counts = {}  # payload_name -> count
+        self._sorted_node_keys = []  # ordered pub_key_hex list for index lookup
         self.tab_order = ["packets", "nodes"]
         self.focus = "packets"
 
@@ -154,7 +213,7 @@ class DashboardActivity(Activity):
             "stats": MultilineText.display_state(
                 lines=self._stats_lines(),
                 min_height=3,
-                max_height=4,
+                max_height=5,
             ),
             "hr1": HorizontalBar.display_state(),
             "packets": ScrollList.display_state(
@@ -178,13 +237,16 @@ class DashboardActivity(Activity):
             ),
             "bottom": BottomBar.display_state(items={
                 "status": self._status,
-                "help": "TAB:switch  c:channels  ESC:back  q:quit",
+                "help": "TAB:focus  ENTER:detail  c:chan  d:log  ?:help  q:quit",
             }),
         }
 
     def _stats_lines(self):
         """Generate the summary stats lines."""
         lines = []
+        now = time.time()
+
+        # Line 1: heartbeat data or waiting message
         hb = self._last_heartbeat
         if hb:
             lines.append(
@@ -199,15 +261,28 @@ class DashboardActivity(Activity):
         else:
             lines.append("  (awaiting first heartbeat...)")
 
+        # Line 2: capture stats + packet rate
+        rate = calc_packet_rate(self._packet_times, now)
+        rate_str = f"  {rate:.1f} pkt/s" if self._frame_count > 0 else ""
         lines.append(
             f"  Captured: {self._frame_count} frames  "
             f"({self._rx_count} RX, {self._tx_count} TX, {self._adv_count} ADV)"
+            f"{rate_str}"
         )
+
+        # Line 3: sparkline + channel stats
+        extra_parts = []
+        if self._packet_times:
+            spark = make_sparkline(self._packet_times, now)
+            extra_parts.append(f"  Traffic: {spark}")
         if self._channel_msg_count > 0:
-            lines.append(
+            extra_parts.append(
                 f"  Channels: {self._channel_msg_count} msgs decoded "
                 f"({self._channel_count} channel{'s' if self._channel_count != 1 else ''})"
             )
+        if extra_parts:
+            lines.append("".join(extra_parts))
+
         return lines
 
     def _packet_line(self, pkt):
@@ -226,8 +301,30 @@ class DashboardActivity(Activity):
         snr = info.get("snr", 0)
         seen = _fmt_time(info.get("last_seen"))
         count = info.get("count", 0)
+        # SNR sparkline from history
+        snr_history = self._node_snr_history.get(key, deque())
+        if len(snr_history) >= 2:
+            spark = self._snr_sparkline(snr_history)
+            snr_part = f"SNR:{snr:+5.1f} {spark}"
+        else:
+            snr_part = f"SNR:{snr:+5.1f}"
         pk_short = key[:12] + ".."
-        return f" {name:16s} {atype:9s} SNR:{snr:+5.1f}  seen:{seen}  x{count}  [{pk_short}]"
+        return f" {name:16s} {atype:9s} {snr_part}  seen:{seen}  x{count}  [{pk_short}]"
+
+    def _snr_sparkline(self, snr_history, width=8):
+        """Create a mini sparkline from SNR readings."""
+        values = [snr for _, snr in snr_history]
+        if len(values) > width:
+            values = values[-width:]
+        # Map SNR range (-20 to +10) into sparkline chars
+        min_snr, max_snr = -20.0, 10.0
+        chars = []
+        for v in values:
+            normalized = (v - min_snr) / (max_snr - min_snr)
+            normalized = max(0.0, min(1.0, normalized))
+            idx = int(normalized * (len(SPARK_CHARS) - 1))
+            chars.append(SPARK_CHARS[idx])
+        return "".join(chars)
 
     def _update_display(self):
         """Refresh display_state with current data."""
@@ -241,14 +338,17 @@ class DashboardActivity(Activity):
             self.display_state["packets"]["items"] = ["(waiting for packets...)"]
 
         if self._nodes:
+            sorted_nodes = sorted(
+                self._nodes.items(),
+                key=lambda kv: kv[1].get("last_seen", 0),
+                reverse=True,
+            )
+            self._sorted_node_keys = [k for k, v in sorted_nodes]
             self.display_state["nodes"]["items"] = [
-                self._node_line(k, v) for k, v in sorted(
-                    self._nodes.items(),
-                    key=lambda kv: kv[1].get("last_seen", 0),
-                    reverse=True,
-                )
+                self._node_line(k, v) for k, v in sorted_nodes
             ]
         else:
+            self._sorted_node_keys = []
             self.display_state["nodes"]["items"] = ["(waiting for advertisements...)"]
 
         self.display_state["bottom"]["items"]["status"] = self._status
@@ -267,9 +367,18 @@ class DashboardActivity(Activity):
         if event.key == ord("c") or event.key == ord("C"):
             self._open_channels()
             return
+        if event.key == ord("d") or event.key == ord("D"):
+            self._open_debug_log()
+            return
+        if event.key == ord("?"):
+            self._open_help()
+            return
         if event.key == Keys.TAB:
             self.cycle_focus()
             self.refresh_screen()
+            return
+        if event.key == Keys.ENTER:
+            self._open_detail()
             return
 
         self.delegate_to_focused(event)
@@ -295,24 +404,32 @@ class DashboardActivity(Activity):
         ft = frame["type"]
         parsed = frame.get("parsed", {})
         self._frame_count += 1
+        received_at = frame.get("received_at", time.time())
+        self._packet_times.append(received_at)
 
         if ft == FRAME_TYPE_RX_RAW:
             self._rx_count += 1
+            ptype_name = parsed.get("payload_name", "?")
+            self._payload_type_counts[ptype_name] = self._payload_type_counts.get(ptype_name, 0) + 1
             self._recent_packets.append({
-                "time": frame.get("received_at"),
+                "time": received_at,
                 "dir": "RX",
                 "route": parsed.get("route_name", "?"),
-                "ptype": parsed.get("payload_name", "?"),
+                "ptype": ptype_name,
                 "extra": f"SNR:{parsed.get('snr', 0):+.1f} RSSI:{parsed.get('rssi', 0)}",
+                "frame": frame,
             })
         elif ft == FRAME_TYPE_TX_RAW:
             self._tx_count += 1
+            ptype_name = parsed.get("payload_name", "?")
+            self._payload_type_counts[ptype_name] = self._payload_type_counts.get(ptype_name, 0) + 1
             self._recent_packets.append({
-                "time": frame.get("received_at"),
+                "time": received_at,
                 "dir": "TX",
                 "route": parsed.get("route_name", "?"),
-                "ptype": parsed.get("payload_name", "?"),
+                "ptype": ptype_name,
                 "extra": f"len:{parsed.get('raw_len', 0)}",
+                "frame": frame,
             })
         elif ft == FRAME_TYPE_ADVERTISEMENT:
             self._adv_count += 1
@@ -323,9 +440,16 @@ class DashboardActivity(Activity):
                     "name": parsed.get("name") or existing.get("name", "?"),
                     "adv_type_name": parsed.get("adv_type_name") or existing.get("adv_type_name", "?"),
                     "snr": parsed.get("snr", existing.get("snr", 0)),
-                    "last_seen": frame.get("received_at"),
+                    "last_seen": received_at,
                     "count": existing.get("count", 0) + 1,
+                    "lat": parsed.get("lat", existing.get("lat")),
+                    "lon": parsed.get("lon", existing.get("lon")),
+                    "pub_key_hex": pk,
                 }
+                # Track SNR history
+                if pk not in self._node_snr_history:
+                    self._node_snr_history[pk] = deque(maxlen=50)
+                self._node_snr_history[pk].append((received_at, parsed.get("snr", 0)))
         elif ft == FRAME_TYPE_HEARTBEAT:
             self._last_heartbeat = parsed
 
@@ -344,6 +468,29 @@ class DashboardActivity(Activity):
         self._channel_count = len(self._channel_names)
         self._update_display()
 
+    def _open_detail(self):
+        """Open detail view for the focused item."""
+        if self.focus == "packets" and self._recent_packets:
+            idx = self.display_state["packets"]["selected_index"]
+            if 0 <= idx < len(self._recent_packets):
+                pkt = self._recent_packets[idx]
+                frame = pkt.get("frame")
+                if frame:
+                    from .packet_detail import PacketDetailActivity
+                    self.application.segue_to(PacketDetailActivity(frame=frame))
+        elif self.focus == "nodes" and self._sorted_node_keys:
+            idx = self.display_state["nodes"]["selected_index"]
+            if 0 <= idx < len(self._sorted_node_keys):
+                pk = self._sorted_node_keys[idx]
+                info = self._nodes.get(pk, {})
+                snr_history = list(self._node_snr_history.get(pk, []))
+                from .node_detail import NodeDetailActivity
+                self.application.segue_to(NodeDetailActivity(
+                    pub_key_hex=pk,
+                    info=info,
+                    snr_history=snr_history,
+                ))
+
     def _open_channels(self):
         """Open the channel browser."""
         try:
@@ -354,3 +501,13 @@ class DashboardActivity(Activity):
         if store:
             from .channels import ChannelBrowserActivity
             self.application.segue_to(ChannelBrowserActivity(store=store))
+
+    def _open_debug_log(self):
+        """Open the debug log viewer."""
+        from .debug_log import DebugLogActivity
+        self.application.segue_to(DebugLogActivity())
+
+    def _open_help(self):
+        """Open the help overlay."""
+        from .help_overlay import HelpActivity
+        self.application.segue_to(HelpActivity(context="dashboard"))

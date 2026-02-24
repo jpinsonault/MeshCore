@@ -68,7 +68,7 @@ class TestDashboardRendering:
     def test_shows_help_keys(self, app, mock_screen):
         app.start_activity(_make_dashboard())
         mock_screen.assert_text_on_screen("TAB")
-        mock_screen.assert_text_on_screen("ESC")
+        mock_screen.assert_text_on_screen("q:quit")
 
     def test_shows_heartbeat_pending(self, app, mock_screen):
         app.start_activity(_make_dashboard())
@@ -363,7 +363,7 @@ class TestDashboardChannelMessage:
 class TestDashboardChannelKey:
     def test_help_shows_channels_key(self, app, mock_screen):
         app.start_activity(_make_dashboard())
-        mock_screen.assert_text_on_screen("c:channels")
+        mock_screen.assert_text_on_screen("c:chan")
 
     def test_c_key_does_not_crash_without_service(self, app, mock_screen):
         """Pressing 'c' when no collector service is registered should not crash."""
