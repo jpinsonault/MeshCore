@@ -33,6 +33,7 @@
 #include <helpers/StatsFormatHelper.h>
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/RegionMap.h>
+#include "CollectorSerial.h"
 #include "RateLimiter.h"
 
 #ifdef WITH_BRIDGE
@@ -102,6 +103,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #if MAX_NEIGHBOURS
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
+  CollectorSerial _collector;
+  bool _collector_enabled;
+  unsigned long _next_heartbeat;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;

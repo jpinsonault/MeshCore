@@ -409,6 +409,9 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   mesh::Utils::printHex(Serial, raw, len);
   Serial.println();
 #endif
+  if (_collector_enabled) {
+    _collector.sendRxRaw(snr, rssi, raw, len);
+  }
 }
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
@@ -459,6 +462,11 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
       }
       f.close();
     }
+  }
+  if (_collector_enabled) {
+    uint8_t raw[MAX_TRANS_UNIT];
+    uint8_t raw_len = pkt->writeTo(raw);
+    _collector.sendTxRaw(raw, raw_len);
   }
 }
 
@@ -582,6 +590,9 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
     if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) { // just keep neigbouring Repeaters
       putNeighbour(id, timestamp, packet->getSNR());
     }
+  }
+  if (_collector_enabled) {
+    _collector.sendAdvertisement(timestamp, packet->_snr, id.pub_key, app_data, app_data_len);
   }
 }
 
@@ -760,6 +771,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   dirty_contacts_expiry = 0;
   set_radio_at = revert_radio_at = 0;
   _logging = false;
+  _collector_enabled = false;
+  _next_heartbeat = 0;
   region_load_active = false;
 
 #if MAX_NEIGHBOURS
@@ -806,6 +819,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+  _collector.begin(Serial);
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -1168,6 +1182,30 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else {
       strcpy(reply, "Err - ??");
     }
+  } else if (sender_timestamp == 0 && memcmp(command, "collector", 9) == 0) {
+    const char *sub = command + 9;
+    while (*sub == ' ') sub++;
+    if (strcmp(sub, "start") == 0) {
+      _collector_enabled = true;
+      _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
+      _collector.sendHandshake();
+      strcpy(reply, "OK");
+    } else if (strcmp(sub, "stop") == 0) {
+      _collector_enabled = false;
+      strcpy(reply, "OK");
+    } else if (strcmp(sub, "status") == 0) {
+      _collector.sendHeartbeat(
+        getRTCClock()->getCurrentTime(),
+        board.getBattMilliVolts(),
+        getNumRecvFlood(), getNumRecvDirect(),
+        getNumSentFlood(), getNumSentDirect(),
+        _mgr->getFreeCount(),
+        (uint32_t)(uptime_millis / 1000)
+      );
+      sprintf(reply, "collector %s", _collector_enabled ? "running" : "stopped");
+    } else {
+      strcpy(reply, "Err - use: collector start|stop|status");
+    }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1209,6 +1247,19 @@ void MyMesh::loop() {
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
     acl.save(_fs);
     dirty_contacts_expiry = 0;
+  }
+
+  // collector heartbeat
+  if (_collector_enabled && _next_heartbeat && millisHasNowPassed(_next_heartbeat)) {
+    _collector.sendHeartbeat(
+      getRTCClock()->getCurrentTime(),
+      board.getBattMilliVolts(),
+      getNumRecvFlood(), getNumRecvDirect(),
+      getNumSentFlood(), getNumSentDirect(),
+      _mgr->getFreeCount(),
+      (uint32_t)(uptime_millis / 1000)
+    );
+    _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
   }
 
   // update uptime
