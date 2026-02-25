@@ -252,6 +252,32 @@ class CollectorStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    def search_channel_messages(self, channel_name=None, search_text=None,
+                                sender=None, limit=200, offset=0):
+        """Search channel messages with optional text, sender, and channel filters.
+
+        Uses SQL LIKE for text/sender matching (case-insensitive for ASCII).
+        Escapes '%' and '_' in search terms to prevent wildcard injection.
+        """
+        sql = "SELECT * FROM channel_messages WHERE 1=1"
+        params = []
+        if channel_name:
+            sql += " AND channel_name = ?"
+            params.append(channel_name)
+        if search_text:
+            escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " AND (text LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')"
+            pattern = f"%{escaped}%"
+            params.extend([pattern, pattern])
+        if sender:
+            escaped = sender.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " AND sender LIKE ? ESCAPE '\\'"
+            params.append(f"%{escaped}%")
+        sql += " ORDER BY timestamp ASC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
     def get_channel_summary(self):
         """Return per-channel summary: count, last_activity, unique senders."""
         rows = self._conn.execute(

@@ -167,6 +167,8 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] Node detail view with SNR sparkline (ENTER on node)
 - [x] Context-aware help overlay (? key from any screen)
 - [x] Debug log viewer with live firmware text (d key)
+- [x] WebSocket + HTTP server for real-time streaming (server.py)
+- [x] Message search in channel browser (/ key) and HTTP API
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -180,14 +182,15 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/port_select.py` — Serial port picker with remembered selection
 - `collector/crypto.py` — Channel decryption (AES-128-ECB, HMAC-SHA256 MAC)
 - `collector/activities/dashboard.py` — Live mesh traffic dashboard
-- `collector/activities/channels.py` — Channel message browser with live updates
+- `collector/activities/channels.py` — Channel message browser with live updates and search
 - `collector/app.py` — TUI entry point (`python -m collector`)
 - `collector/api.py` — JSON API server (`python -m collector.api`)
+- `collector/server.py` — WebSocket + HTTP server (`python -m collector.server`)
 - `collector/activities/packet_detail.py` — Packet detail view with hex dump
 - `collector/activities/node_detail.py` — Node detail view with SNR sparkline
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/tests/` — 295 automated tests (protocol, store, crypto, config, core integration, TUI activities)
+- `collector/tests/` — 336 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running
@@ -204,6 +207,12 @@ python -m collector --port /dev/cu.usbserial-0001
 
 # Headless mode (JSON API on port 8080)
 python -m collector.api --port /dev/cu.usbserial-0001
+
+# WebSocket + HTTP server (streams events to ws://0.0.0.0:8081)
+python -m collector.server --port /dev/cu.usbserial-0001
+
+# TUI with WebSocket server enabled
+python -m collector --port /dev/cu.usbserial-0001 --serve 8081
 
 # Run tests
 python -m pytest collector/tests/ -v

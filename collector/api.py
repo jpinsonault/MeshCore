@@ -91,10 +91,15 @@ class CollectorAPI:
             return []
         return store.get_channel_summary()
 
-    def get_channel_messages(self, channel=None, limit=100):
+    def get_channel_messages(self, channel=None, limit=100, search=None, sender=None):
         store = self.core.store
         if not store:
             return []
+        if search or sender:
+            return store.search_channel_messages(
+                channel_name=channel, search_text=search,
+                sender=sender, limit=limit,
+            )
         return store.get_channel_messages(channel_name=channel, limit=limit)
 
 
@@ -127,6 +132,8 @@ def make_handler(api: CollectorAPI):
                 "/api/channels/messages": lambda: api.get_channel_messages(
                     channel=params.get("channel", [None])[0],
                     limit=int(params.get("limit", [100])[0]),
+                    search=params.get("search", [None])[0],
+                    sender=params.get("sender", [None])[0],
                 ),
             }
 

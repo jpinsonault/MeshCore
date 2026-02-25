@@ -25,11 +25,12 @@ from .config import load_config
 
 
 class CollectorApp(Application):
-    def __init__(self, curses_screen, port=None, baud=115200):
+    def __init__(self, curses_screen, port=None, baud=115200, serve=None):
         super().__init__(curses_screen)
         self.log_filename = "collector_tui.log"
         self._port = port
         self._baud = baud
+        self._serve = serve  # WebSocket port or None
 
     def on_start(self):
         pass
@@ -37,7 +38,9 @@ class CollectorApp(Application):
     def run(self):
         if self._port:
             # Skip port selection, go directly to dashboard
-            self.start(DashboardActivity(port=self._port, baud=self._baud))
+            self.start(DashboardActivity(
+                port=self._port, baud=self._baud, ws_port=self._serve
+            ))
         else:
             self.start(PortSelectActivity())
 
@@ -46,10 +49,12 @@ def main():
     parser = argparse.ArgumentParser(description="MeshCore Collector TUI")
     parser.add_argument("--port", default=None, help="Serial port (skip port selection)")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
+    parser.add_argument("--serve", type=int, default=None, metavar="WS_PORT",
+                        help="Start WebSocket server on this port (e.g., 8081)")
     args = parser.parse_args()
 
     def curses_main(stdscr):
-        app = CollectorApp(stdscr, port=args.port, baud=args.baud)
+        app = CollectorApp(stdscr, port=args.port, baud=args.baud, serve=args.serve)
         app.run()
 
     curses.wrapper(curses_main)

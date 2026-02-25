@@ -13,13 +13,14 @@ from datetime import datetime
 sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
 
 from pyos.Activity import Activity
-from pyos.EventTypes import KeyStroke, ScrollChange
-from pyos.input_handlers import handle_scroll_list_input
+from pyos.EventTypes import KeyStroke, ScrollChange, TextBoxChange, TextBoxSubmit
+from pyos.input_handlers import handle_scroll_list_input, handle_text_box_input
 from pyos import Keys
 from pyos.printers.TopBar import TopBar
 from pyos.printers.BottomBar import BottomBar
 from pyos.printers.HorizontalBar import HorizontalBar
 from pyos.printers.ScrollList import ScrollList
+from pyos.printers.TextInput import TextInput
 
 from ..events import ChannelMessage
 
@@ -44,12 +45,16 @@ class ChannelBrowserActivity(Activity):
         self._messages = []     # message dicts for selected channel
         self._selected_channel = None  # channel_name or None for all
         self._total_count = 0
+        self._search_active = False
+        self._search_text = ""
         self.tab_order = ["channel_list", "messages"]
         self.focus = "channel_list"
 
     def on_start(self):
         self.application.subscribe(KeyStroke, self, self.on_key_stroke)
         self.application.subscribe(ScrollChange, self, self.on_scroll)
+        self.application.subscribe(TextBoxChange, self, self._on_search_change)
+        self.application.subscribe(TextBoxSubmit, self, self._on_search_submit)
         self.application.subscribe(ChannelMessage, self, self._on_channel_message)
 
         self._load_data()
@@ -61,7 +66,13 @@ class ChannelBrowserActivity(Activity):
             return
         self._channels = self._store.get_channel_summary()
         self._total_count = self._store.get_channel_message_count()
-        if self._selected_channel:
+        if self._search_text:
+            self._messages = self._store.search_channel_messages(
+                channel_name=self._selected_channel,
+                search_text=self._search_text,
+                limit=200,
+            )
+        elif self._selected_channel:
             self._messages = self._store.get_channel_messages(
                 channel_name=self._selected_channel, limit=200
             )
@@ -88,6 +99,12 @@ class ChannelBrowserActivity(Activity):
                 min_height=3,
                 flex=1,
             ),
+            "search_input": TextInput.display_state(
+                label="/",
+                text="",
+                focused=False,
+                input_handler=handle_text_box_input,
+            ),
             "hr": HorizontalBar.display_state(),
             "messages": ScrollList.display_state(
                 self.screen,
@@ -99,10 +116,12 @@ class ChannelBrowserActivity(Activity):
                 flex=3,
             ),
             "bottom": BottomBar.display_state(items={
-                "status": f"{self._total_count} msgs decoded",
-                "help": "TAB:switch  ENTER:select  r:refresh  ESC:back",
+                "status": self._status_text(),
+                "help": "TAB:switch  ENTER:select  /:search  r:refresh  ESC:back",
             }),
         }
+        if not self._search_active:
+            self.display_state["search_input"]["hidden"] = True
 
     def _channel_items(self):
         """Format channel summary for the list."""
@@ -134,6 +153,13 @@ class ChannelBrowserActivity(Activity):
             items.append(f"  {ts}  {sender}: {text}")
         return items
 
+    def _status_text(self):
+        """Build the status bar text."""
+        if self._search_text:
+            count = len(self._messages)
+            return f"{count} match{'es' if count != 1 else ''} | {self._total_count} total"
+        return f"{self._total_count} msgs decoded"
+
     def _update_display(self):
         """Refresh display with current data."""
         self.display_state["top"]["items"]["help"] = (
@@ -141,14 +167,22 @@ class ChannelBrowserActivity(Activity):
         )
         self.display_state["channel_list"]["items"] = self._channel_items()
         self.display_state["messages"]["items"] = self._message_items()
-        self.display_state["bottom"]["items"]["status"] = f"{self._total_count} msgs decoded"
+        self.display_state["bottom"]["items"]["status"] = self._status_text()
+        self.display_state["search_input"]["hidden"] = not self._search_active
         self.refresh_screen()
 
     # --- Event handlers ---
 
     def on_key_stroke(self, event: KeyStroke):
         if event.key == Keys.ESC:
+            if self._search_active:
+                self._close_search()
+                return
             self.application.pop_activity()
+            return
+
+        if event.key == ord("/") and self.focus != "search_input":
+            self._open_search()
             return
 
         if event.key == Keys.TAB:
@@ -161,14 +195,16 @@ class ChannelBrowserActivity(Activity):
             return
 
         if event.key == ord("r") or event.key == ord("R"):
-            self._load_data()
-            self._update_display()
-            return
+            if self.focus != "search_input":
+                self._load_data()
+                self._update_display()
+                return
 
         if event.key == ord("?"):
-            from .help_overlay import HelpActivity
-            self.application.segue_to(HelpActivity(context="channels"))
-            return
+            if self.focus != "search_input":
+                from .help_overlay import HelpActivity
+                self.application.segue_to(HelpActivity(context="channels"))
+                return
 
         self.delegate_to_focused(event)
         self.refresh_screen()
@@ -197,6 +233,47 @@ class ChannelBrowserActivity(Activity):
         self.display_state["messages"]["selected_index"] = max(0, len(msg_items) - 1)
         self._update_display()
 
+    def _open_search(self):
+        """Activate the search bar."""
+        self._search_active = True
+        self.display_state["search_input"]["hidden"] = False
+        self.display_state["search_input"]["text"] = ""
+        self.display_state["search_input"]["cursor_index"] = 0
+        if "search_input" not in self.tab_order:
+            self.tab_order = ["channel_list", "search_input", "messages"]
+        self.focus = "search_input"
+        self._update_display()
+
+    def _close_search(self):
+        """Deactivate the search bar and clear filter."""
+        self._search_active = False
+        self._search_text = ""
+        self.display_state["search_input"]["hidden"] = True
+        self.display_state["search_input"]["text"] = ""
+        self.tab_order = ["channel_list", "messages"]
+        self.focus = "channel_list"
+        self._load_data()
+        self._update_display()
+
+    def _on_search_change(self, event):
+        """Handle live search as user types."""
+        if not self._search_active:
+            return
+        self._search_text = self.display_state["search_input"]["text"]
+        self._load_data()
+        # Scroll messages to bottom
+        msg_items = self._message_items()
+        self.display_state["messages"]["selected_index"] = max(0, len(msg_items) - 1)
+        self._update_display()
+
+    def _on_search_submit(self, event):
+        """Handle ENTER in search bar — lock search and move focus to messages."""
+        if not self._search_active:
+            return
+        self._search_text = self.display_state["search_input"]["text"]
+        self.focus = "messages"
+        self.refresh_screen()
+
     def _on_channel_message(self, event):
         """Handle live channel message events."""
         self._total_count += 1
@@ -219,8 +296,16 @@ class ChannelBrowserActivity(Activity):
                 "unique_senders": 1,
             })
 
-        # Add to message list if it matches the filter
-        if self._selected_channel is None or self._selected_channel == msg.channel_name:
+        # Add to message list if it matches the active filters
+        channel_match = self._selected_channel is None or self._selected_channel == msg.channel_name
+        search_match = True
+        if self._search_text:
+            q = self._search_text.lower()
+            search_match = (
+                (msg.text and q in msg.text.lower()) or
+                (msg.sender and q in msg.sender.lower())
+            )
+        if channel_match and search_match:
             self._messages.append({
                 "timestamp": msg.raw_timestamp,
                 "msg_timestamp": msg.timestamp,

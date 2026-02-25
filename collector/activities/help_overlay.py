@@ -38,9 +38,10 @@ HELP_SECTIONS = {
         "keys": [
             ("TAB", "Switch focus between channel list and messages"),
             ("ENTER", "Select/deselect channel to filter"),
+            ("/", "Open search bar (filter by text or sender)"),
             ("r / R", "Refresh data from database"),
             ("?", "Show this help screen"),
-            ("ESC", "Go back to dashboard"),
+            ("ESC", "Close search / go back to dashboard"),
             ("UP/DOWN", "Scroll through list items"),
         ],
     },

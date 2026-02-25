@@ -126,11 +126,13 @@ def make_type_distribution(type_counts, width=20):
 class DashboardActivity(Activity):
     """Main collector dashboard showing live mesh data."""
 
-    def __init__(self, port, baud=115200, auto_start=True):
+    def __init__(self, port, baud=115200, auto_start=True, ws_port=None):
         super().__init__()
         self._port = port
         self._baud = baud
         self._auto_start = auto_start
+        self._ws_port = ws_port  # WebSocket port or None
+        self._server = None
         self._frame_count = 0
         self._rx_count = 0
         self._tx_count = 0
@@ -162,8 +164,13 @@ class DashboardActivity(Activity):
 
         if self._auto_start:
             self._start_collector_service()
+            if self._ws_port:
+                self._start_server()
 
     def on_stop(self):
+        if self._server:
+            self._server.stop()
+            self._server = None
         try:
             svc = self.application.service("collector")
             if svc.is_running:
@@ -194,6 +201,17 @@ class DashboardActivity(Activity):
         else:
             self.application.register_service("collector", svc)
         self.application.start_service("collector")
+
+    def _start_server(self):
+        """Start the WebSocket + HTTP server alongside the collector."""
+        try:
+            svc = self.application.service("collector")
+            core = svc.core
+        except (KeyError, RuntimeError):
+            return
+        from ..server import CollectorServer
+        self._server = CollectorServer(core, ws_port=self._ws_port)
+        self._server.start()
 
     def _resolve_db_path(self):
         from ..config import load_config, DEFAULT_CONFIG_DIR
@@ -282,6 +300,9 @@ class DashboardActivity(Activity):
             )
         if extra_parts:
             lines.append("".join(extra_parts))
+
+        if self._server and self._server.is_running:
+            lines.append(f"  WS: {self._server.ws_url}")
 
         return lines
 
