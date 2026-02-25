@@ -89,11 +89,11 @@ class TestChannelSummary:
 
 
 class TestSchemaVersion:
-    def test_fresh_db_has_v2(self, store):
+    def test_fresh_db_has_latest_version(self, store):
         row = store._conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert int(row["value"]) == 2
+        assert int(row["value"]) == 3
 
     def test_migration_from_v1(self):
         """Simulate a V1 database and verify migration adds channel_messages."""
@@ -135,11 +135,11 @@ class TestSchemaVersion:
             s = CollectorStore(f.name)
             s.open()
 
-            # Check version is now 2
+            # Check version is now 3 (migrated through v2 and v3)
             row = s._conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
-            assert int(row["value"]) == 2
+            assert int(row["value"]) == 3
 
             # channel_messages table should exist
             s.store_channel_message(_msg())

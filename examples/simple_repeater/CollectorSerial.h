@@ -11,11 +11,13 @@
 #define COLLECTOR_TX_RAW        0xD1
 #define COLLECTOR_ADVERTISEMENT 0xD2
 #define COLLECTOR_HEARTBEAT     0xD3
+#define COLLECTOR_DIAGNOSTICS   0xD4
 #define COLLECTOR_HANDSHAKE     0xDF
 
 #define COLLECTOR_PROTOCOL_VER  1
 
 #define COLLECTOR_HEARTBEAT_INTERVAL  10000  // milliseconds
+#define COLLECTOR_DIAG_INTERVAL      30000  // milliseconds
 
 class CollectorSerial {
   Stream *_serial;
@@ -73,6 +75,31 @@ public:
     _serial->write((const uint8_t *)&tx_direct, 4);
     _serial->write(&free_pkts, 1);
     _serial->write((const uint8_t *)&uptime_secs, 4);
+  }
+
+  void sendDiagnostics(float mcu_temp, uint32_t free_heap, uint32_t min_free_heap,
+                       uint32_t total_heap, int16_t noise_floor, int16_t last_rssi,
+                       int16_t last_snr_x4, uint32_t tx_airtime_ms, uint32_t rx_airtime_ms,
+                       uint32_t recv_errors, uint16_t err_flags, uint16_t tx_queue_len,
+                       uint16_t direct_dups, uint16_t flood_dups,
+                       uint32_t n_recv, uint32_t n_sent) {
+    writeFrameHeader(COLLECTOR_DIAGNOSTICS, 50);
+    _serial->write((const uint8_t *)&mcu_temp, 4);
+    _serial->write((const uint8_t *)&free_heap, 4);
+    _serial->write((const uint8_t *)&min_free_heap, 4);
+    _serial->write((const uint8_t *)&total_heap, 4);
+    _serial->write((const uint8_t *)&noise_floor, 2);
+    _serial->write((const uint8_t *)&last_rssi, 2);
+    _serial->write((const uint8_t *)&last_snr_x4, 2);
+    _serial->write((const uint8_t *)&tx_airtime_ms, 4);
+    _serial->write((const uint8_t *)&rx_airtime_ms, 4);
+    _serial->write((const uint8_t *)&recv_errors, 4);
+    _serial->write((const uint8_t *)&err_flags, 2);
+    _serial->write((const uint8_t *)&tx_queue_len, 2);
+    _serial->write((const uint8_t *)&direct_dups, 2);
+    _serial->write((const uint8_t *)&flood_dups, 2);
+    _serial->write((const uint8_t *)&n_recv, 4);
+    _serial->write((const uint8_t *)&n_sent, 4);
   }
 
   void sendHandshake() {

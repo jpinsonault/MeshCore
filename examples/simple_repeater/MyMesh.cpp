@@ -773,6 +773,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _logging = false;
   _collector_enabled = false;
   _next_heartbeat = 0;
+  _next_diagnostics = 0;
   region_load_active = false;
 
 #if MAX_NEIGHBOURS
@@ -1188,6 +1189,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     if (strcmp(sub, "start") == 0) {
       _collector_enabled = true;
       _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
+      _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
       _collector.sendHandshake();
       strcpy(reply, "OK");
     } else if (strcmp(sub, "stop") == 0) {
@@ -1203,8 +1205,23 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         (uint32_t)(uptime_millis / 1000)
       );
       sprintf(reply, "collector %s", _collector_enabled ? "running" : "stopped");
+    } else if (strcmp(sub, "diag") == 0) {
+      SimpleMeshTables *tables = (SimpleMeshTables *)getTables();
+      float temp = board.getMCUTemperature();
+      _collector.sendDiagnostics(
+        temp,
+        ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(),
+        (int16_t)_radio->getNoiseFloor(), (int16_t)_radio->getLastRSSI(),
+        (int16_t)(_radio->getLastSNR() * 4),
+        (uint32_t)getTotalAirTime(), (uint32_t)getReceiveAirTime(),
+        radio_driver.getPacketsRecvErrors(), _err_flags,
+        (uint16_t)_mgr->getOutboundCount(millis()),
+        (uint16_t)tables->getNumDirectDups(), (uint16_t)tables->getNumFloodDups(),
+        radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
+      );
+      strcpy(reply, "OK");
     } else {
-      strcpy(reply, "Err - use: collector start|stop|status");
+      strcpy(reply, "Err - use: collector start|stop|status|diag");
     }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
@@ -1260,6 +1277,24 @@ void MyMesh::loop() {
       (uint32_t)(uptime_millis / 1000)
     );
     _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
+  }
+
+  // collector diagnostics
+  if (_collector_enabled && _next_diagnostics && millisHasNowPassed(_next_diagnostics)) {
+    SimpleMeshTables *tables = (SimpleMeshTables *)getTables();
+    float temp = board.getMCUTemperature();
+    _collector.sendDiagnostics(
+      temp,
+      ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(),
+      (int16_t)_radio->getNoiseFloor(), (int16_t)_radio->getLastRSSI(),
+      (int16_t)(_radio->getLastSNR() * 4),
+      (uint32_t)getTotalAirTime(), (uint32_t)getReceiveAirTime(),
+      radio_driver.getPacketsRecvErrors(), _err_flags,
+      (uint16_t)_mgr->getOutboundCount(millis()),
+      (uint16_t)tables->getNumDirectDups(), (uint16_t)tables->getNumFloodDups(),
+      radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
+    );
+    _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
   }
 
   // update uptime

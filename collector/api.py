@@ -17,6 +17,7 @@ Endpoints:
     GET /api/advertisements     — recent advertisements (?limit=50)
     GET /api/heartbeats         — heartbeat history (?limit=50)
     GET /api/traffic            — packet counts by type
+    GET /api/diagnostics        — OS diagnostics history (?limit=50)
     GET /api/channels           — channel summary (decoded group messages)
     GET /api/channels/messages  — channel messages (?channel=X&limit=N)
 """
@@ -91,6 +92,12 @@ class CollectorAPI:
             return []
         return store.get_channel_summary()
 
+    def get_diagnostics(self, limit=50):
+        store = self.core.store
+        if not store:
+            return []
+        return store.get_diagnostics(limit=limit)
+
     def get_channel_messages(self, channel=None, limit=100, search=None, sender=None):
         store = self.core.store
         if not store:
@@ -128,6 +135,9 @@ def make_handler(api: CollectorAPI):
                     limit=int(params.get("limit", [50])[0]),
                 ),
                 "/api/traffic": lambda: api.get_traffic(),
+                "/api/diagnostics": lambda: api.get_diagnostics(
+                    limit=int(params.get("limit", [50])[0]),
+                ),
                 "/api/channels": lambda: api.get_channels(),
                 "/api/channels/messages": lambda: api.get_channel_messages(
                     channel=params.get("channel", [None])[0],

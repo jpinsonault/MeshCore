@@ -17,6 +17,7 @@ FRAME_TYPE_RX_RAW = 0xD0
 FRAME_TYPE_TX_RAW = 0xD1
 FRAME_TYPE_ADVERTISEMENT = 0xD2
 FRAME_TYPE_HEARTBEAT = 0xD3
+FRAME_TYPE_DIAGNOSTICS = 0xD4
 FRAME_TYPE_HANDSHAKE = 0xDF
 
 FRAME_TYPE_NAMES = {
@@ -24,6 +25,7 @@ FRAME_TYPE_NAMES = {
     FRAME_TYPE_TX_RAW: "TX_RAW",
     FRAME_TYPE_ADVERTISEMENT: "ADVERTISEMENT",
     FRAME_TYPE_HEARTBEAT: "HEARTBEAT",
+    FRAME_TYPE_DIAGNOSTICS: "DIAGNOSTICS",
     FRAME_TYPE_HANDSHAKE: "HANDSHAKE",
 }
 
@@ -166,6 +168,40 @@ def parse_heartbeat(payload):
     }
 
 
+def parse_diagnostics(payload):
+    """Parse a DIAGNOSTICS frame payload (50 bytes)."""
+    if len(payload) < 50:
+        return {"error": f"too short ({len(payload)} bytes, need 50)"}
+    (
+        mcu_temp,
+        free_heap, min_free_heap, total_heap,
+        noise_floor, last_rssi, last_snr_x4,
+        tx_airtime_ms, rx_airtime_ms,
+        recv_errors, err_flags, tx_queue_len,
+        direct_dups, flood_dups,
+        n_recv, n_sent,
+    ) = struct.unpack("<f3I3h2I I H H 2H 2I", payload[:50])
+
+    return {
+        "mcu_temp": mcu_temp,
+        "free_heap": free_heap,
+        "min_free_heap": min_free_heap,
+        "total_heap": total_heap,
+        "noise_floor": noise_floor,
+        "last_rssi": last_rssi,
+        "last_snr": last_snr_x4 / 4.0,
+        "tx_airtime_ms": tx_airtime_ms,
+        "rx_airtime_ms": rx_airtime_ms,
+        "recv_errors": recv_errors,
+        "err_flags": err_flags,
+        "tx_queue_len": tx_queue_len,
+        "direct_dups": direct_dups,
+        "flood_dups": flood_dups,
+        "n_recv": n_recv,
+        "n_sent": n_sent,
+    }
+
+
 def parse_handshake(payload):
     """Parse a HANDSHAKE frame payload."""
     if len(payload) < 10:
@@ -184,6 +220,7 @@ FRAME_PARSERS = {
     FRAME_TYPE_TX_RAW: parse_tx_raw,
     FRAME_TYPE_ADVERTISEMENT: parse_advertisement,
     FRAME_TYPE_HEARTBEAT: parse_heartbeat,
+    FRAME_TYPE_DIAGNOSTICS: parse_diagnostics,
     FRAME_TYPE_HANDSHAKE: parse_handshake,
 }
 

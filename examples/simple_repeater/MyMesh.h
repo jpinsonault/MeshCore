@@ -106,6 +106,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   CollectorSerial _collector;
   bool _collector_enabled;
   unsigned long _next_heartbeat;
+  unsigned long _next_diagnostics;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;

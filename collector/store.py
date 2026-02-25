@@ -13,12 +13,13 @@ from pathlib import Path
 
 from .protocol import (
     FRAME_TYPE_ADVERTISEMENT,
+    FRAME_TYPE_DIAGNOSTICS,
     FRAME_TYPE_HEARTBEAT,
     FRAME_TYPE_RX_RAW,
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -101,6 +102,30 @@ CREATE INDEX IF NOT EXISTS idx_channel_messages_ts ON channel_messages(timestamp
 CREATE INDEX IF NOT EXISTS idx_channel_messages_channel ON channel_messages(channel_name);
 """
 
+SCHEMA_V3_SQL = """
+CREATE TABLE IF NOT EXISTS diagnostics (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       REAL NOT NULL,
+    mcu_temp        REAL,
+    free_heap       INTEGER,
+    min_free_heap   INTEGER,
+    total_heap      INTEGER,
+    noise_floor     INTEGER,
+    last_rssi       INTEGER,
+    last_snr        REAL,
+    tx_airtime_ms   INTEGER,
+    rx_airtime_ms   INTEGER,
+    recv_errors     INTEGER,
+    err_flags       INTEGER,
+    tx_queue_len    INTEGER,
+    direct_dups     INTEGER,
+    flood_dups      INTEGER,
+    n_recv          INTEGER,
+    n_sent          INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostics_ts ON diagnostics(timestamp);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -136,6 +161,14 @@ class CollectorStore:
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 (str(2),),
             )
+            current = 2
+
+        if current < 3:
+            self._conn.executescript(SCHEMA_V3_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(3),),
+            )
 
     def close(self):
         if self._conn:
@@ -164,6 +197,8 @@ class CollectorStore:
             self._store_advertisement(now, parsed)
         elif ft == FRAME_TYPE_HEARTBEAT:
             self._store_heartbeat(now, parsed)
+        elif ft == FRAME_TYPE_DIAGNOSTICS:
+            self._store_diagnostics(now, parsed)
 
     def _store_rx(self, now, p):
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""
@@ -223,6 +258,26 @@ class CollectorStore:
                     p.get("rx_flood"), p.get("rx_direct"),
                     p.get("tx_flood"), p.get("tx_direct"),
                     p.get("free_pkts"), p.get("uptime_secs"),
+                ),
+            )
+
+    def _store_diagnostics(self, now, p):
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO diagnostics "
+                "(timestamp, mcu_temp, free_heap, min_free_heap, total_heap, "
+                "noise_floor, last_rssi, last_snr, tx_airtime_ms, rx_airtime_ms, "
+                "recv_errors, err_flags, tx_queue_len, direct_dups, flood_dups, "
+                "n_recv, n_sent) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    now, p.get("mcu_temp"), p.get("free_heap"),
+                    p.get("min_free_heap"), p.get("total_heap"),
+                    p.get("noise_floor"), p.get("last_rssi"), p.get("last_snr"),
+                    p.get("tx_airtime_ms"), p.get("rx_airtime_ms"),
+                    p.get("recv_errors"), p.get("err_flags"), p.get("tx_queue_len"),
+                    p.get("direct_dups"), p.get("flood_dups"),
+                    p.get("n_recv"), p.get("n_sent"),
                 ),
             )
 
@@ -378,5 +433,20 @@ class CollectorStore:
         """Return packet counts grouped by payload type."""
         rows = self._conn.execute(
             "SELECT payload_type, COUNT(*) as cnt FROM raw_packets GROUP BY payload_type ORDER BY cnt DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_latest_diagnostics(self):
+        """Return the most recent diagnostics row, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM diagnostics ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_diagnostics(self, limit=50):
+        """Return recent diagnostics rows."""
+        rows = self._conn.execute(
+            "SELECT * FROM diagnostics ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

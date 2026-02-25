@@ -26,6 +26,7 @@ HELP_SECTIONS = {
             ("TAB", "Switch focus between packets and nodes"),
             ("ENTER", "Open detail view for selected item"),
             ("c / C", "Open channel browser"),
+            ("s / S", "Open system diagnostics"),
             ("d / D", "Open debug log"),
             ("?", "Show this help screen"),
             ("ESC", "Go back to port selection"),
@@ -65,6 +66,14 @@ HELP_SECTIONS = {
     "node_detail": {
         "title": "Node Detail",
         "keys": [
+            ("ESC", "Go back to dashboard"),
+            ("UP/DOWN", "Scroll through content"),
+        ],
+    },
+    "system_diag": {
+        "title": "System Diagnostics",
+        "keys": [
+            ("r / R", "Request immediate diagnostics update"),
             ("ESC", "Go back to dashboard"),
             ("UP/DOWN", "Scroll through content"),
         ],

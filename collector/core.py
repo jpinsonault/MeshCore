@@ -226,6 +226,16 @@ class CollectorCore:
                     if self.on_channel_message:
                         self.on_channel_message(msg)
 
+    def send_command(self, cmd):
+        """Send a CLI command to the device. Returns True if sent, False otherwise."""
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.write(cmd.encode() if isinstance(cmd, str) else cmd)
+                return True
+            except serial.SerialException:
+                return False
+        return False
+
     def _fire_text(self, line):
         if self.on_text:
             self.on_text(line)

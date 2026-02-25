@@ -343,7 +343,7 @@ class DashboardActivity(Activity):
             ),
             "bottom": BottomBar.display_state(items={
                 "status": self._status,
-                "help": "TAB:focus  ENTER:detail  c:chan  d:log  ?:help  q:quit",
+                "help": "TAB:focus  ENTER:detail  c:chan  s:diag  d:log  ?:help  q:quit",
             }),
         }
 
@@ -476,6 +476,9 @@ class DashboardActivity(Activity):
         if event.key == ord("c") or event.key == ord("C"):
             self._open_channels()
             return
+        if event.key == ord("s") or event.key == ord("S"):
+            self._open_system_diag()
+            return
         if event.key == ord("d") or event.key == ord("D"):
             self._open_debug_log()
             return
@@ -607,6 +610,11 @@ class DashboardActivity(Activity):
         if store:
             from .channels import ChannelBrowserActivity
             self.application.segue_to(ChannelBrowserActivity(store=store))
+
+    def _open_system_diag(self):
+        """Open the system diagnostics screen."""
+        from .system_diag import SystemDiagActivity
+        self.application.segue_to(SystemDiagActivity())
 
     def _open_debug_log(self):
         """Open the debug log viewer."""
