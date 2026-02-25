@@ -1,8 +1,10 @@
 """Shared fixtures for collector tests."""
 
+import tempfile
 import pytest
 
 from pyos.testing import MockScreen, HarnessApplication
+from collector.store import CollectorStore
 
 
 @pytest.fixture
@@ -33,3 +35,13 @@ def make_app():
     yield _factory
     for application in apps:
         application.teardown()
+
+
+@pytest.fixture
+def store():
+    """Fresh SQLite store backed by a temp file."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        s = CollectorStore(f.name)
+        s.open()
+        yield s
+        s.close()

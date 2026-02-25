@@ -32,3 +32,6 @@ dev = ["pytest>=8.0"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".."]
+markers = [
+  "stress: long-running performance and scaling tests",
+]
