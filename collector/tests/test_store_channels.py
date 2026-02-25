@@ -93,7 +93,7 @@ class TestSchemaVersion:
         row = store._conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert int(row["value"]) == 4
+        assert int(row["value"]) == 5
 
     def test_migration_from_v1(self):
         """Simulate a V1 database and verify migration adds channel_messages."""
@@ -139,7 +139,7 @@ class TestSchemaVersion:
             row = s._conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
-            assert int(row["value"]) == 4
+            assert int(row["value"]) == 5
 
             # channel_messages table should exist
             s.store_channel_message(_msg())

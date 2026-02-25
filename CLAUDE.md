@@ -179,6 +179,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] Side-by-side split panel layout (SplitView component) for dashboard and channel browser
 - [x] Hashtag channel support: `#name` entries auto-derive encryption key via SHA-256
 - [x] IRC-style chat interface (ChatActivity) as new main screen with /commands
+- [x] Channel cracker: passive dictionary attack on hashtag channels, retroactive decrypt, /crack command
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -192,6 +193,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/port_select.py` — Serial port picker with remembered selection
 - `collector/crypto.py` — Channel decryption (AES-128-ECB, HMAC-SHA256 MAC), hashtag key derivation
 - `collector/split_view.py` — Reusable side-by-side split panel component (SplitView)
+- `collector/cracker.py` — Passive channel cracker: dictionary attack, hash table, retroactive decrypt, cache
 - `collector/activities/chat.py` — IRC-style main screen with /commands, rooms sidebar, message panel
 - `collector/activities/dashboard.py` — Live mesh traffic dashboard (secondary, via /nodes or /packets)
 - `collector/activities/channels.py` — Channel message browser with live updates and search
@@ -203,7 +205,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/tests/` — 535 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface)
+- `collector/tests/` — 574 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running

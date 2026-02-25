@@ -39,3 +39,10 @@ class ChannelMessage:
     """Fired when a group channel message is decoded."""
     def __init__(self, msg):
         self.msg = msg
+
+
+class ChannelDiscovered:
+    """Fired when the cracker discovers a new channel name."""
+    def __init__(self, channel_name, decoded_count):
+        self.channel_name = channel_name
+        self.decoded_count = decoded_count

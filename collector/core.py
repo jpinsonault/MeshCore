@@ -75,8 +75,10 @@ class CollectorCore:
         self.on_disconnected: Callable = None
         self.on_error: Callable = None
         self.on_channel_message: Callable = None
+        self.on_channel_discovered: Callable = None
 
         self._channels = []
+        self._cracker = None
         self._ser = None
         self._store = None
         self._reader = None
@@ -114,6 +116,10 @@ class CollectorCore:
     def remove_channel(self, name):
         """Remove a channel by name from the live decode list."""
         self._channels = [ch for ch in self._channels if ch.name != name]
+
+    def set_cracker(self, cracker):
+        """Attach a ChannelCracker instance for passive channel discovery."""
+        self._cracker = cracker
 
     def start(self):
         """Start the collector on a background thread."""
@@ -284,26 +290,32 @@ class CollectorCore:
             if self._replay_above_seq > 0 and seq > self._replay_above_seq:
                 self._replay_above_seq = 0
 
-        self._store.store_frame(frame)
+        raw_packet_id = self._store.store_frame(frame)
         if self.on_frame:
             self.on_frame(frame)
 
         # Try to decode group channel messages
         if (
-            self._channels
-            and frame["type"] == FRAME_TYPE_RX_RAW
+            frame["type"] == FRAME_TYPE_RX_RAW
             and frame.get("parsed")
             and frame["parsed"].get("payload_type") == PAYLOAD_TYPE_GRP_TXT
         ):
             raw = frame["parsed"].get("raw")
             if raw and isinstance(raw, bytes):
-                msg = try_decode_group_message(
-                    raw, self._channels, frame.get("received_at", time.time())
-                )
+                msg = None
+                if self._channels:
+                    msg = try_decode_group_message(
+                        raw, self._channels, frame.get("received_at", time.time())
+                    )
                 if msg:
-                    self._store.store_channel_message(msg)
+                    self._store.store_channel_message(msg, raw_packet_id=raw_packet_id)
                     if self.on_channel_message:
                         self.on_channel_message(msg)
+                elif self._cracker:
+                    from .crypto import extract_group_payload
+                    extracted = extract_group_payload(raw)
+                    if extracted:
+                        self._cracker.notify_unknown_hash(extracted["channel_hash"])
 
     def _send_ack(self, seq):
         """Send HOST_ACK frame and persist last committed seq."""

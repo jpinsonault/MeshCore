@@ -19,7 +19,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -131,6 +131,16 @@ ALTER TABLE raw_packets ADD COLUMN seq INTEGER;
 CREATE INDEX IF NOT EXISTS idx_raw_packets_seq ON raw_packets(seq);
 """
 
+SCHEMA_V5_SQL = """
+CREATE TABLE IF NOT EXISTS cracked_channels (
+    channel_hash   INTEGER NOT NULL,
+    channel_name   TEXT    NOT NULL UNIQUE,
+    discovered_at  REAL    NOT NULL,
+    decoded_count  INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_cracked_hash ON cracked_channels(channel_hash);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -182,6 +192,14 @@ class CollectorStore:
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 (str(4),),
             )
+            current = 4
+
+        if current < 5:
+            self._conn.executescript(SCHEMA_V5_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(5),),
+            )
 
     def close(self):
         if self._conn:
@@ -210,43 +228,46 @@ class CollectorStore:
             )
 
     def store_frame(self, frame):
-        """Store a parsed frame. Dispatches by frame type."""
+        """Store a parsed frame. Dispatches by frame type. Returns raw_packets rowid for RX/TX, else None."""
         ft = frame["type"]
         parsed = frame.get("parsed")
         if not parsed or "error" in parsed:
-            return
+            return None
 
         now = frame.get("received_at", time.time())
         seq = frame.get("seq")
 
         if ft == FRAME_TYPE_RX_RAW:
-            self._store_rx(now, parsed, seq=seq)
+            return self._store_rx(now, parsed, seq=seq)
         elif ft == FRAME_TYPE_TX_RAW:
-            self._store_tx(now, parsed, seq=seq)
+            return self._store_tx(now, parsed, seq=seq)
         elif ft == FRAME_TYPE_ADVERTISEMENT:
             self._store_advertisement(now, parsed)
         elif ft == FRAME_TYPE_HEARTBEAT:
             self._store_heartbeat(now, parsed)
         elif ft == FRAME_TYPE_DIAGNOSTICS:
             self._store_diagnostics(now, parsed)
+        return None
 
     def _store_rx(self, now, p, seq=None):
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""
         with self._tx() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len, seq) "
                 "VALUES (?, 'rx', ?, ?, ?, ?, ?, ?, ?)",
                 (now, p.get("snr"), p.get("rssi"), p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0), seq),
             )
+            return cursor.lastrowid
 
     def _store_tx(self, now, p, seq=None):
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""
         with self._tx() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len, seq) "
                 "VALUES (?, 'tx', NULL, NULL, ?, ?, ?, ?, ?)",
                 (now, p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0), seq),
             )
+            return cursor.lastrowid
 
     def _store_advertisement(self, now, p):
         pub_key_hex = p.get("pub_key_hex", "")
@@ -477,6 +498,43 @@ class CollectorStore:
         """Return recent diagnostics rows."""
         rows = self._conn.execute(
             "SELECT * FROM diagnostics ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Cracker cache methods ---
+
+    def store_cracked_channel(self, name, channel_hash, decoded_count):
+        """INSERT OR REPLACE a cracked channel into the cache."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO cracked_channels "
+                "(channel_hash, channel_name, discovered_at, decoded_count) "
+                "VALUES (?, ?, ?, ?)",
+                (channel_hash, name, time.time(), decoded_count),
+            )
+
+    def get_cracked_channels(self):
+        """Return all cached cracked channel entries."""
+        rows = self._conn.execute(
+            "SELECT * FROM cracked_channels ORDER BY discovered_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def has_channel_message_for_packet(self, raw_packet_id):
+        """Check whether a channel_message already exists for a given raw_packet_id."""
+        row = self._conn.execute(
+            "SELECT 1 FROM channel_messages WHERE raw_packet_id = ? LIMIT 1",
+            (raw_packet_id,),
+        ).fetchone()
+        return row is not None
+
+    def get_grp_txt_packets(self, limit=10000):
+        """Return RX raw_packets with payload_type=5 (GRP_TXT) for cracker scanning."""
+        rows = self._conn.execute(
+            "SELECT id, timestamp, raw_hex FROM raw_packets "
+            "WHERE payload_type = 5 AND direction = 'rx' "
+            "ORDER BY timestamp ASC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

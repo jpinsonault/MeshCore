@@ -110,6 +110,11 @@ public:
     _ring_size = COLLECTOR_RING_SIZE;
 #ifdef ESP32
     _ring = (uint8_t *)ps_malloc(_ring_size + 2);  // +2 ensures sentinel always fits
+    if (!_ring) {
+      // No PSRAM — fall back to regular heap with reduced size
+      _ring_size = 150 * 1024;
+      _ring = (uint8_t *)malloc(_ring_size + 2);
+    }
 #else
     _ring = (uint8_t *)malloc(_ring_size + 2);
 #endif

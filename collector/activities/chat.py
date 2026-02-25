@@ -23,6 +23,7 @@ from pyos.printers.BottomBar import BottomBar
 from pyos.printers.TextInput import TextInput
 
 from ..events import (
+    ChannelDiscovered,
     ChannelMessage,
     CollectorConnected,
     CollectorDisconnected,
@@ -150,6 +151,7 @@ class ChatActivity(Activity):
         self.application.subscribe(CollectorFrame, self, self._on_frame)
         self.application.subscribe(CollectorError, self, self._on_error)
         self.application.subscribe(ChannelMessage, self, self._on_channel_message)
+        self.application.subscribe(ChannelDiscovered, self, self._on_channel_discovered)
 
         if self._service_started:
             # Re-entry after segue — reload from store
@@ -161,6 +163,7 @@ class ChatActivity(Activity):
                 self._start_collector_service()
                 if self._ws_port:
                     self._start_server()
+                self._start_cracker()
             self._service_started = True
             self._load_channels_from_config()
             self._add_system_message(f"Connected to {self._port}")
@@ -190,6 +193,31 @@ class ChatActivity(Activity):
         else:
             self.application.register_service("collector", svc)
         self.application.start_service("collector")
+
+    def _start_cracker(self):
+        """Auto-start the channel cracker after the collector service launches."""
+        try:
+            svc = self.application.service("collector")
+            core = svc.core
+        except (KeyError, RuntimeError):
+            return
+        from ..cracker import ChannelCracker
+        cracker = ChannelCracker(core.store, core._channels)
+        # Load cached cracks and add them to core's live channel list
+        cached = cracker.load_cache()
+        for ch in cached:
+            core.add_channel(ch)
+            if not any(c["name"] == ch.name for c in self._channels):
+                self._channels.append({"name": ch.name, "msg_count": 0})
+        # Wire callback to bridge into core's on_channel_discovered
+        def _on_discovered(name, decoded_count):
+            core.add_channel(Channel.from_hashtag(name))
+            if core.on_channel_discovered:
+                core.on_channel_discovered(name, decoded_count)
+        from ..crypto import Channel
+        cracker.on_channel_discovered = _on_discovered
+        core.set_cracker(cracker)
+        cracker.start()
 
     def _start_server(self):
         try:
@@ -596,6 +624,28 @@ class ChatActivity(Activity):
 
         self._update_display()
 
+    def _on_channel_discovered(self, event):
+        """Cracker found a new channel — add to sidebar and show system message."""
+        name = event.channel_name
+        count = event.decoded_count
+        # Add to sidebar if not present
+        found = False
+        for ch in self._channels:
+            if ch["name"] == name:
+                ch["msg_count"] += count
+                found = True
+                break
+        if not found:
+            self._channels.append({"name": name, "msg_count": count})
+
+        self._add_system_message(f"Cracked channel {name} ({count} messages decoded)")
+
+        # Reload messages if viewing All or this channel
+        if self._selected_channel is None or self._selected_channel == name:
+            self._reload_messages()
+
+        self._update_display()
+
     # --- Channel selection ---
 
     def _select_channel_from_sidebar(self):
@@ -630,6 +680,8 @@ class ChatActivity(Activity):
             self._cmd_part(arg)
         elif cmd == "/search":
             self._cmd_search(arg)
+        elif cmd == "/crack":
+            self._cmd_crack(arg)
         elif cmd == "/diag":
             self._cmd_segue_diag()
         elif cmd == "/nodes":
@@ -645,28 +697,67 @@ class ChatActivity(Activity):
 
     def _cmd_join(self, arg):
         if not arg:
-            self._add_system_message("Usage: /join #channelname")
+            self._add_system_message("Usage: /join #name  or  /join Name base64psk")
             return
-        name = arg if arg.startswith("#") else f"#{arg}"
+
+        parts = arg.split()
+        from ..crypto import Channel
+
+        if parts[0].startswith("#"):
+            # Hashtag channel
+            name = parts[0]
+            channel = Channel.from_hashtag(name)
+            psk_arg = None
+        elif len(parts) >= 2:
+            # PSK channel: /join RoomName base64psk
+            name = parts[0]
+            psk_arg = parts[1]
+            try:
+                channel = Channel.from_psk(name, psk_arg)
+            except (ValueError, Exception) as e:
+                self._add_system_message(f"Invalid PSK: {e}")
+                return
+        else:
+            # Assume hashtag
+            name = f"#{parts[0]}"
+            channel = Channel.from_hashtag(name)
+            psk_arg = None
+
         # Check if already joined
         for ch in self._channels:
             if ch["name"] == name:
                 self._add_system_message(f"Already joined {name}")
                 return
-        # Create channel and add to core
-        from ..crypto import Channel
-        channel = Channel.from_hashtag(name)
+
+        # Add to core's live channel list
         try:
             svc = self.application.service("collector")
             svc.core.add_channel(channel)
         except (KeyError, RuntimeError):
             pass
+
         # Save to config
         from ..config import add_channel_to_config
-        add_channel_to_config(name)
+        add_channel_to_config(name, psk=psk_arg)
+
+        # Retroactive decrypt via cracker pipeline
+        decoded_count = 0
+        try:
+            svc = self.application.service("collector")
+            cracker = svc.core._cracker
+            if cracker:
+                decoded_count = cracker.retroactive_decrypt(channel)
+        except (KeyError, RuntimeError):
+            pass
+
         # Add to local list
-        self._channels.append({"name": name, "msg_count": 0})
-        self._add_system_message(f"Joined {name}")
+        self._channels.append({"name": name, "msg_count": decoded_count})
+
+        if decoded_count > 0:
+            self._add_system_message(f"Joined {name} ({decoded_count} historical messages decoded)")
+            self._reload_messages()
+        else:
+            self._add_system_message(f"Joined {name}")
 
     def _cmd_part(self, arg):
         if not arg:
@@ -711,6 +802,51 @@ class ChatActivity(Activity):
             DashboardActivity(port=self._port, auto_start=False)
         )
 
+    def _cmd_crack(self, arg):
+        """Handle /crack command: status, start, stop, wordlist."""
+        try:
+            svc = self.application.service("collector")
+            cracker = svc.core._cracker
+        except (KeyError, RuntimeError):
+            cracker = None
+
+        if not cracker:
+            self._add_system_message("Cracker not available (no collector connected)")
+            return
+
+        sub = arg.strip().split(None, 1) if arg.strip() else ["status"]
+        subcmd = sub[0].lower()
+
+        if subcmd == "status":
+            st = cracker.status()
+            state = "running" if st["running"] else "stopped"
+            self._add_system_message(
+                f"Cracker: {state}, {st['cracked_count']} cracked, "
+                f"{st['pending_count']} pending, {st['wordlist_size']} words"
+            )
+            if st["cracked_names"]:
+                self._add_system_message(
+                    f"  Cracked: {', '.join(st['cracked_names'])}"
+                )
+            if st["pending_hashes"]:
+                hexes = ", ".join(f"0x{h:02X}" for h in st["pending_hashes"])
+                self._add_system_message(f"  Pending hashes: {hexes}")
+        elif subcmd == "start":
+            cracker.start()
+            self._add_system_message("Cracker started")
+        elif subcmd == "stop":
+            cracker.stop()
+            self._add_system_message("Cracker stopped")
+        elif subcmd == "wordlist":
+            if len(sub) > 1:
+                path = sub[1].strip()
+                cracker.add_wordlist(path)
+                self._add_system_message(f"Loaded wordlist: {path}")
+            else:
+                self._add_system_message("Usage: /crack wordlist /path/to/file")
+        else:
+            self._add_system_message("Usage: /crack [status|start|stop|wordlist path]")
+
     def _cmd_status(self):
         self._add_system_message(f"Port: {self._port}")
         self._add_system_message(
@@ -728,11 +864,15 @@ class ChatActivity(Activity):
 
     def _cmd_help(self):
         self._add_system_message("Available commands:")
-        self._add_system_message("  /join #name  - Join a hashtag channel")
-        self._add_system_message("  /part [#name] - Leave current or named channel")
-        self._add_system_message("  /search text - Filter messages (empty to clear)")
-        self._add_system_message("  /diag        - Open system diagnostics")
-        self._add_system_message("  /nodes       - Open node list (dashboard)")
-        self._add_system_message("  /packets     - Open packet list (dashboard)")
-        self._add_system_message("  /status      - Show connection info")
-        self._add_system_message("  /help        - Show this help")
+        self._add_system_message("  /join #name       - Join a hashtag channel")
+        self._add_system_message("  /join Name b64psk - Join a PSK channel")
+        self._add_system_message("  /part [#name]     - Leave current or named channel")
+        self._add_system_message("  /search text      - Filter messages (empty to clear)")
+        self._add_system_message("  /crack [status]   - Show cracker state")
+        self._add_system_message("  /crack start|stop - Toggle channel cracker")
+        self._add_system_message("  /crack wordlist f - Load custom wordlist")
+        self._add_system_message("  /diag             - Open system diagnostics")
+        self._add_system_message("  /nodes            - Open node list (dashboard)")
+        self._add_system_message("  /packets          - Open packet list (dashboard)")
+        self._add_system_message("  /status           - Show connection info")
+        self._add_system_message("  /help             - Show this help")
