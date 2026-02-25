@@ -165,7 +165,7 @@ class TestDashboardEnhancedStats:
             app.dispatch_event(CollectorFrame(_rx_frame()))
         app.drain()
 
-        mock_screen.assert_text_on_screen("pkt/s")
+        mock_screen.assert_text_on_screen("p/s")
 
     def test_sparkline_shown_after_frames(self, app, mock_screen):
         activity = _make_dashboard()
@@ -175,7 +175,10 @@ class TestDashboardEnhancedStats:
             app.dispatch_event(CollectorFrame(_rx_frame()))
         app.drain()
 
-        mock_screen.assert_text_on_screen("Traffic:")
+        # Sparkline chars appear in the stats line
+        lines = activity._stats_lines()
+        has_spark = any(c in "".join(lines) for c in SPARK_CHARS[1:])
+        assert has_spark
 
     def test_payload_types_tracked(self, app, mock_screen):
         activity = _make_dashboard()
@@ -241,9 +244,9 @@ class TestDashboardEnterDrillDown:
         app.dispatch_event(CollectorFrame(_adv_frame()))
         app.drain()
 
-        # Switch focus to nodes
+        # Switch focus to nodes (right panel)
         app.send_key(Keys.TAB)
-        assert activity.focus == "nodes"
+        assert activity.display_state["split"]["focused_panel"] == "right"
 
         app.send_key(Keys.ENTER)
         assert app.activity_stack_depth() == 2
@@ -287,9 +290,9 @@ class TestDashboardNewKeybindings:
     def test_updated_bottom_bar(self, app, mock_screen):
         activity = _make_dashboard()
         app.start_activity(activity)
-        mock_screen.assert_text_on_screen("ENTER:detail")
         mock_screen.assert_text_on_screen("d:log")
         mock_screen.assert_text_on_screen("?:help")
+        mock_screen.assert_text_on_screen("resize")
 
 
 class TestDashboardFrameStorage:

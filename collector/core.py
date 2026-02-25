@@ -107,6 +107,14 @@ class CollectorCore:
         """Set the list of Channel objects for group message decoding."""
         self._channels = list(channels)
 
+    def add_channel(self, channel):
+        """Add a channel to the live decode list."""
+        self._channels.append(channel)
+
+    def remove_channel(self, name):
+        """Remove a channel by name from the live decode list."""
+        self._channels = [ch for ch in self._channels if ch.name != name]
+
     def start(self):
         """Start the collector on a background thread."""
         if self._running:

@@ -8,7 +8,7 @@ import pytest
 from pyos import Keys
 from pyos.testing import MockScreen, HarnessApplication
 
-from collector.activities.dashboard import DashboardActivity, _fmt_uptime, _fmt_time
+from collector.activities.dashboard import DashboardActivity, _fmt_uptime, _fmt_uptime_short, _fmt_time
 from collector.events import (
     ChannelMessage,
     CollectorConnected,
@@ -44,6 +44,18 @@ class TestFormatHelpers:
     def test_fmt_uptime_none(self):
         assert _fmt_uptime(None) == "---"
 
+    def test_fmt_uptime_short_seconds(self):
+        assert _fmt_uptime_short(45) == "45s"
+
+    def test_fmt_uptime_short_minutes(self):
+        assert _fmt_uptime_short(125) == "2m5s"
+
+    def test_fmt_uptime_short_hours(self):
+        assert _fmt_uptime_short(3665) == "1h1m"
+
+    def test_fmt_uptime_short_none(self):
+        assert _fmt_uptime_short(None) == "---"
+
     def test_fmt_time_valid(self):
         result = _fmt_time(1700000000)
         assert ":" in result  # HH:MM:SS format
@@ -75,6 +87,15 @@ class TestDashboardRendering:
     def test_shows_heartbeat_pending(self, app, mock_screen):
         app.start_activity(_make_dashboard())
         mock_screen.assert_text_on_screen("awaiting first heartbeat")
+
+    def test_shows_split_view_titles(self, app, mock_screen):
+        app.start_activity(_make_dashboard())
+        mock_screen.assert_text_on_screen("Packets")
+        mock_screen.assert_text_on_screen("Nodes")
+
+    def test_shows_resize_hint(self, app, mock_screen):
+        app.start_activity(_make_dashboard())
+        mock_screen.assert_text_on_screen("resize")
 
 
 class TestDashboardEvents:
@@ -184,7 +205,7 @@ class TestDashboardEvents:
         app.dispatch_event(CollectorFrame(frame))
         app.drain()
         mock_screen.assert_text_on_screen("3700mV")
-        mock_screen.assert_text_on_screen("1h 0m 0s")
+        mock_screen.assert_text_on_screen("1h0m")
 
     def test_frame_counter_increments(self, app, mock_screen):
         activity = _make_dashboard()
@@ -205,7 +226,7 @@ class TestDashboardEvents:
         app.drain()
         assert activity._frame_count == 3
         assert activity._rx_count == 3
-        mock_screen.assert_text_on_screen("3 frames")
+        mock_screen.assert_text_on_screen("3RX")
 
     def test_multiple_nodes_tracked(self, app, mock_screen):
         activity = _make_dashboard()
@@ -262,14 +283,15 @@ class TestDashboardKeyboard:
         app.flush_stop_events()
         assert app.activity_stack_depth() == 0
 
-    def test_tab_cycles_focus(self, app, mock_screen):
+    def test_tab_toggles_panel(self, app, mock_screen):
         activity = _make_dashboard()
         app.start_activity(activity)
-        assert activity.focus == "packets"
+        assert activity.focus == "split"
+        assert activity.display_state["split"]["focused_panel"] == "left"
         app.send_key(Keys.TAB)
-        assert activity.focus == "nodes"
+        assert activity.display_state["split"]["focused_panel"] == "right"
         app.send_key(Keys.TAB)
-        assert activity.focus == "packets"
+        assert activity.display_state["split"]["focused_panel"] == "left"
 
     def test_q_stops_application(self, app, mock_screen):
         app.start_activity(_make_dashboard())
@@ -294,10 +316,17 @@ class TestDashboardKeyboard:
             app.dispatch_event(CollectorFrame(frame))
         app.drain()
 
-        # Should be able to scroll
-        initial_idx = activity.display_state["packets"]["selected_index"]
+        # Should be able to scroll in the left panel (packets)
+        initial_idx = activity.display_state["split"]["left_selected"]
         app.send_key(curses.KEY_DOWN)
-        assert activity.display_state["packets"]["selected_index"] == initial_idx + 1
+        assert activity.display_state["split"]["left_selected"] == initial_idx + 1
+
+    def test_resize_split(self, app, mock_screen):
+        activity = _make_dashboard()
+        app.start_activity(activity)
+        initial_ratio = activity.display_state["split"]["split_ratio"]
+        app.send_key(curses.KEY_RIGHT)
+        assert activity.display_state["split"]["split_ratio"] > initial_ratio
 
 
 def _group_msg(sender="Alice", text="Hello", channel="Public"):
@@ -341,15 +370,14 @@ class TestDashboardChannelMessage:
         app.dispatch_event(ChannelMessage(_group_msg()))
         app.drain()
 
-        mock_screen.assert_text_on_screen("Channels")
-        mock_screen.assert_text_on_screen("1 msgs decoded")
+        mock_screen.assert_text_on_screen("1ch/1msg decoded")
 
     def test_channel_stats_not_shown_when_zero(self, app, mock_screen):
         activity = _make_dashboard()
         app.start_activity(activity)
-        # No channel messages — stats line should not include "Channels"
+        # No channel messages — stats line should not include "decoded"
         lines = activity._stats_lines()
-        assert not any("Channels" in line for line in lines)
+        assert not any("decoded" in line for line in lines)
 
     def test_channel_stats_plural(self, app, mock_screen):
         activity = _make_dashboard()
@@ -359,7 +387,7 @@ class TestDashboardChannelMessage:
         app.dispatch_event(ChannelMessage(_group_msg(channel="B")))
         app.drain()
 
-        mock_screen.assert_text_on_screen("2 channels")
+        mock_screen.assert_text_on_screen("2ch/2msg decoded")
 
 
 class TestDashboardChannelKey:
@@ -596,21 +624,35 @@ class TestDashboardReentry:
             self._cleanup_fake_service(app)
             store.close()
 
-    def test_first_start_does_not_reload(self, app, mock_screen):
-        """On first start with auto_start=False, _reload_from_store is not called."""
+    def test_first_start_with_auto_start_false(self, app, mock_screen):
+        """On first start with auto_start=False, service is not started but flag is set."""
         activity = _make_dashboard()
         app.start_activity(activity)
 
-        # Should remain at initial state
-        assert activity._service_started is False
+        # Flag is set on first start (enables re-entry reload on subsequent starts)
+        assert activity._service_started is True
+        # But no data is loaded without a service
         assert activity._frame_count == 0
         assert activity._status == "Connecting..."
 
-    def test_service_started_flag_set_on_auto_start(self, app, mock_screen):
-        """When auto_start=True and service starts, _service_started is set."""
-        activity = DashboardActivity(port="/dev/ttyUSB0", auto_start=True)
-        # We can't fully test auto_start=True without a real port,
-        # but verify the flag logic: auto_start=False leaves it False
-        activity2 = _make_dashboard()
-        app.start_activity(activity2)
-        assert activity2._service_started is False
+    def test_auto_start_false_with_existing_service(self, app, mock_screen):
+        """When auto_start=False but a collector service exists, data reloads from store."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/test.db"
+            store = _setup_store_with_data(db_path)
+
+            activity = _make_dashboard()
+            # Register fake service before starting activity
+            svc = _FakeCollectorService(store)
+            app._services["collector"] = svc
+            svc._application = app
+
+            app.start_activity(activity)
+            app.drain()
+
+            # Should have reloaded from store
+            assert activity._rx_count == 5
+            assert activity._status == "Connected"
+
+            app._services.pop("collector", None)
+            store.close()

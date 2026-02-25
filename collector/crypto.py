@@ -47,6 +47,23 @@ class Channel:
     hash: int       # 1-byte channel hash (first byte of SHA-256 of raw PSK)
 
     @classmethod
+    def from_hashtag(cls, name: str) -> "Channel":
+        """Construct a Channel from a hashtag channel name.
+
+        Matches firmware derivation for public hashtag channels:
+        - Normalize name to include '#' prefix
+        - PSK = SHA-256("#name")[:16]
+        - Hash = SHA-256(psk)[:1]
+        - Secret = psk + 16 zero bytes
+        """
+        if not name.startswith("#"):
+            name = f"#{name}"
+        psk = hashlib.sha256(name.encode("utf-8")).digest()[:CIPHER_KEY_SIZE]
+        channel_hash = hashlib.sha256(psk).digest()[0]
+        secret = psk + b"\x00" * (PUB_KEY_SIZE - len(psk))
+        return cls(name=name, secret=secret, hash=channel_hash)
+
+    @classmethod
     def from_psk(cls, name: str, psk_base64: str) -> "Channel":
         """Construct a Channel from a base64-encoded PSK.
 

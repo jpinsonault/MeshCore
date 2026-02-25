@@ -54,14 +54,14 @@ def _value_sparkline(values, width=30, min_val=None, max_val=None):
 
 
 def _fmt_heap_bar(free, total, width=12):
-    """Format a heap usage bar: ████████░░░░ 287,432 / 368,640 B (78%)"""
+    """Format a heap usage bar: ████████░░░░ 287,432 free / 368,640 B (78% used)"""
     if not total or total == 0:
         return "---"
     used = total - free
     pct = used / total
     filled = int(pct * width)
     bar = "\u2588" * filled + "\u2591" * (width - filled)
-    return f"{bar} {free:,} / {total:,} B ({pct * 100:.0f}% used)"
+    return f"{bar} {free:,} free / {total:,} B ({pct * 100:.0f}% used)"
 
 
 def _fmt_duty(airtime_ms, uptime_secs):

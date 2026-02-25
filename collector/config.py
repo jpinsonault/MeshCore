@@ -37,7 +37,13 @@ def load_channels(config):
     """Parse channel entries from config into Channel objects.
 
     Config format:
-        {"channels": [{"name": "MeshCore Public", "psk": "base64..."}]}
+        {"channels": [
+            {"name": "#catlovers"},
+            {"name": "Private", "psk": "base64..."}
+        ]}
+
+    Hashtag channels (name starts with '#', no psk) auto-derive their key
+    from the channel name via SHA-256, matching firmware behaviour.
 
     Returns list of Channel objects. Silently skips invalid entries.
     """
@@ -50,7 +56,14 @@ def load_channels(config):
             continue
         name = entry.get("name", "")
         psk = entry.get("psk", "")
-        if name and psk:
+        if not name:
+            continue
+        if name.startswith("#") and not psk:
+            try:
+                channels.append(Channel.from_hashtag(name))
+            except (ValueError, Exception):
+                pass
+        elif psk:
             try:
                 channels.append(Channel.from_psk(name, psk))
             except (ValueError, Exception):
@@ -64,3 +77,30 @@ def save_config(config, path=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(config, f, indent=2)
+
+
+def add_channel_to_config(name, psk=None, path=None):
+    """Add a channel entry to config. For hashtag channels, psk is omitted.
+
+    Returns True if added, False if already exists.
+    """
+    config = load_config(path)
+    channels = config.get("channels", [])
+    for ch in channels:
+        if ch.get("name") == name:
+            return False
+    entry = {"name": name}
+    if psk:
+        entry["psk"] = psk
+    channels.append(entry)
+    config["channels"] = channels
+    save_config(config, path)
+    return True
+
+
+def remove_channel_from_config(name, path=None):
+    """Remove a channel entry from config by name."""
+    config = load_config(path)
+    channels = config.get("channels", [])
+    config["channels"] = [ch for ch in channels if ch.get("name") != name]
+    save_config(config, path)

@@ -1,5 +1,6 @@
 """Tests for the ChannelBrowserActivity."""
 
+import curses
 import time
 import pytest
 
@@ -82,7 +83,7 @@ class TestRendering:
         channels = [_channel_summary("Public", 42, 3)]
         app.start_activity(_make_activity(channels=channels))
         mock_screen.assert_text_on_screen("Public")
-        mock_screen.assert_text_on_screen("42 msgs")
+        mock_screen.assert_text_on_screen("42")
 
     def test_shows_messages(self, app, mock_screen):
         channels = [_channel_summary("Public")]
@@ -106,6 +107,12 @@ class TestRendering:
         mock_screen.assert_text_on_screen("ENTER")
         mock_screen.assert_text_on_screen("ESC")
 
+    def test_shows_split_view_titles(self, app, mock_screen):
+        channels = [_channel_summary("Public")]
+        app.start_activity(_make_activity(channels=channels))
+        mock_screen.assert_text_on_screen("Channels")
+        mock_screen.assert_text_on_screen("All Messages")
+
 
 class TestNavigation:
     def test_esc_pops_activity(self, app, mock_screen):
@@ -115,14 +122,15 @@ class TestNavigation:
         app.flush_stop_events()
         assert app.activity_stack_depth() == 0
 
-    def test_tab_cycles_focus(self, app, mock_screen):
+    def test_tab_toggles_panel(self, app, mock_screen):
         activity = _make_activity()
         app.start_activity(activity)
-        assert activity.focus == "channel_list"
+        assert activity.focus == "split"
+        assert activity.display_state["split"]["focused_panel"] == "left"
         app.send_key(Keys.TAB)
-        assert activity.focus == "messages"
+        assert activity.display_state["split"]["focused_panel"] == "right"
         app.send_key(Keys.TAB)
-        assert activity.focus == "channel_list"
+        assert activity.display_state["split"]["focused_panel"] == "left"
 
     def test_enter_selects_channel(self, app, mock_screen):
         channels = [
@@ -136,7 +144,7 @@ class TestNavigation:
         activity = _make_activity(channels=channels, messages=messages)
         app.start_activity(activity)
 
-        # Select first channel (Public)
+        # Select first channel (Public) — focus is on left panel
         app.send_key(Keys.ENTER)
         assert activity._selected_channel == "Public"
 
@@ -218,7 +226,7 @@ class TestFilteredLiveUpdates:
         activity = _make_activity(channels=channels, messages=messages)
         app.start_activity(activity)
 
-        # Select ChanA
+        # Select ChanA (left panel is focused by default)
         app.send_key(Keys.ENTER)
         assert activity._selected_channel == "ChanA"
 
@@ -259,18 +267,25 @@ class TestScrollBehavior:
         assert activity._selected_channel is None
 
     def test_scroll_down_in_messages(self, app, mock_screen):
-        """Scroll down in the messages list."""
-        import curses
+        """Scroll down in the messages panel (right side)."""
         messages = [_message(f"User{i}", f"msg{i}") for i in range(10)]
         channels = [_channel_summary()]
         activity = _make_activity(channels=channels, messages=messages)
         app.start_activity(activity)
 
-        # Switch focus to messages
+        # Switch to right panel (messages)
         app.send_key(Keys.TAB)
-        assert activity.focus == "messages"
+        assert activity.display_state["split"]["focused_panel"] == "right"
 
-        # Scroll down
-        initial = activity.display_state["messages"]["selected_index"]
+        # Scroll up from the bottom
+        initial = activity.display_state["split"]["right_selected"]
         app.send_key(curses.KEY_UP)
-        assert activity.display_state["messages"]["selected_index"] == initial - 1
+        assert activity.display_state["split"]["right_selected"] == initial - 1
+
+    def test_resize_split(self, app, mock_screen):
+        """LEFT/RIGHT resizes the split when split is focused."""
+        activity = _make_activity()
+        app.start_activity(activity)
+        initial = activity.display_state["split"]["split_ratio"]
+        app.send_key(curses.KEY_RIGHT)
+        assert activity.display_state["split"]["split_ratio"] > initial

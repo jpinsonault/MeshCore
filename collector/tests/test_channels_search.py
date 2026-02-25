@@ -102,7 +102,7 @@ class TestSearchActivation:
 
         app.send_key(Keys.ESC)
         assert not activity._search_active
-        assert activity.focus == "channel_list"
+        assert activity.focus == "split"
 
     def test_esc_without_search_pops_activity(self, app, mock_screen):
         activity = _make_activity()
@@ -173,7 +173,8 @@ class TestSearchFiltering:
             app.send_key(ord(ch))
         app.send_key(Keys.ENTER)
 
-        assert activity.focus == "messages"
+        assert activity.focus == "split"
+        assert activity.display_state["split"]["focused_panel"] == "right"
         assert activity._search_text == "test"
 
 
@@ -232,3 +233,39 @@ class TestSearchHelpText:
         activity = _make_activity()
         app.start_activity(activity)
         mock_screen.assert_text_on_screen("/:search")
+
+
+class TestTabCycleWithSearch:
+    def test_tab_cycles_to_search_when_active(self, app, mock_screen):
+        """TAB from right panel goes to search_input when search is active."""
+        activity = _make_activity()
+        app.start_activity(activity)
+
+        # Open search
+        app.send_key(ord("/"))
+        assert activity.focus == "search_input"
+
+        # Tab back to split left
+        app.send_key(Keys.TAB)
+        assert activity.focus == "split"
+        assert activity.display_state["split"]["focused_panel"] == "left"
+
+        # Tab to right
+        app.send_key(Keys.TAB)
+        assert activity.display_state["split"]["focused_panel"] == "right"
+
+        # Tab should go to search_input
+        app.send_key(Keys.TAB)
+        assert activity.focus == "search_input"
+
+    def test_tab_wraps_from_search_to_left(self, app, mock_screen):
+        """TAB from search_input goes back to split left panel."""
+        activity = _make_activity()
+        app.start_activity(activity)
+
+        app.send_key(ord("/"))
+        assert activity.focus == "search_input"
+
+        app.send_key(Keys.TAB)
+        assert activity.focus == "split"
+        assert activity.display_state["split"]["focused_panel"] == "left"

@@ -23,7 +23,8 @@ HELP_SECTIONS = {
     "dashboard": {
         "title": "Dashboard",
         "keys": [
-            ("TAB", "Switch focus between packets and nodes"),
+            ("TAB", "Switch focus between packets and nodes panels"),
+            ("LEFT/RIGHT", "Resize the panel split"),
             ("ENTER", "Open detail view for selected item"),
             ("c / C", "Open channel browser"),
             ("s / S", "Open system diagnostics"),
@@ -34,10 +35,31 @@ HELP_SECTIONS = {
             ("UP/DOWN", "Scroll through list items"),
         ],
     },
+    "chat": {
+        "title": "Chat",
+        "keys": [
+            ("TAB", "Cycle focus: rooms \u2192 messages \u2192 command input"),
+            ("LEFT/RIGHT", "Resize the panel split (when split focused)"),
+            ("ENTER", "Select/deselect channel in rooms panel"),
+            ("/join #name", "Join a hashtag channel"),
+            ("/part [#name]", "Leave current or named channel"),
+            ("/search text", "Filter messages (empty to clear)"),
+            ("/diag", "Open system diagnostics"),
+            ("/nodes", "Open node list (dashboard)"),
+            ("/packets", "Open packet list (dashboard)"),
+            ("/status", "Show connection info"),
+            ("/help", "Show available commands"),
+            ("?", "Show this help screen"),
+            ("ESC", "Focus command input / go back"),
+            ("q / Q", "Quit application (when not typing)"),
+            ("UP/DOWN", "Scroll through list items"),
+        ],
+    },
     "channels": {
         "title": "Channel Browser",
         "keys": [
-            ("TAB", "Switch focus between channel list and messages"),
+            ("TAB", "Cycle focus: channels \u2192 messages \u2192 search"),
+            ("LEFT/RIGHT", "Resize the panel split"),
             ("ENTER", "Select/deselect channel to filter"),
             ("/", "Open search bar (filter by text or sender)"),
             ("r / R", "Refresh data from database"),

@@ -149,7 +149,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - SQLite storage: raw_packets, advertisements, nodes, heartbeats, diagnostics
 - pyos-based TUI with port selection and live dashboard
 - JSON HTTP API for browser access from another machine
-- 424 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery)
+- 478 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels)
 
 ### Current Status
 
@@ -176,6 +176,9 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] System diagnostics TUI screen (s key) with sparklines and human-readable formatting
 - [x] /api/diagnostics endpoint and SQLite storage (schema v3)
 - [x] Reliable delivery v2: ring buffer (200KB), seq numbers, CRC-16, ACK/RESUME handshake (schema v4)
+- [x] Side-by-side split panel layout (SplitView component) for dashboard and channel browser
+- [x] Hashtag channel support: `#name` entries auto-derive encryption key via SHA-256
+- [x] IRC-style chat interface (ChatActivity) as new main screen with /commands
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -187,8 +190,10 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/core.py` — Standalone CollectorCore (serial + store, callback-driven)
 - `collector/mesh_service.py` — pyos Service wrapper around CollectorCore
 - `collector/activities/port_select.py` — Serial port picker with remembered selection
-- `collector/crypto.py` — Channel decryption (AES-128-ECB, HMAC-SHA256 MAC)
-- `collector/activities/dashboard.py` — Live mesh traffic dashboard
+- `collector/crypto.py` — Channel decryption (AES-128-ECB, HMAC-SHA256 MAC), hashtag key derivation
+- `collector/split_view.py` — Reusable side-by-side split panel component (SplitView)
+- `collector/activities/chat.py` — IRC-style main screen with /commands, rooms sidebar, message panel
+- `collector/activities/dashboard.py` — Live mesh traffic dashboard (secondary, via /nodes or /packets)
 - `collector/activities/channels.py` — Channel message browser with live updates and search
 - `collector/app.py` — TUI entry point (`python -m collector`)
 - `collector/api.py` — JSON API server (`python -m collector.api`)
@@ -198,7 +203,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/tests/` — 424 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery)
+- `collector/tests/` — 535 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running

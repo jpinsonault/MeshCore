@@ -1,7 +1,7 @@
 """
 Channel Browser Activity — browse decoded group channel messages.
 
-Split-view layout: channel list on top, messages below.
+Side-by-side layout: channel list on the left, messages on the right.
 Subscribes to ChannelMessage events for live updates.
 """
 
@@ -14,15 +14,14 @@ sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
 
 from pyos.Activity import Activity
 from pyos.EventTypes import KeyStroke, ScrollChange, TextBoxChange, TextBoxSubmit
-from pyos.input_handlers import handle_scroll_list_input, handle_text_box_input
+from pyos.input_handlers import handle_text_box_input
 from pyos import Keys
 from pyos.printers.TopBar import TopBar
 from pyos.printers.BottomBar import BottomBar
-from pyos.printers.HorizontalBar import HorizontalBar
-from pyos.printers.ScrollList import ScrollList
 from pyos.printers.TextInput import TextInput
 
 from ..events import ChannelMessage
+from ..split_view import SplitView
 
 
 def _fmt_time(ts):
@@ -47,8 +46,8 @@ class ChannelBrowserActivity(Activity):
         self._total_count = 0
         self._search_active = False
         self._search_text = ""
-        self.tab_order = ["channel_list", "messages"]
-        self.focus = "channel_list"
+        self.tab_order = ["split"]
+        self.focus = "split"
 
     def on_start(self):
         self.application.subscribe(KeyStroke, self, self.on_key_stroke)
@@ -85,18 +84,24 @@ class ChannelBrowserActivity(Activity):
         message_items = self._message_items()
         channel_count = len(self._channels)
 
+        right_title = self._selected_channel or "All Messages"
+
         self.display_state = {
             "top": TopBar.display_state(items={
                 "title": "Channel Browser",
                 "help": f"{channel_count} channel{'s' if channel_count != 1 else ''}",
             }),
-            "channel_list": ScrollList.display_state(
+            "split": SplitView.display_state(
                 self.screen,
-                items=channel_items,
-                selected_index=0,
+                left_items=channel_items,
+                right_items=message_items,
+                left_title=f"Channels [{channel_count}]",
+                right_title=right_title,
+                left_selected=0,
+                right_selected=max(0, len(message_items) - 1),
+                split_ratio=0.3,
                 focused=True,
-                input_handler=handle_scroll_list_input,
-                min_height=3,
+                min_height=5,
                 flex=1,
             ),
             "search_input": TextInput.display_state(
@@ -105,19 +110,9 @@ class ChannelBrowserActivity(Activity):
                 focused=False,
                 input_handler=handle_text_box_input,
             ),
-            "hr": HorizontalBar.display_state(),
-            "messages": ScrollList.display_state(
-                self.screen,
-                items=message_items,
-                selected_index=max(0, len(message_items) - 1),
-                focused=False,
-                input_handler=handle_scroll_list_input,
-                min_height=5,
-                flex=3,
-            ),
             "bottom": BottomBar.display_state(items={
                 "status": self._status_text(),
-                "help": "TAB:switch  ENTER:select  /:search  r:refresh  ESC:back",
+                "help": "TAB:panel  \u25c4\u25ba:resize  ENTER:select  /:search  r:refresh  ESC:back",
             }),
         }
         if not self._search_active:
@@ -131,12 +126,8 @@ class ChannelBrowserActivity(Activity):
         for ch in self._channels:
             name = ch["channel_name"]
             count = ch["msg_count"]
-            senders = ch["unique_senders"]
-            last = _fmt_time(ch.get("last_activity"))
             marker = " >" if name == self._selected_channel else "  "
-            items.append(
-                f"{marker} {name:20s} {count:4d} msgs  last: {last}  {senders} sender{'s' if senders != 1 else ''}"
-            )
+            items.append(f"{marker} {name:16s} {count:4d}")
         return items
 
     def _message_items(self):
@@ -150,7 +141,7 @@ class ChannelBrowserActivity(Activity):
             ts = _fmt_time(m.get("timestamp"))
             sender = m.get("sender", "?")
             text = m.get("text", "")
-            items.append(f"  {ts}  {sender}: {text}")
+            items.append(f" {ts} {sender}: {text}")
         return items
 
     def _status_text(self):
@@ -165,8 +156,11 @@ class ChannelBrowserActivity(Activity):
         self.display_state["top"]["items"]["help"] = (
             f"{len(self._channels)} channel{'s' if len(self._channels) != 1 else ''}"
         )
-        self.display_state["channel_list"]["items"] = self._channel_items()
-        self.display_state["messages"]["items"] = self._message_items()
+        split = self.display_state["split"]
+        split["left_items"] = self._channel_items()
+        split["right_items"] = self._message_items()
+        split["left_title"] = f"Channels [{len(self._channels)}]"
+        split["right_title"] = self._selected_channel or "All Messages"
         self.display_state["bottom"]["items"]["status"] = self._status_text()
         self.display_state["search_input"]["hidden"] = not self._search_active
         self.refresh_screen()
@@ -186,13 +180,14 @@ class ChannelBrowserActivity(Activity):
             return
 
         if event.key == Keys.TAB:
-            self.cycle_focus()
+            self._cycle_split_focus()
             self.refresh_screen()
             return
 
-        if event.key == Keys.ENTER and self.focus == "channel_list":
-            self._select_channel()
-            return
+        if event.key == Keys.ENTER:
+            if self.focus == "split" and self.display_state["split"]["focused_panel"] == "left":
+                self._select_channel()
+                return
 
         if event.key == ord("r") or event.key == ord("R"):
             if self.focus != "search_input":
@@ -209,6 +204,21 @@ class ChannelBrowserActivity(Activity):
         self.delegate_to_focused(event)
         self.refresh_screen()
 
+    def _cycle_split_focus(self):
+        """Custom TAB cycling: left → right → search_input (if active) → left."""
+        if self.focus == "split":
+            panel = self.display_state["split"]["focused_panel"]
+            if panel == "left":
+                self.display_state["split"]["focused_panel"] = "right"
+            else:
+                if self._search_active:
+                    self._set_focus("search_input")
+                else:
+                    self.display_state["split"]["focused_panel"] = "left"
+        elif self.focus == "search_input":
+            self._set_focus("split")
+            self.display_state["split"]["focused_panel"] = "left"
+
     def on_scroll(self, event: ScrollChange):
         self.refresh_screen()
 
@@ -216,7 +226,7 @@ class ChannelBrowserActivity(Activity):
         """Select a channel from the list to filter messages."""
         if not self._channels:
             return
-        idx = self.display_state["channel_list"]["selected_index"]
+        idx = self.display_state["split"]["left_selected"]
         if idx >= len(self._channels):
             return
 
@@ -230,7 +240,7 @@ class ChannelBrowserActivity(Activity):
         self._load_data()
         # Scroll messages to bottom (newest)
         msg_items = self._message_items()
-        self.display_state["messages"]["selected_index"] = max(0, len(msg_items) - 1)
+        self.display_state["split"]["right_selected"] = max(0, len(msg_items) - 1)
         self._update_display()
 
     def _open_search(self):
@@ -239,9 +249,7 @@ class ChannelBrowserActivity(Activity):
         self.display_state["search_input"]["hidden"] = False
         self.display_state["search_input"]["text"] = ""
         self.display_state["search_input"]["cursor_index"] = 0
-        if "search_input" not in self.tab_order:
-            self.tab_order = ["channel_list", "search_input", "messages"]
-        self.focus = "search_input"
+        self._set_focus("search_input")
         self._update_display()
 
     def _close_search(self):
@@ -250,8 +258,8 @@ class ChannelBrowserActivity(Activity):
         self._search_text = ""
         self.display_state["search_input"]["hidden"] = True
         self.display_state["search_input"]["text"] = ""
-        self.tab_order = ["channel_list", "messages"]
-        self.focus = "channel_list"
+        self._set_focus("split")
+        self.display_state["split"]["focused_panel"] = "left"
         self._load_data()
         self._update_display()
 
@@ -263,7 +271,7 @@ class ChannelBrowserActivity(Activity):
         self._load_data()
         # Scroll messages to bottom
         msg_items = self._message_items()
-        self.display_state["messages"]["selected_index"] = max(0, len(msg_items) - 1)
+        self.display_state["split"]["right_selected"] = max(0, len(msg_items) - 1)
         self._update_display()
 
     def _on_search_submit(self, event):
@@ -271,7 +279,8 @@ class ChannelBrowserActivity(Activity):
         if not self._search_active:
             return
         self._search_text = self.display_state["search_input"]["text"]
-        self.focus = "messages"
+        self._set_focus("split")
+        self.display_state["split"]["focused_panel"] = "right"
         self.refresh_screen()
 
     def _on_channel_message(self, event):

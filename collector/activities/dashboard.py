@@ -17,14 +17,12 @@ sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
 
 from pyos.Activity import Activity
 from pyos.EventTypes import KeyStroke, ScrollChange
-from pyos.input_handlers import handle_scroll_list_input
 from pyos import Keys
 from pyos.printers.TopBar import TopBar
 from pyos.printers.BottomBar import BottomBar
-from pyos.printers.HorizontalBar import HorizontalBar
-from pyos.printers.ScrollList import ScrollList
-from pyos.printers.Table import Table
 from pyos.printers.MultilineText import MultilineText
+
+from ..split_view import SplitView
 
 from ..events import (
     ChannelMessage,
@@ -70,6 +68,20 @@ def _fmt_uptime(secs):
         return f"{h}h {m}m {s}s"
     if m > 0:
         return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _fmt_uptime_short(secs):
+    """Format seconds as compact XhXm."""
+    if secs is None:
+        return "---"
+    h = secs // 3600
+    m = (secs % 3600) // 60
+    s = secs % 60
+    if h > 0:
+        return f"{h}h{m}m"
+    if m > 0:
+        return f"{m}m{s}s"
     return f"{s}s"
 
 
@@ -150,8 +162,8 @@ class DashboardActivity(Activity):
         self._sorted_node_keys = []  # ordered pub_key_hex list for index lookup
         self._service_started = False  # True after first on_start creates the service
         self._channel_names = set()  # track unique channel names
-        self.tab_order = ["packets", "nodes"]
-        self.focus = "packets"
+        self.tab_order = ["split"]
+        self.focus = "split"
 
     def on_start(self):
         self.application.subscribe(KeyStroke, self, self.on_key_stroke)
@@ -172,8 +184,13 @@ class DashboardActivity(Activity):
                 self._start_collector_service()
                 if self._ws_port:
                     self._start_server()
-                self._service_started = True
+            elif "collector" in self.application._services:
+                # Launched with auto_start=False but service exists (from ChatActivity)
+                self._reload_from_store()
+            self._service_started = True
             self._build_display()
+            if not self._auto_start and "collector" in self.application._services:
+                self._update_display()
 
     def on_stop(self):
         # Service and server keep running across screen transitions.
@@ -318,79 +335,57 @@ class DashboardActivity(Activity):
             }),
             "stats": MultilineText.display_state(
                 lines=self._stats_lines(),
-                min_height=3,
-                max_height=5,
+                min_height=2,
+                max_height=3,
+                flex=0,
             ),
-            "hr1": HorizontalBar.display_state(),
-            "packets": ScrollList.display_state(
+            "split": SplitView.display_state(
                 self.screen,
-                items=["(waiting for packets...)"],
-                selected_index=0,
+                left_items=["(waiting for packets...)"],
+                right_items=["(waiting for advertisements...)"],
+                left_title="Packets [0]",
+                right_title="Nodes [0]",
                 focused=True,
-                input_handler=handle_scroll_list_input,
-                min_height=5,
-                flex=2,
-            ),
-            "hr2": HorizontalBar.display_state(),
-            "nodes": ScrollList.display_state(
-                self.screen,
-                items=["(waiting for advertisements...)"],
-                selected_index=0,
-                focused=False,
-                input_handler=handle_scroll_list_input,
-                min_height=3,
+                min_height=7,
                 flex=1,
             ),
             "bottom": BottomBar.display_state(items={
                 "status": self._status,
-                "help": "TAB:focus  ENTER:detail  c:chan  s:diag  d:log  ?:help  q:quit",
+                "help": "TAB:panel \u25c4\u25ba:resize c:chan s:diag d:log ?:help q:quit",
             }),
         }
 
     def _stats_lines(self):
-        """Generate the summary stats lines."""
+        """Generate condensed summary stats (2 lines)."""
         lines = []
         now = time.time()
 
-        # Line 1: heartbeat data or waiting message
+        # Line 1: heartbeat + sparkline + rate
         hb = self._last_heartbeat
+        parts = []
         if hb:
-            lines.append(
-                f"  Uptime: {_fmt_uptime(hb.get('uptime_secs'))}  |  "
-                f"Battery: {hb.get('battery_mv', '?')}mV  |  "
-                f"Free pkts: {hb.get('free_pkts', '?')}"
-            )
-            lines.append(
-                f"  Device RX: {hb.get('rx_flood', 0)}F/{hb.get('rx_direct', 0)}D  |  "
-                f"Device TX: {hb.get('tx_flood', 0)}F/{hb.get('tx_direct', 0)}D"
-            )
-        else:
-            lines.append("  (awaiting first heartbeat...)")
-
-        # Line 2: capture stats + packet rate
-        rate = calc_packet_rate(self._packet_times, now)
-        rate_str = f"  {rate:.1f} pkt/s" if self._frame_count > 0 else ""
-        lines.append(
-            f"  Captured: {self._frame_count} frames  "
-            f"({self._rx_count} RX, {self._tx_count} TX, {self._adv_count} ADV)"
-            f"{rate_str}"
-        )
-
-        # Line 3: sparkline + channel stats
-        extra_parts = []
+            parts.append(f"Up:{_fmt_uptime_short(hb.get('uptime_secs'))}")
+            parts.append(f"{hb.get('battery_mv', '?')}mV")
+            parts.append(f"Free:{hb.get('free_pkts', '?')}")
         if self._packet_times:
             spark = make_sparkline(self._packet_times, now)
-            extra_parts.append(f"  Traffic: {spark}")
+            parts.append(spark)
+        rate = calc_packet_rate(self._packet_times, now)
+        if self._frame_count > 0:
+            parts.append(f"{rate:.1f}p/s")
+        if parts:
+            lines.append(" " + "  ".join(parts))
+        else:
+            lines.append(" (awaiting first heartbeat...)")
+
+        # Line 2: counters + channel stats
+        parts2 = [f" {self._rx_count}RX {self._tx_count}TX {self._adv_count}ADV"]
         if self._channel_msg_count > 0:
-            extra_parts.append(
-                f"  Channels: {self._channel_msg_count} msgs decoded "
-                f"({self._channel_count} channel{'s' if self._channel_count != 1 else ''})"
-            )
-        if extra_parts:
-            lines.append("".join(extra_parts))
+            parts2.append(f"{self._channel_count}ch/{self._channel_msg_count}msg decoded")
+        lines.append("  ".join(parts2))
 
         if self._server and self._server.is_running:
-            lines.append(f"  WS: {self._server.ws_url}")
+            lines.append(f" WS: {self._server.ws_url}")
 
         return lines
 
@@ -439,12 +434,14 @@ class DashboardActivity(Activity):
         """Refresh display_state with current data."""
         self.display_state["stats"]["lines"] = self._stats_lines()
 
+        split = self.display_state["split"]
         if self._recent_packets:
-            self.display_state["packets"]["items"] = [
+            split["left_items"] = [
                 self._packet_line(p) for p in self._recent_packets
             ]
         else:
-            self.display_state["packets"]["items"] = ["(waiting for packets...)"]
+            split["left_items"] = ["(waiting for packets...)"]
+        split["left_title"] = f"Packets [{len(self._recent_packets)}]"
 
         if self._nodes:
             sorted_nodes = sorted(
@@ -453,12 +450,13 @@ class DashboardActivity(Activity):
                 reverse=True,
             )
             self._sorted_node_keys = [k for k, v in sorted_nodes]
-            self.display_state["nodes"]["items"] = [
+            split["right_items"] = [
                 self._node_line(k, v) for k, v in sorted_nodes
             ]
         else:
             self._sorted_node_keys = []
-            self.display_state["nodes"]["items"] = ["(waiting for advertisements...)"]
+            split["right_items"] = ["(waiting for advertisements...)"]
+        split["right_title"] = f"Nodes [{len(self._nodes)}]"
 
         self.display_state["bottom"]["items"]["status"] = self._status
         self.refresh_screen()
@@ -486,7 +484,8 @@ class DashboardActivity(Activity):
             self._open_help()
             return
         if event.key == Keys.TAB:
-            self.cycle_focus()
+            panel = self.display_state["split"]["focused_panel"]
+            self.display_state["split"]["focused_panel"] = "right" if panel == "left" else "left"
             self.refresh_screen()
             return
         if event.key == Keys.ENTER:
@@ -579,16 +578,17 @@ class DashboardActivity(Activity):
 
     def _open_detail(self):
         """Open detail view for the focused item."""
-        if self.focus == "packets" and self._recent_packets:
-            idx = self.display_state["packets"]["selected_index"]
+        panel = self.display_state["split"]["focused_panel"]
+        if panel == "left" and self._recent_packets:
+            idx = self.display_state["split"]["left_selected"]
             if 0 <= idx < len(self._recent_packets):
                 pkt = self._recent_packets[idx]
                 frame = pkt.get("frame")
                 if frame:
                     from .packet_detail import PacketDetailActivity
                     self.application.segue_to(PacketDetailActivity(frame=frame))
-        elif self.focus == "nodes" and self._sorted_node_keys:
-            idx = self.display_state["nodes"]["selected_index"]
+        elif panel == "right" and self._sorted_node_keys:
+            idx = self.display_state["split"]["right_selected"]
             if 0 <= idx < len(self._sorted_node_keys):
                 pk = self._sorted_node_keys[idx]
                 info = self._nodes.get(pk, {})

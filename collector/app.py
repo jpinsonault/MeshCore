@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
 from pyos.Application import Application
 
 from .activities.port_select import PortSelectActivity
-from .activities.dashboard import DashboardActivity
+from .activities.chat import ChatActivity
 from .config import load_config
 
 
@@ -37,8 +37,8 @@ class CollectorApp(Application):
 
     def run(self):
         if self._port:
-            # Skip port selection, go directly to dashboard
-            self.start(DashboardActivity(
+            # Skip port selection, go directly to chat
+            self.start(ChatActivity(
                 port=self._port, baud=self._baud, ws_port=self._serve
             ))
         else:

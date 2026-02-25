@@ -1,9 +1,11 @@
-"""Tests for config.py — especially load_channels()."""
+"""Tests for config.py — load_channels(), add/remove channel helpers."""
 
+import json
+import tempfile
 import pytest
 
 import base64
-from collector.config import load_channels
+from collector.config import load_channels, add_channel_to_config, remove_channel_from_config
 from collector.crypto import Channel
 
 
@@ -94,3 +96,117 @@ class TestLoadChannels:
         channels = load_channels(config)
         assert len(channels) == 1
         assert channels[0].name == "Ok"
+
+
+class TestLoadHashtagChannels:
+    def test_hashtag_name_without_psk(self):
+        """Hashtag channel derives key from name."""
+        config = {"channels": [{"name": "#test"}]}
+        channels = load_channels(config)
+        assert len(channels) == 1
+        assert channels[0].name == "#test"
+
+    def test_hashtag_with_psk_uses_psk(self):
+        """If psk is present, from_psk is used even for #names."""
+        config = {"channels": [{"name": "#override", "psk": VALID_PSK}]}
+        channels = load_channels(config)
+        assert len(channels) == 1
+        assert channels[0].secret[:16] == b"\x01" * 16
+
+    def test_non_hashtag_without_psk_skipped(self):
+        """Name without '#' and no psk should be skipped."""
+        config = {"channels": [{"name": "NoPSK"}]}
+        channels = load_channels(config)
+        assert len(channels) == 0
+
+    def test_missing_psk_with_hashtag(self):
+        """Entry missing 'psk' but starting with '#' should auto-derive."""
+        config = {"channels": [{"name": "#meshcore"}]}
+        channels = load_channels(config)
+        assert len(channels) == 1
+        assert channels[0].name == "#meshcore"
+
+
+class TestAddChannelToConfig:
+    def test_add_hashtag_channel(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": []}, f)
+            path = f.name
+        result = add_channel_to_config("#test", path=path)
+        assert result is True
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 1
+        assert config["channels"][0] == {"name": "#test"}
+
+    def test_add_channel_with_psk(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": []}, f)
+            path = f.name
+        result = add_channel_to_config("Private", psk=VALID_PSK, path=path)
+        assert result is True
+        with open(path) as f:
+            config = json.load(f)
+        assert config["channels"][0]["psk"] == VALID_PSK
+
+    def test_add_duplicate_returns_false(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": [{"name": "#test"}]}, f)
+            path = f.name
+        result = add_channel_to_config("#test", path=path)
+        assert result is False
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 1
+
+    def test_add_to_empty_config(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({}, f)
+            path = f.name
+        result = add_channel_to_config("#new", path=path)
+        assert result is True
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 1
+
+    def test_add_preserves_existing(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": [{"name": "#existing"}]}, f)
+            path = f.name
+        add_channel_to_config("#new", path=path)
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 2
+        names = [ch["name"] for ch in config["channels"]]
+        assert "#existing" in names
+        assert "#new" in names
+
+
+class TestRemoveChannelFromConfig:
+    def test_remove_existing(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": [{"name": "#test"}, {"name": "#keep"}]}, f)
+            path = f.name
+        remove_channel_from_config("#test", path=path)
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 1
+        assert config["channels"][0]["name"] == "#keep"
+
+    def test_remove_nonexistent(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": [{"name": "#test"}]}, f)
+            path = f.name
+        remove_channel_from_config("#nonexistent", path=path)
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 1
+
+    def test_remove_from_empty(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"channels": []}, f)
+            path = f.name
+        remove_channel_from_config("#test", path=path)
+        with open(path) as f:
+            config = json.load(f)
+        assert len(config["channels"]) == 0

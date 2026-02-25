@@ -137,8 +137,8 @@ class PortSelectActivity(Activity):
         self._config["port"] = port
         save_config(self._config)
 
-        # Start the dashboard with this port
-        from .dashboard import DashboardActivity
+        # Start the chat interface with this port
+        from .chat import ChatActivity
         self.application.segue_to(
-            DashboardActivity(port=port, baud=self._config.get("baud", 115200)),
+            ChatActivity(port=port, baud=self._config.get("baud", 115200)),
         )
