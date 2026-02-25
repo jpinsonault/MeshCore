@@ -180,6 +180,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] Hashtag channel support: `#name` entries auto-derive encryption key via SHA-256
 - [x] IRC-style chat interface (ChatActivity) as new main screen with /commands
 - [x] Channel cracker: passive dictionary attack on hashtag channels, retroactive decrypt, /crack command
+- [x] Hardware-in-the-loop system tests (7 tests: inject pipeline, CLI commands, sequencing, cracker)
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -205,7 +206,8 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/tests/` — 574 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker)
+- `collector/tests/` — 652 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker)
+- `collector/tests/system/` — 7 hardware-in-the-loop system tests (require MESHCORE_PORT env var)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running
@@ -231,6 +233,9 @@ python -m collector --port /dev/cu.usbserial-0001 --serve 8081
 
 # Run tests
 python -m pytest collector/tests/ -v
+
+# System tests (require hardware)
+MESHCORE_PORT=/dev/cu.usbserial-0001 python -m pytest collector/tests/system/ -v
 ```
 
 ## Contributing

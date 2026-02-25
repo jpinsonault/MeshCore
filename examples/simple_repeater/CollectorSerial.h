@@ -194,9 +194,7 @@ public:
       memcpy(&entry_len, &_ring[_send_cursor], 2);
     }
 
-    // Check backpressure — need room for 0xC0 + len(2) + frame data
     uint16_t wire_len = entry_len;  // 1(type) + 4(seq) + payload + 2(crc) = 7 + payload = entry_len
-    if (_serial->availableForWrite() < (int)(3 + wire_len)) return false;
 
     // Compute CRC over type + seq + payload (entry bytes 2..entry_len-1)
     uint16_t crc_data_len = entry_len - 2;

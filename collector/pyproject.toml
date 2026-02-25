@@ -34,4 +34,5 @@ testpaths = ["tests"]
 pythonpath = [".."]
 markers = [
   "stress: long-running performance and scaling tests",
+  "system: hardware-in-the-loop tests (require MESHCORE_PORT)",
 ]

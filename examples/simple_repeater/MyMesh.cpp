@@ -1220,8 +1220,87 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
       );
       strcpy(reply, "OK");
+    } else if (strncmp(sub, "inject ", 7) == 0) {
+      // Inject a synthetic group message into the collector pipeline (not transmitted over radio).
+      // Usage: collector inject #channel sender message text here
+      const char *args = sub + 7;
+      while (*args == ' ') args++;
+
+      if (*args != '#') {
+        strcpy(reply, "Err - use: collector inject #channel sender message");
+        return;
+      }
+
+      // Parse channel name
+      const char *chan_start = args;
+      const char *p = args + 1;
+      while (*p && *p != ' ') p++;
+      if (!*p) { strcpy(reply, "Err - need sender and message"); return; }
+
+      char chan_name[32];
+      int chan_len = p - chan_start;
+      if (chan_len >= (int)sizeof(chan_name)) chan_len = sizeof(chan_name) - 1;
+      memcpy(chan_name, chan_start, chan_len);
+      chan_name[chan_len] = 0;
+
+      // Parse sender name
+      while (*p == ' ') p++;
+      const char *sender_start = p;
+      while (*p && *p != ' ') p++;
+      if (!*p) { strcpy(reply, "Err - need message text"); return; }
+
+      char sender_name[32];
+      int sender_len = p - sender_start;
+      if (sender_len >= (int)sizeof(sender_name)) sender_len = sizeof(sender_name) - 1;
+      memcpy(sender_name, sender_start, sender_len);
+      sender_name[sender_len] = 0;
+
+      // Rest is message text
+      while (*p == ' ') p++;
+      const char *message = p;
+
+      // Derive channel key: PSK = SHA256(channel_name)[:16]
+      uint8_t psk[CIPHER_KEY_SIZE];
+      mesh::Utils::sha256(psk, CIPHER_KEY_SIZE, (const uint8_t *)chan_name, strlen(chan_name));
+
+      // Zero-pad to 32-byte secret (HMAC needs full PUB_KEY_SIZE)
+      uint8_t secret[PUB_KEY_SIZE];
+      memcpy(secret, psk, CIPHER_KEY_SIZE);
+      memset(secret + CIPHER_KEY_SIZE, 0, PUB_KEY_SIZE - CIPHER_KEY_SIZE);
+
+      // Channel hash = SHA256(psk)[0]
+      uint8_t hash_buf[32];
+      mesh::Utils::sha256(hash_buf, sizeof(hash_buf), psk, CIPHER_KEY_SIZE);
+      uint8_t channel_hash = hash_buf[0];
+
+      // Build plaintext: [timestamp(4 LE)][flags=0(1)][sender: message\0]
+      uint8_t plaintext[MAX_PACKET_PAYLOAD];
+      uint32_t ts = getRTCClock()->getCurrentTime();
+      int pt_len = 0;
+      memcpy(plaintext, &ts, 4); pt_len += 4;
+      plaintext[pt_len++] = 0;  // flags = TXT_TYPE_PLAIN
+      pt_len += snprintf((char *)&plaintext[pt_len], sizeof(plaintext) - pt_len, "%s: %s", sender_name, message);
+      pt_len++;  // include null terminator
+
+      // Build packet payload: [channel_hash(1)] [mac(2)] [ciphertext...]
+      uint8_t payload[MAX_PACKET_PAYLOAD];
+      payload[0] = channel_hash;
+      int enc_len = mesh::Utils::encryptThenMAC(secret, &payload[1], plaintext, pt_len);
+      int payload_len = 1 + enc_len;
+
+      // Build raw wire bytes: [header(1)] [path_len=0(1)] [payload...]
+      uint8_t raw[MAX_TRANS_UNIT + 1];
+      raw[0] = (PAYLOAD_TYPE_GRP_TXT << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD;
+      raw[1] = 0;  // path_len = 0 (no hops)
+      memcpy(&raw[2], payload, payload_len);
+      int raw_len = 2 + payload_len;
+
+      // Feed into collector pipeline only — NOT transmitted over radio
+      logRxRaw(-50.0f, -90.0f, raw, raw_len);
+
+      sprintf(reply, "OK - injected %d bytes on %s", raw_len, chan_name);
     } else {
-      strcpy(reply, "Err - use: collector start|stop|status|diag");
+      strcpy(reply, "Err - use: collector start|stop|status|diag|inject");
     }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
