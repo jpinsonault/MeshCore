@@ -23,7 +23,9 @@
 #define COLLECTOR_HEARTBEAT_INTERVAL  10000  // milliseconds
 #define COLLECTOR_DIAG_INTERVAL      30000  // milliseconds
 
+#ifndef COLLECTOR_RING_SIZE
 #define COLLECTOR_RING_SIZE     (200 * 1024)
+#endif
 #define RING_SENTINEL           0xFFFF
 
 // Ring entry format: [uint16_t entry_len][uint8_t type][uint32_t seq][payload...]
@@ -44,6 +46,7 @@ class CollectorSerial {
   uint32_t _acked_seq;    // highest seq ACKed by host
   uint32_t _dropped_count;
   uint32_t _total_entries;
+  uint32_t _unsent_entries; // entries written but not yet drained
 
   static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len) {
     uint16_t crc = 0xFFFF;
@@ -83,6 +86,7 @@ class CollectorSerial {
     // Advance send_cursor if it points to the entry being dropped
     if (_send_cursor == _head) {
       _send_cursor = _head + entry_len;
+      if (_unsent_entries > 0) _unsent_entries--;
     }
     _head += entry_len;
     _total_entries--;
@@ -99,7 +103,7 @@ public:
   CollectorSerial()
     : _serial(nullptr), _ring(nullptr), _ring_size(0), _ring_valid(false),
       _head(0), _tail(0), _send_cursor(0), _next_seq(1), _acked_seq(0),
-      _dropped_count(0), _total_entries(0) {}
+      _dropped_count(0), _total_entries(0), _unsent_entries(0) {}
 
   void begin(Stream &serial) {
     _serial = &serial;
@@ -117,6 +121,7 @@ public:
     _acked_seq = 0;
     _dropped_count = 0;
     _total_entries = 0;
+    _unsent_entries = 0;
   }
 
   // --- Ring buffer operations ---
@@ -152,6 +157,13 @@ public:
       ringDropHead();
     }
 
+    // After total eviction, reset head and send_cursor to tail so they
+    // point where the new entry will be (not inside stale/overwritten data)
+    if (_total_entries == 0) {
+      _head = _tail;
+      _send_cursor = _tail;
+    }
+
     // Write entry
     uint32_t seq = _next_seq++;
     _ring[_tail + 0] = entry_len & 0xFF;
@@ -161,11 +173,12 @@ public:
     if (len > 0) memcpy(&_ring[_tail + 7], payload, len);
     _tail += entry_len;
     _total_entries++;
+    _unsent_entries++;
     return true;
   }
 
   bool drain() {
-    if (!_ring_valid || _send_cursor == _tail) return false;
+    if (!_ring_valid || _unsent_entries == 0) return false;
 
     // Skip sentinel
     uint16_t entry_len;
@@ -195,11 +208,12 @@ public:
     _serial->write(crc_bytes, 2);
 
     _send_cursor += entry_len;
+    _unsent_entries--;
     return true;
   }
 
   bool hasBacklog() const {
-    return _ring_valid && _send_cursor != _tail;
+    return _ring_valid && _unsent_entries > 0;
   }
 
   void handleAck(uint32_t ack_seq) {
@@ -231,6 +245,7 @@ public:
       _send_cursor += entry_len;
       count--;
     }
+    _unsent_entries = count;
   }
 
   void processIncoming(Stream &s) {
