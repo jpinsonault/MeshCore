@@ -39,9 +39,9 @@ There are no automated tests. Validation is done through physical device testing
 
 ### Flashing ESP32 Boards
 
-The default LoRa frequency is 869.525 MHz (EU). For US 915 MHz boards, override it:
+The default LoRa frequency is 869.525 MHz (EU). For US 915 MHz boards (Seattle / Puget Mesh settings), override:
 ```bash
-export PLATFORMIO_BUILD_FLAGS="-D LORA_FREQ=906.875"
+export PLATFORMIO_BUILD_FLAGS="-D LORA_FREQ=910.525 -D LORA_BW=62.5 -D LORA_SF=7"
 ```
 
 **macOS Tahoe (26.x) issue:** PlatformIO's bundled esptool (v4.5.1) ships pyserial 3.5 which crashes with `termios.error: (22, 'Invalid argument')` when opening CP2102 serial ports. `pio run -t upload` will fail. Workaround: install standalone esptool and flash manually:
