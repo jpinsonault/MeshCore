@@ -137,7 +137,9 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 
 **Firmware** (modified `simple_repeater`):
 - Hooks into `logRxRaw()`, `logTx()`, `onAdvertRecv()` to capture all traffic
-- Binary frame protocol over serial: `[0xC0] [len_lo] [len_hi] [type] [payload...]`
+- Binary frame protocol v2 over serial: `[0xC0] [len_lo] [len_hi] [type] [seq(4B)] [payload...] [crc16(2B)]`
+- 200KB ring buffer with sequence numbers, CRC-16 integrity, and ACK/RESUME handshake for reliable delivery
+- Host-to-device frames: HOST_ACK (0xA0), HOST_RESUME (0xA1) for flow control
 - Runtime-toggleable via CLI: `collector start|stop|status|diag`
 - Frame types: RX_RAW (0xD0), TX_RAW (0xD1), ADVERTISEMENT (0xD2), HEARTBEAT (0xD3), DIAGNOSTICS (0xD4), HANDSHAKE (0xDF)
 - Zero impact when disabled — just a bool check per packet
@@ -147,7 +149,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - SQLite storage: raw_packets, advertisements, nodes, heartbeats, diagnostics
 - pyos-based TUI with port selection and live dashboard
 - JSON HTTP API for browser access from another machine
-- 373 automated tests (protocol, store, TUI activities, diagnostics)
+- 424 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery)
 
 ### Current Status
 
@@ -173,12 +175,13 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] OS diagnostics frame (0xD4): MCU temp, heap, radio metrics, error flags, dedup stats
 - [x] System diagnostics TUI screen (s key) with sparklines and human-readable formatting
 - [x] /api/diagnostics endpoint and SQLite storage (schema v3)
+- [x] Reliable delivery v2: ring buffer (200KB), seq numbers, CRC-16, ACK/RESUME handshake (schema v4)
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
 
-- `examples/simple_repeater/CollectorSerial.h` — Binary frame protocol
-- `examples/simple_repeater/MyMesh.cpp` — Firmware hooks (search for `_collector`)
+- `examples/simple_repeater/CollectorSerial.h` — Binary frame protocol, ring buffer, CRC-16, reliable delivery
+- `examples/simple_repeater/MyMesh.cpp` — Firmware hooks, drain() loop, handleCollectorFrame()
 - `collector/protocol.py` — Frame constants, parsers, FrameReader state machine
 - `collector/store.py` — SQLite schema and query methods
 - `collector/core.py` — Standalone CollectorCore (serial + store, callback-driven)
@@ -195,7 +198,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/tests/` — 373 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics)
+- `collector/tests/` — 424 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Running

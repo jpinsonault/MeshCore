@@ -208,7 +208,7 @@ class TestSchemaMigration:
             row = s._conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
-            assert row["value"] == "3"
+            assert row["value"] == "4"
 
             # diagnostics table should exist
             s._conn.execute("SELECT COUNT(*) FROM diagnostics")

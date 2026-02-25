@@ -29,9 +29,13 @@ from .protocol import (
     FRAME_TYPE_RX_RAW,
     PAYLOAD_TYPE_GRP_TXT,
     FrameReader,
+    build_ack_frame,
+    build_resume_frame,
 )
 from .crypto import try_decode_group_message
 from .store import CollectorStore
+
+ACK_INTERVAL = 1.0  # seconds between ACK frames
 
 
 def list_serial_ports():
@@ -80,6 +84,12 @@ class CollectorCore:
         self._stop_event = threading.Event()
         self._thread = None
         self._connected = False
+
+        # Reliable delivery state (v2)
+        self._protocol_version = 1
+        self._highest_seq_seen = 0
+        self._last_ack_time = 0.0
+        self._replay_above_seq = 0  # skip storage for frames with seq <= this
 
     @property
     def is_running(self):
@@ -147,6 +157,12 @@ class CollectorCore:
         self._ser.reset_input_buffer()
         self._reader = FrameReader()
 
+        # Reset reliable delivery state
+        self._protocol_version = 1
+        self._highest_seq_seen = 0
+        self._last_ack_time = 0.0
+        self._replay_above_seq = 0
+
         # Enable collector mode
         self._ser.write(b"collector start\r")
 
@@ -163,6 +179,7 @@ class CollectorCore:
                     parsed = frame.get("parsed", {})
                     if parsed.get("valid"):
                         handshake_ok = True
+                        self._handle_handshake(parsed)
             for line in self._reader.take_text():
                 self._fire_text(line)
             if handshake_ok:
@@ -193,8 +210,18 @@ class CollectorCore:
             for line in self._reader.take_text():
                 self._fire_text(line)
 
+            # Periodic ACK (v2 only)
+            if self._protocol_version >= 2 and self._highest_seq_seen > 0:
+                now = time.monotonic()
+                if now - self._last_ack_time >= ACK_INTERVAL:
+                    self._send_ack(self._highest_seq_seen)
+                    self._last_ack_time = now
+
         # Disable collector before disconnecting
         try:
+            # Final ACK before disconnect
+            if self._protocol_version >= 2 and self._highest_seq_seen > 0:
+                self._send_ack(self._highest_seq_seen)
             self._ser.write(b"collector stop\r")
             time.sleep(0.3)
         except serial.SerialException:
@@ -203,8 +230,52 @@ class CollectorCore:
         self._connected = False
         self._fire_disconnected("Stopped by user")
 
+    def _handle_handshake(self, parsed):
+        """Process handshake result — set up v2 reliable delivery if supported."""
+        version = parsed.get("version", 1)
+        self._protocol_version = version
+        self._reader.protocol_version = version
+
+        if version >= 2:
+            last_committed = self._store.get_last_committed_seq()
+            self._replay_above_seq = last_committed
+            self._fire_text(
+                f"[collector] v2 handshake: oldest={parsed.get('oldest_seq', '?')}, "
+                f"newest={parsed.get('newest_seq', '?')}, resuming from seq {last_committed}"
+            )
+            try:
+                self._ser.write(build_resume_frame(last_committed))
+            except serial.SerialException:
+                pass
+            self._last_ack_time = time.monotonic()
+
     def _process_frame(self, frame):
         """Store frame, attempt channel decode, and fire callbacks."""
+        seq = frame.get("seq")
+
+        # v2 seq tracking
+        if seq is not None:
+            # Seq reset detection: if incoming seq is much lower than last seen
+            if self._highest_seq_seen > 0 and seq < self._highest_seq_seen and seq < 100:
+                self._fire_text(
+                    f"[collector] seq reset detected: got {seq}, expected > {self._highest_seq_seen}"
+                )
+                self._replay_above_seq = 0  # clear replay watermark on reset
+
+            if seq > self._highest_seq_seen:
+                self._highest_seq_seen = seq
+
+            # Replay dedup: skip storage for frames already committed
+            if self._replay_above_seq > 0 and seq <= self._replay_above_seq:
+                # Still fire callback (for live display) but don't store
+                if self.on_frame:
+                    self.on_frame(frame)
+                return
+
+            # Clear replay watermark once we see a frame above it
+            if self._replay_above_seq > 0 and seq > self._replay_above_seq:
+                self._replay_above_seq = 0
+
         self._store.store_frame(frame)
         if self.on_frame:
             self.on_frame(frame)
@@ -225,6 +296,15 @@ class CollectorCore:
                     self._store.store_channel_message(msg)
                     if self.on_channel_message:
                         self.on_channel_message(msg)
+
+    def _send_ack(self, seq):
+        """Send HOST_ACK frame and persist last committed seq."""
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.write(build_ack_frame(seq))
+                self._store.set_last_committed_seq(seq)
+            except serial.SerialException:
+                pass
 
     def send_command(self, cmd):
         """Send a CLI command to the device. Returns True if sent, False otherwise."""

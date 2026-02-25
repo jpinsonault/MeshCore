@@ -103,6 +103,10 @@ void setup() {
 void loop() {
   int len = strlen(command);
   while (Serial.available() && len < sizeof(command)-1) {
+    if ((uint8_t)Serial.peek() == 0xC0) {
+      the_mesh.handleCollectorFrame();
+      continue;
+    }
     char c = Serial.read();
     if (c != '\n') {
       command[len++] = c;

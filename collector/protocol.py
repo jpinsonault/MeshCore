@@ -20,6 +20,10 @@ FRAME_TYPE_HEARTBEAT = 0xD3
 FRAME_TYPE_DIAGNOSTICS = 0xD4
 FRAME_TYPE_HANDSHAKE = 0xDF
 
+# Host -> Device frame types
+FRAME_TYPE_HOST_ACK = 0xA0
+FRAME_TYPE_HOST_RESUME = 0xA1
+
 FRAME_TYPE_NAMES = {
     FRAME_TYPE_RX_RAW: "RX_RAW",
     FRAME_TYPE_TX_RAW: "TX_RAW",
@@ -63,6 +67,54 @@ ADV_TYPES = {
     4: "SENSOR",
 }
 
+
+# --- CRC-16-CCITT (poly 0x1021, init 0xFFFF) ---
+
+def crc16_ccitt(data: bytes) -> int:
+    """Compute CRC-16-CCITT over data. Returns uint16."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
+
+
+# --- Host-to-device frame builders ---
+
+def build_host_frame(frame_type: int, payload: bytes = b"") -> bytes:
+    """Build a complete v2 wire frame for host-to-device communication.
+
+    Wire format: [0xC0] [len_lo] [len_hi] [type] [seq(4B LE)] [payload] [crc16(2B LE)]
+    Host frames always use seq=0.
+    """
+    seq = struct.pack("<I", 0)
+    crc_data = bytes([frame_type]) + seq + payload
+    crc = crc16_ccitt(crc_data)
+    frame_len = 1 + 4 + len(payload) + 2  # type + seq + payload + crc
+    return (
+        bytes([FRAME_START])
+        + struct.pack("<H", frame_len)
+        + crc_data
+        + struct.pack("<H", crc)
+    )
+
+
+def build_ack_frame(last_seq: int) -> bytes:
+    """Build a HOST_ACK frame: tells firmware 'I have committed through seq N'."""
+    return build_host_frame(FRAME_TYPE_HOST_ACK, struct.pack("<I", last_seq))
+
+
+def build_resume_frame(from_seq: int) -> bytes:
+    """Build a HOST_RESUME frame: tells firmware 'replay everything after seq N'."""
+    return build_host_frame(FRAME_TYPE_HOST_RESUME, struct.pack("<I", from_seq))
+
+
+# --- Parsers ---
 
 def parse_packet_header(raw):
     """Parse the first byte of a mesh packet into route/payload/version."""
@@ -203,16 +255,24 @@ def parse_diagnostics(payload):
 
 
 def parse_handshake(payload):
-    """Parse a HANDSHAKE frame payload."""
+    """Parse a HANDSHAKE frame payload.
+
+    v1: 10 bytes — "COLLECTOR" + version(1)
+    v2: 18 bytes — "COLLECTOR" + version(2) + oldest_seq(4) + newest_seq(4)
+    """
     if len(payload) < 10:
         return {"error": f"too short ({len(payload)} bytes)"}
     magic = payload[0:9].decode("ascii", errors="replace")
     version = payload[9]
-    return {
+    result = {
         "magic": magic,
         "version": version,
         "valid": magic == "COLLECTOR",
     }
+    if version >= 2 and len(payload) >= 18:
+        result["oldest_seq"] = struct.unpack("<I", payload[10:14])[0]
+        result["newest_seq"] = struct.unpack("<I", payload[14:18])[0]
+    return result
 
 
 FRAME_PARSERS = {
@@ -241,12 +301,19 @@ class FrameReader:
 
     Call ``feed(byte)`` for each byte from the serial port. Complete frames and
     text lines are accumulated into ``frames`` and ``text_lines``.
+
+    Protocol version handling:
+    - Starts in v1 mode (no seq, no CRC)
+    - Automatically upgrades to v2 after receiving a handshake with version >= 2
+    - In v2 mode: extracts seq (4 bytes after type), validates CRC (last 2 bytes),
+      strips both before passing payload to parsers
     """
 
     def __init__(self):
         self.frames = []
         self.text_lines = []
         self.errors = []
+        self.protocol_version = 1
         self._text_buf = bytearray()
         self._state = "idle"  # idle | read_len | read_data
         self._len_buf = bytearray()
@@ -290,15 +357,62 @@ class FrameReader:
 
     def _emit_frame(self):
         frame_type = self._data_buf[0]
-        payload = bytes(self._data_buf[1:])
-        frame = {
-            "type": frame_type,
-            "type_name": FRAME_TYPE_NAMES.get(frame_type, f"UNKNOWN(0x{frame_type:02X})"),
-            "payload": payload,
-            "received_at": time.time(),
-            "parsed": parse_frame(frame_type, payload),
-        }
-        self.frames.append(frame)
+
+        # Handshake is always v1 format (even from v2 firmware)
+        if frame_type == FRAME_TYPE_HANDSHAKE:
+            payload = bytes(self._data_buf[1:])
+            frame = {
+                "type": frame_type,
+                "type_name": FRAME_TYPE_NAMES.get(frame_type, f"UNKNOWN(0x{frame_type:02X})"),
+                "payload": payload,
+                "received_at": time.time(),
+                "parsed": parse_frame(frame_type, payload),
+            }
+            self.frames.append(frame)
+            # Auto-upgrade to v2 if handshake indicates it
+            parsed = frame.get("parsed")
+            if parsed and parsed.get("version", 1) >= 2:
+                self.protocol_version = 2
+            return
+
+        if self.protocol_version >= 2:
+            # v2 wire: [type] [seq(4B)] [payload...] [crc16(2B)]
+            raw_data = bytes(self._data_buf)
+            if len(raw_data) < 7:  # type(1) + seq(4) + crc(2) minimum
+                self.errors.append(f"v2 frame too short: {len(raw_data)} bytes")
+                return
+            # Validate CRC (covers type + seq + payload, last 2 bytes are CRC)
+            crc_data = raw_data[:-2]
+            crc_expected = struct.unpack("<H", raw_data[-2:])[0]
+            crc_actual = crc16_ccitt(crc_data)
+            if crc_actual != crc_expected:
+                self.errors.append(
+                    f"CRC mismatch: expected 0x{crc_expected:04X}, got 0x{crc_actual:04X}"
+                )
+                return
+            # Extract seq and payload
+            seq = struct.unpack("<I", raw_data[1:5])[0]
+            payload = bytes(raw_data[5:-2])
+            frame = {
+                "type": frame_type,
+                "type_name": FRAME_TYPE_NAMES.get(frame_type, f"UNKNOWN(0x{frame_type:02X})"),
+                "payload": payload,
+                "seq": seq,
+                "received_at": time.time(),
+                "parsed": parse_frame(frame_type, payload),
+            }
+            self.frames.append(frame)
+        else:
+            # v1 wire: [type] [payload...]
+            payload = bytes(self._data_buf[1:])
+            frame = {
+                "type": frame_type,
+                "type_name": FRAME_TYPE_NAMES.get(frame_type, f"UNKNOWN(0x{frame_type:02X})"),
+                "payload": payload,
+                "received_at": time.time(),
+                "parsed": parse_frame(frame_type, payload),
+            }
+            self.frames.append(frame)
 
     def _flush_text(self):
         line = self._text_buf.decode("ascii", errors="replace").strip()

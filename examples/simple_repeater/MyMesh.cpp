@@ -1297,10 +1297,24 @@ void MyMesh::loop() {
     _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
   }
 
+  // drain collector ring buffer — 1 frame normally, up to 4 during replay catch-up
+  if (_collector_enabled) {
+    int count = _collector.hasBacklog() ? 4 : 1;
+    for (int i = 0; i < count; i++) {
+      if (!_collector.drain()) break;
+    }
+  }
+
   // update uptime
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
+}
+
+void MyMesh::handleCollectorFrame() {
+  if (_collector_enabled) {
+    _collector.processIncoming(Serial);
+  }
 }
 
 // To check if there is pending work

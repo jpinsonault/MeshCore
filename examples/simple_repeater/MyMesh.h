@@ -237,6 +237,8 @@ public:
   }
 #endif
 
+  void handleCollectorFrame();
+
   // To check if there is pending work
   bool hasPendingWork() const;
 };

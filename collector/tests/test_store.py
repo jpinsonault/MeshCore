@@ -22,8 +22,8 @@ def store():
         s.close()
 
 
-def _rx_frame(snr=5.0, rssi=-80, route_type=1, payload_type=5, raw_len=20):
-    return {
+def _rx_frame(snr=5.0, rssi=-80, route_type=1, payload_type=5, raw_len=20, seq=None):
+    frame = {
         "type": FRAME_TYPE_RX_RAW,
         "received_at": time.time(),
         "parsed": {
@@ -35,10 +35,13 @@ def _rx_frame(snr=5.0, rssi=-80, route_type=1, payload_type=5, raw_len=20):
             "raw_len": raw_len,
         },
     }
+    if seq is not None:
+        frame["seq"] = seq
+    return frame
 
 
-def _tx_frame(route_type=2, payload_type=3, raw_len=15):
-    return {
+def _tx_frame(route_type=2, payload_type=3, raw_len=15, seq=None):
+    frame = {
         "type": FRAME_TYPE_TX_RAW,
         "received_at": time.time(),
         "parsed": {
@@ -48,6 +51,9 @@ def _tx_frame(route_type=2, payload_type=3, raw_len=15):
             "raw_len": raw_len,
         },
     }
+    if seq is not None:
+        frame["seq"] = seq
+    return frame
 
 
 def _adv_frame(pub_key_hex="ab" * 32, name="TestNode", adv_type=1):
@@ -197,3 +203,50 @@ class TestSkipsInvalidFrames:
             "parsed": {"error": "too short"},
         })
         assert store.get_stats()["total_packets"] == 0
+
+
+class TestSchemaV4:
+    def test_seq_column_exists(self, store):
+        """Schema v4 adds seq column to raw_packets."""
+        store.store_frame(_rx_frame(seq=42))
+        rows = store.get_recent_packets(limit=1)
+        assert len(rows) == 1
+        assert rows[0]["seq"] == 42
+
+    def test_seq_null_for_v1_frames(self, store):
+        """Frames without seq should have NULL seq."""
+        store.store_frame(_rx_frame())
+        rows = store.get_recent_packets(limit=1)
+        assert rows[0]["seq"] is None
+
+    def test_tx_frame_with_seq(self, store):
+        store.store_frame(_tx_frame(seq=7))
+        rows = store.get_recent_packets(limit=1)
+        assert rows[0]["seq"] == 7
+
+
+class TestLastCommittedSeq:
+    def test_default_is_zero(self, store):
+        assert store.get_last_committed_seq() == 0
+
+    def test_roundtrip(self, store):
+        store.set_last_committed_seq(42)
+        assert store.get_last_committed_seq() == 42
+
+    def test_upsert(self, store):
+        store.set_last_committed_seq(10)
+        store.set_last_committed_seq(20)
+        assert store.get_last_committed_seq() == 20
+
+    def test_persists_across_reopen(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            path = f.name
+        s = CollectorStore(path)
+        s.open()
+        s.set_last_committed_seq(99)
+        s.close()
+
+        s2 = CollectorStore(path)
+        s2.open()
+        assert s2.get_last_committed_seq() == 99
+        s2.close()

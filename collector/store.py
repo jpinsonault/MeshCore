@@ -19,7 +19,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -126,6 +126,11 @@ CREATE TABLE IF NOT EXISTS diagnostics (
 CREATE INDEX IF NOT EXISTS idx_diagnostics_ts ON diagnostics(timestamp);
 """
 
+SCHEMA_V4_SQL = """
+ALTER TABLE raw_packets ADD COLUMN seq INTEGER;
+CREATE INDEX IF NOT EXISTS idx_raw_packets_seq ON raw_packets(seq);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -169,6 +174,14 @@ class CollectorStore:
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 (str(3),),
             )
+            current = 3
+
+        if current < 4:
+            self._conn.executescript(SCHEMA_V4_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(4),),
+            )
 
     def close(self):
         if self._conn:
@@ -180,6 +193,22 @@ class CollectorStore:
         with self._conn:
             yield self._conn
 
+    def get_last_committed_seq(self) -> int:
+        """Return the last committed sequence number (default 0)."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_committed_seq'"
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def set_last_committed_seq(self, seq: int):
+        """Upsert the last committed sequence number."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("last_committed_seq", str(seq)),
+            )
+
     def store_frame(self, frame):
         """Store a parsed frame. Dispatches by frame type."""
         ft = frame["type"]
@@ -188,11 +217,12 @@ class CollectorStore:
             return
 
         now = frame.get("received_at", time.time())
+        seq = frame.get("seq")
 
         if ft == FRAME_TYPE_RX_RAW:
-            self._store_rx(now, parsed)
+            self._store_rx(now, parsed, seq=seq)
         elif ft == FRAME_TYPE_TX_RAW:
-            self._store_tx(now, parsed)
+            self._store_tx(now, parsed, seq=seq)
         elif ft == FRAME_TYPE_ADVERTISEMENT:
             self._store_advertisement(now, parsed)
         elif ft == FRAME_TYPE_HEARTBEAT:
@@ -200,22 +230,22 @@ class CollectorStore:
         elif ft == FRAME_TYPE_DIAGNOSTICS:
             self._store_diagnostics(now, parsed)
 
-    def _store_rx(self, now, p):
+    def _store_rx(self, now, p, seq=None):
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""
         with self._tx() as conn:
             conn.execute(
-                "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len) "
-                "VALUES (?, 'rx', ?, ?, ?, ?, ?, ?)",
-                (now, p.get("snr"), p.get("rssi"), p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0)),
+                "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len, seq) "
+                "VALUES (?, 'rx', ?, ?, ?, ?, ?, ?, ?)",
+                (now, p.get("snr"), p.get("rssi"), p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0), seq),
             )
 
-    def _store_tx(self, now, p):
+    def _store_tx(self, now, p, seq=None):
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""
         with self._tx() as conn:
             conn.execute(
-                "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len) "
-                "VALUES (?, 'tx', NULL, NULL, ?, ?, ?, ?)",
-                (now, p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0)),
+                "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len, seq) "
+                "VALUES (?, 'tx', NULL, NULL, ?, ?, ?, ?, ?)",
+                (now, p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0), seq),
             )
 
     def _store_advertisement(self, now, p):
