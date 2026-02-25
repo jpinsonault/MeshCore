@@ -366,6 +366,14 @@ class CollectorStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_recent_packet_timestamps(self, limit=1000):
+        """Return recent packet timestamps (newest first) for sparkline/rate rebuild."""
+        rows = self._conn.execute(
+            "SELECT timestamp FROM raw_packets ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [r["timestamp"] for r in rows]
+
     def get_traffic_by_type(self):
         """Return packet counts grouped by payload type."""
         rows = self._conn.execute(

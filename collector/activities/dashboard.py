@@ -148,6 +148,8 @@ class DashboardActivity(Activity):
         self._packet_times = deque(maxlen=1000)  # timestamps for rate/sparkline
         self._payload_type_counts = {}  # payload_name -> count
         self._sorted_node_keys = []  # ordered pub_key_hex list for index lookup
+        self._service_started = False  # True after first on_start creates the service
+        self._channel_names = set()  # track unique channel names
         self.tab_order = ["packets", "nodes"]
         self.focus = "packets"
 
@@ -160,23 +162,23 @@ class DashboardActivity(Activity):
         self.application.subscribe(CollectorError, self, self._on_error)
         self.application.subscribe(ChannelMessage, self, self._on_channel_message)
 
-        self._build_display()
-
-        if self._auto_start:
-            self._start_collector_service()
-            if self._ws_port:
-                self._start_server()
+        if self._service_started:
+            # Re-entry after segue — service is still running, reload state from SQLite
+            self._reload_from_store()
+            self._build_display()
+            self._update_display()
+        else:
+            if self._auto_start:
+                self._start_collector_service()
+                if self._ws_port:
+                    self._start_server()
+                self._service_started = True
+            self._build_display()
 
     def on_stop(self):
-        if self._server:
-            self._server.stop()
-            self._server = None
-        try:
-            svc = self.application.service("collector")
-            if svc.is_running:
-                self.application.stop_service("collector")
-        except (KeyError, RuntimeError):
-            pass
+        # Service and server keep running across screen transitions.
+        # They are application-scoped and outlive this activity.
+        pass
 
     def _start_collector_service(self):
         """Register and start the collector service.
@@ -212,6 +214,92 @@ class DashboardActivity(Activity):
         from ..server import CollectorServer
         self._server = CollectorServer(core, ws_port=self._ws_port)
         self._server.start()
+
+    def _reload_from_store(self):
+        """Rebuild in-memory dashboard state from SQLite after a segue return."""
+        try:
+            svc = self.application.service("collector")
+            store = svc.store
+        except (KeyError, RuntimeError):
+            return
+
+        stats = store.get_stats()
+        self._frame_count = stats["total_packets"] + stats["advert_count"]
+        self._rx_count = stats["rx_count"]
+        self._tx_count = stats["tx_count"]
+        self._adv_count = stats["advert_count"]
+        self._last_heartbeat = stats.get("latest_heartbeat")
+        self._channel_msg_count = stats["channel_msg_count"]
+        self._status = "Connected"
+
+        # Channel count
+        summaries = store.get_channel_summary()
+        self._channel_count = len(summaries)
+        self._channel_names = {s["channel_name"] for s in summaries}
+
+        # Recent packets — rebuild display dicts from DB rows
+        rows = store.get_recent_packets(limit=self._max_recent)
+        rows.reverse()  # oldest first, like live accumulation
+        self._recent_packets = []
+        for row in rows:
+            direction = row["direction"].upper()
+            route_name = ROUTE_TYPES.get(row.get("route_type"), "?")
+            ptype_name = PAYLOAD_TYPES.get(row.get("payload_type"), "?")
+            if direction == "RX":
+                extra = f"SNR:{row.get('snr', 0) or 0:+.1f} RSSI:{row.get('rssi', 0) or 0}"
+            else:
+                extra = f"len:{row.get('raw_len', 0)}"
+            self._recent_packets.append({
+                "time": row["timestamp"],
+                "dir": direction,
+                "route": route_name,
+                "ptype": ptype_name,
+                "extra": extra,
+                "frame": {
+                    "type": FRAME_TYPE_RX_RAW if direction == "RX" else FRAME_TYPE_TX_RAW,
+                    "received_at": row["timestamp"],
+                    "parsed": {
+                        "snr": row.get("snr"),
+                        "rssi": row.get("rssi"),
+                        "route_type": row.get("route_type"),
+                        "route_name": route_name,
+                        "payload_type": row.get("payload_type"),
+                        "payload_name": ptype_name,
+                        "raw_len": row.get("raw_len", 0),
+                        "raw": bytes.fromhex(row.get("raw_hex", "") or ""),
+                    },
+                },
+            })
+
+        # Nodes
+        node_rows = store.get_nodes()
+        self._nodes = {}
+        for n in node_rows:
+            pk = n["pub_key_hex"]
+            self._nodes[pk] = {
+                "name": n.get("name", "?"),
+                "adv_type_name": n.get("adv_type_name", "?"),
+                "snr": 0,  # last SNR not stored in nodes table
+                "last_seen": n.get("last_seen"),
+                "count": n.get("advert_count", 0),
+                "lat": n.get("lat"),
+                "lon": n.get("lon"),
+                "pub_key_hex": pk,
+            }
+
+        # Packet timestamps for sparkline/rate
+        ts_list = store.get_recent_packet_timestamps(limit=1000)
+        self._packet_times = deque(reversed(ts_list), maxlen=1000)
+
+        # Payload type distribution
+        type_rows = store.get_traffic_by_type()
+        self._payload_type_counts = {}
+        for tr in type_rows:
+            name = PAYLOAD_TYPES.get(tr["payload_type"], f"0x{tr['payload_type']:02X}" if tr["payload_type"] is not None else "?")
+            self._payload_type_counts[name] = tr["cnt"]
+
+        # SNR history can't be fully recovered; starts empty, repopulates from live data
+        self._node_snr_history = {}
 
     def _resolve_db_path(self):
         from ..config import load_config, DEFAULT_CONFIG_DIR
@@ -482,10 +570,7 @@ class DashboardActivity(Activity):
 
     def _on_channel_message(self, event):
         self._channel_msg_count += 1
-        ch_name = event.msg.channel_name
-        if not hasattr(self, "_channel_names"):
-            self._channel_names = set()
-        self._channel_names.add(ch_name)
+        self._channel_names.add(event.msg.channel_name)
         self._channel_count = len(self._channel_names)
         self._update_display()
 

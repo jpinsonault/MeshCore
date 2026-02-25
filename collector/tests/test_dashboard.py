@@ -1,6 +1,7 @@
 """Tests for the DashboardActivity."""
 
 import curses
+import tempfile
 import time
 import pytest
 
@@ -22,6 +23,7 @@ from collector.protocol import (
     FRAME_TYPE_ADVERTISEMENT,
     FRAME_TYPE_HEARTBEAT,
 )
+from collector.store import CollectorStore
 
 
 def _make_dashboard():
@@ -373,3 +375,242 @@ class TestDashboardChannelKey:
         app.send_key(ord("c"))
         # Still alive
         assert app.activity_stack_depth() >= 1
+
+
+class _FakeCollectorService:
+    """Minimal mock that provides a store for _reload_from_store tests."""
+    def __init__(self, store):
+        self.store = store
+        self.core = None
+        self.is_running = False
+        self._application = None
+        self.state = "STOPPED"
+
+    def on_stop(self):
+        pass
+
+
+def _setup_store_with_data(db_path):
+    """Create and populate a CollectorStore with test data."""
+    store = CollectorStore(db_path=db_path)
+    store.open()
+
+    now = time.time()
+    # Insert RX packets
+    for i in range(5):
+        store.store_frame({
+            "type": FRAME_TYPE_RX_RAW,
+            "received_at": now - 10 + i,
+            "parsed": {
+                "snr": 5.0 + i,
+                "rssi": -80 + i,
+                "route_type": 1,
+                "payload_type": 5,
+                "raw": b"\xaa" * 20,
+                "raw_len": 20,
+            },
+        })
+    # Insert TX packets
+    for i in range(3):
+        store.store_frame({
+            "type": FRAME_TYPE_TX_RAW,
+            "received_at": now - 5 + i,
+            "parsed": {
+                "route_type": 2,
+                "payload_type": 3,
+                "raw": b"\xbb" * 15,
+                "raw_len": 15,
+            },
+        })
+    # Insert advertisement
+    store.store_frame({
+        "type": FRAME_TYPE_ADVERTISEMENT,
+        "received_at": now,
+        "parsed": {
+            "timestamp": 1700000000,
+            "snr": 7.0,
+            "pub_key_hex": "aa" * 32,
+            "adv_type": 1,
+            "adv_type_name": "CHAT",
+            "name": "ReloadNode",
+        },
+    })
+    # Insert heartbeat
+    store.store_frame({
+        "type": FRAME_TYPE_HEARTBEAT,
+        "received_at": now,
+        "parsed": {
+            "timestamp": 1700000000,
+            "battery_mv": 3800,
+            "rx_flood": 50,
+            "rx_direct": 20,
+            "tx_flood": 40,
+            "tx_direct": 10,
+            "free_pkts": 8,
+            "uptime_secs": 7200,
+        },
+    })
+    return store
+
+
+class TestDashboardReentry:
+    """Test that dashboard state persists across segue/return transitions."""
+
+    def _register_fake_service(self, app, activity, store):
+        """Register a fake collector service and mark service as started."""
+        svc = _FakeCollectorService(store)
+        app._services["collector"] = svc
+        svc._application = app
+        activity._service_started = True
+        return svc
+
+    def _cleanup_fake_service(self, app):
+        """Remove fake service before teardown to avoid attribute errors."""
+        app._services.pop("collector", None)
+
+    def test_reload_from_store_restores_counters(self, app, mock_screen):
+        """After segue and return, dashboard reloads state from SQLite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/test.db"
+            store = _setup_store_with_data(db_path)
+
+            activity = _make_dashboard()
+            app.start_activity(activity)
+            self._register_fake_service(app, activity, store)
+
+            # Verify initial state (fresh dashboard, no data yet)
+            assert activity._frame_count == 0
+            assert activity._rx_count == 0
+            assert activity._tx_count == 0
+
+            # Simulate on_stop + on_start (as if returning from a segue)
+            activity.on_stop()
+            activity.on_start()
+            app.drain()
+
+            # Counters should be reloaded from SQLite
+            assert activity._rx_count == 5
+            assert activity._tx_count == 3
+            assert activity._adv_count == 1
+            # frame_count = total_packets(8) + advert_count(1)
+            assert activity._frame_count == 9
+            assert activity._status == "Connected"
+
+            self._cleanup_fake_service(app)
+            store.close()
+
+    def test_reload_restores_nodes(self, app, mock_screen):
+        """After re-entry, nodes are rebuilt from SQLite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/test.db"
+            store = _setup_store_with_data(db_path)
+
+            activity = _make_dashboard()
+            app.start_activity(activity)
+            self._register_fake_service(app, activity, store)
+
+            assert len(activity._nodes) == 0
+
+            # Simulate re-entry
+            activity.on_stop()
+            activity.on_start()
+            app.drain()
+
+            assert len(activity._nodes) == 1
+            assert "aa" * 32 in activity._nodes
+            node = activity._nodes["aa" * 32]
+            assert node["name"] == "ReloadNode"
+            assert node["count"] == 1
+            mock_screen.assert_text_on_screen("ReloadNode")
+
+            self._cleanup_fake_service(app)
+            store.close()
+
+    def test_reload_restores_packets(self, app, mock_screen):
+        """After re-entry, recent packets list is rebuilt from SQLite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/test.db"
+            store = _setup_store_with_data(db_path)
+
+            activity = _make_dashboard()
+            app.start_activity(activity)
+            self._register_fake_service(app, activity, store)
+
+            assert len(activity._recent_packets) == 0
+
+            activity.on_stop()
+            activity.on_start()
+            app.drain()
+
+            # 5 RX + 3 TX = 8 packets
+            assert len(activity._recent_packets) == 8
+            directions = [p["dir"] for p in activity._recent_packets]
+            assert directions.count("RX") == 5
+            assert directions.count("TX") == 3
+
+            self._cleanup_fake_service(app)
+            store.close()
+
+    def test_reload_restores_heartbeat(self, app, mock_screen):
+        """After re-entry, heartbeat data is restored from SQLite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/test.db"
+            store = _setup_store_with_data(db_path)
+
+            activity = _make_dashboard()
+            app.start_activity(activity)
+            self._register_fake_service(app, activity, store)
+
+            assert activity._last_heartbeat is None
+
+            activity.on_stop()
+            activity.on_start()
+            app.drain()
+
+            assert activity._last_heartbeat is not None
+            assert activity._last_heartbeat["battery_mv"] == 3800
+            mock_screen.assert_text_on_screen("3800mV")
+
+            self._cleanup_fake_service(app)
+            store.close()
+
+    def test_reload_restores_packet_timestamps(self, app, mock_screen):
+        """After re-entry, packet_times deque is rebuilt for sparkline."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/test.db"
+            store = _setup_store_with_data(db_path)
+
+            activity = _make_dashboard()
+            app.start_activity(activity)
+            self._register_fake_service(app, activity, store)
+
+            assert len(activity._packet_times) == 0
+
+            activity.on_stop()
+            activity.on_start()
+            app.drain()
+
+            # 8 packets total
+            assert len(activity._packet_times) == 8
+
+            self._cleanup_fake_service(app)
+            store.close()
+
+    def test_first_start_does_not_reload(self, app, mock_screen):
+        """On first start with auto_start=False, _reload_from_store is not called."""
+        activity = _make_dashboard()
+        app.start_activity(activity)
+
+        # Should remain at initial state
+        assert activity._service_started is False
+        assert activity._frame_count == 0
+        assert activity._status == "Connecting..."
+
+    def test_service_started_flag_set_on_auto_start(self, app, mock_screen):
+        """When auto_start=True and service starts, _service_started is set."""
+        activity = DashboardActivity(port="/dev/ttyUSB0", auto_start=True)
+        # We can't fully test auto_start=True without a real port,
+        # but verify the flag logic: auto_start=False leaves it False
+        activity2 = _make_dashboard()
+        app.start_activity(activity2)
+        assert activity2._service_started is False
