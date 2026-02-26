@@ -23,13 +23,27 @@ class PortPickerActivity(Activity):
         self.ports = self._scan_ports()
         self.ble_devices = []  # [(address, name), ...]
         self._ble_scanning = False
+        self._ble_scan_active = True  # keep scanning until user connects/exits
 
-        self.tab_order = ["serial_ports", "ble_devices"]
-        self._set_focus("serial_ports")
+        self.tab_order = ["ble_devices", "serial_ports"]
+        self._set_focus("ble_devices")
 
         self.display_state = {
             "top": TopBar.display_state(
                 items={"title": "BuzzerBoard", "sub": "Select Connection"}
+            ),
+            "ble_label": {
+                "layout": {"height": 1},
+                "line_generator": lambda ctx, h: [
+                    partial(print_line, 2, self._ble_label_text())
+                ],
+            },
+            "ble_devices": ScrollList.display_state(
+                screen=self.screen,
+                items=self._format_ble_devices(),
+                selected_index=0,
+                focused=True,
+                input_handler=handle_scroll_list_input,
             ),
             "serial_label": {
                 "layout": {"height": 1},
@@ -39,17 +53,6 @@ class PortPickerActivity(Activity):
                 screen=self.screen,
                 items=self._format_ports(),
                 selected_index=0,
-                focused=True,
-                input_handler=handle_scroll_list_input,
-            ),
-            "ble_label": {
-                "layout": {"height": 1},
-                "line_generator": lambda ctx, h: [partial(print_line, 2, "BLE Devices:")],
-            },
-            "ble_devices": ScrollList.display_state(
-                screen=self.screen,
-                items=self._format_ble_devices(),
-                selected_index=0,
                 focused=False,
                 input_handler=handle_scroll_list_input,
             ),
@@ -58,7 +61,6 @@ class PortPickerActivity(Activity):
                     "nav": "TAB: switch",
                     "select": "ENTER: connect",
                     "refresh": "r: refresh",
-                    "ble": "b: BLE scan",
                     "quit": "ESC: quit",
                 }
             ),
@@ -81,11 +83,16 @@ class PortPickerActivity(Activity):
             return ["No serial ports found."]
         return [f"{port}  -  {desc}" for port, desc in self.ports]
 
-    def _format_ble_devices(self) -> list:
+    def _ble_label_text(self) -> str:
         if self._ble_scanning:
-            return ["Scanning..."]
+            return "BLE Devices: (scanning...)"
+        return "BLE Devices:"
+
+    def _format_ble_devices(self) -> list:
         if not self.ble_devices:
-            return ["No BLE devices found. Press 'b' to scan."]
+            if self._ble_scanning:
+                return ["Scanning..."]
+            return ["No BLE devices found."]
         return [f"{name}  ({addr})" for addr, name in self.ble_devices]
 
     def _start_ble_scan(self):
@@ -93,7 +100,9 @@ class PortPickerActivity(Activity):
         if self._ble_scanning:
             return
         self._ble_scanning = True
-        self.display_state["ble_devices"]["items"] = self._format_ble_devices()
+        # Update label to show scanning indicator, but keep existing device list
+        if not self.ble_devices:
+            self.display_state["ble_devices"]["items"] = self._format_ble_devices()
         self.refresh_screen()
 
         def do_scan():
@@ -109,15 +118,41 @@ class PortPickerActivity(Activity):
     def _on_ble_scan_done(self, devices):
         """Called on main thread when BLE scan completes."""
         self._ble_scanning = False
-        self.ble_devices = devices
+
+        # Preserve selected device across list updates
+        selected_addr = None
+        if self.ble_devices:
+            idx = self.display_state["ble_devices"]["selected_index"]
+            if 0 <= idx < len(self.ble_devices):
+                selected_addr = self.ble_devices[idx][0]
+
+        # Merge: keep existing devices, add new ones, update names
+        known = {addr: name for addr, name in self.ble_devices}
+        for addr, name in devices:
+            known[addr] = name
+        self.ble_devices = [(addr, name) for addr, name in known.items()]
+
         self.display_state["ble_devices"]["items"] = self._format_ble_devices()
-        self.display_state["ble_devices"]["selected_index"] = 0
+
+        # Restore selection to same device
+        new_idx = 0
+        if selected_addr:
+            for i, (addr, _) in enumerate(self.ble_devices):
+                if addr == selected_addr:
+                    new_idx = i
+                    break
+        self.display_state["ble_devices"]["selected_index"] = new_idx
         self.refresh_screen()
+
+        # Continue scanning if still active
+        if self._ble_scan_active:
+            self._start_ble_scan()
 
     def on_key_stroke(self, event: KeyStroke):
         key = event.key
 
         if key == Keys.ESC:
+            self._ble_scan_active = False
             self.application.pop_activity()
             return
 
@@ -132,10 +167,6 @@ class PortPickerActivity(Activity):
             self.display_state["serial_ports"]["selected_index"] = 0
             self._start_ble_scan()
             self.refresh_screen()
-            return
-
-        if key == ord("b"):
-            self._start_ble_scan()
             return
 
         if key == Keys.ENTER:
@@ -161,10 +192,12 @@ class PortPickerActivity(Activity):
 
     def _connect_serial(self, port: str):
         """Register serial service and segue to InstrumentActivity."""
+        self._ble_scan_active = False
         from .serial_service import BuzzerSerialService
         from .instrument import InstrumentActivity
 
         svc = BuzzerSerialService(port)
+        self.application._services.pop("buzzer_serial", None)
         self.application.register_service("buzzer_serial", svc)
 
         self.display_state["bottom"]["items"]["status"] = f"Connecting to {port}..."
@@ -184,10 +217,12 @@ class PortPickerActivity(Activity):
 
     def _connect_ble(self, address: str):
         """Register BLE service and segue to InstrumentActivity."""
+        self._ble_scan_active = False
         from .ble_service import BuzzerBLEService
         from .instrument import InstrumentActivity
 
         svc = BuzzerBLEService(address)
+        self.application._services.pop("buzzer_serial", None)
         self.application.register_service("buzzer_serial", svc)
 
         self.display_state["bottom"]["items"]["status"] = f"Connecting BLE {address}..."
@@ -197,7 +232,10 @@ class PortPickerActivity(Activity):
             try:
                 svc.on_start()
             except Exception as e:
-                self.main_thread.submit_async(self._show_error, str(e))
+                from loguru import logger
+                logger.exception("BLE connect failed")
+                msg = str(e) or f"{type(e).__name__}"
+                self.main_thread.submit_async(self._show_error, msg)
                 return
             self.main_thread.submit_async(
                 lambda: self.application.segue_to(InstrumentActivity())

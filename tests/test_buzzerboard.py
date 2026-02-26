@@ -522,16 +522,16 @@ class TestPortPickerDualList:
         app.start_activity(PortPickerActivity())
         activity = app.current_activity()
 
-        # Initially focused on serial_ports
-        assert activity.focus == "serial_ports"
-
-        # TAB moves to ble_devices
-        app.send_key(Keys.TAB)
+        # Initially focused on ble_devices (BLE is now default)
         assert activity.focus == "ble_devices"
 
-        # TAB wraps back to serial_ports
+        # TAB moves to serial_ports
         app.send_key(Keys.TAB)
         assert activity.focus == "serial_ports"
+
+        # TAB wraps back to ble_devices
+        app.send_key(Keys.TAB)
+        assert activity.focus == "ble_devices"
 
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
@@ -596,3 +596,215 @@ class TestSustainedNotes:
         instrument_app.send_key(Keys.ESC)  # quit
         stop_cmds = [c for c in mock_serial.commands if c[0] == "STOP"]
         assert len(stop_cmds) >= 1
+
+
+# ===========================================================================
+# 13. BLE scanning
+# ===========================================================================
+
+
+def _make_ble_device(address, name=None):
+    """Create a mock BleakClient device + AdvertisementData pair."""
+    device = MagicMock()
+    device.address = address
+    device.name = name or address
+    return device
+
+
+def _make_adv_data(service_uuids=None, local_name=None):
+    """Create a mock AdvertisementData."""
+    adv = MagicMock()
+    adv.service_uuids = service_uuids or []
+    adv.local_name = local_name
+    return adv
+
+
+NUS_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+
+
+class TestBLEScanning:
+    def test_scan_filters_nus_devices(self):
+        """Only devices advertising NUS UUID should be returned."""
+        import asyncio
+        from buzzerboard_tui.ble_service import BuzzerBLEService
+
+        dev_nus = _make_ble_device("AA:BB:CC:DD:EE:01", "BuzzerBoard")
+        adv_nus = _make_adv_data(service_uuids=[NUS_UUID], local_name="BuzzerBoard")
+        dev_other = _make_ble_device("AA:BB:CC:DD:EE:02", "SomeOther")
+        adv_other = _make_adv_data(service_uuids=["0000180a-0000-1000-8000-00805f9b34fb"])
+
+        scan_result = {
+            "AA:BB:CC:DD:EE:01": (dev_nus, adv_nus),
+            "AA:BB:CC:DD:EE:02": (dev_other, adv_other),
+        }
+
+        with patch("bleak.BleakScanner.discover", return_value=scan_result):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        assert len(results) == 1
+        assert results[0][0] == "AA:BB:CC:DD:EE:01"
+        assert results[0][1] == "BuzzerBoard"
+
+    def test_scan_empty_returns_empty(self):
+        """No devices found → empty list."""
+        import asyncio
+        from buzzerboard_tui.ble_service import BuzzerBLEService
+
+        with patch("bleak.BleakScanner.discover", return_value={}):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        assert results == []
+
+    def test_scan_uses_advertised_name(self):
+        """local_name from advertisement data is preferred over cached device.name."""
+        import asyncio
+        from buzzerboard_tui.ble_service import BuzzerBLEService
+
+        dev = _make_ble_device("AA:BB:CC:DD:EE:03", "CachedName")
+        adv = _make_adv_data(service_uuids=[NUS_UUID], local_name="BuzzerBoard-Live")
+
+        with patch("bleak.BleakScanner.discover",
+                   return_value={"AA:BB:CC:DD:EE:03": (dev, adv)}):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        assert results[0][1] == "BuzzerBoard-Live"
+
+    def test_scan_case_sensitivity(self):
+        """UUID matching should be case-insensitive (bleak may return uppercase)."""
+        import asyncio
+        from buzzerboard_tui.ble_service import BuzzerBLEService
+
+        dev = _make_ble_device("AA:BB:CC:DD:EE:04", "BB")
+        adv = _make_adv_data(service_uuids=[NUS_UUID.upper()], local_name="BB")
+
+        with patch("bleak.BleakScanner.discover",
+                   return_value={"AA:BB:CC:DD:EE:04": (dev, adv)}):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        assert len(results) == 1
+        assert results[0][0] == "AA:BB:CC:DD:EE:04"
+
+
+# ===========================================================================
+# 14. BLE connection via port picker
+# ===========================================================================
+
+
+class TestBLEConnection:
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_ble_device_appears_in_picker(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """A discovered BLE device name should render on screen."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+        # Simulate scan completing with a device
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard-Test")])
+        mock_screen.assert_text_on_screen("BuzzerBoard-Test")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_enter_on_ble_device_connects(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Pressing ENTER on a BLE device should call _connect_ble."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard-Test")])
+
+        with patch.object(activity, "_connect_ble") as mock_connect:
+            app.send_key(Keys.ENTER)
+            mock_connect.assert_called_once_with("AA:BB:CC:DD:EE:FF")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_connect_failure_shows_error(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Connection failure should display an error message."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+        # Simulate error via _show_error (same path _connect_ble uses on failure)
+        activity._show_error("fail")
+        assert activity.display_state["bottom"]["items"]["status"] == "Error: fail"
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_service_re_registration(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Re-connecting should not crash due to 'already registered' service."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+
+        # Register a service under buzzer_serial (simulates first connection)
+        mock_svc = MockBuzzerBLE()
+        app.register_service("buzzer_serial", mock_svc)
+
+        activity = app.current_activity()
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard-Test")])
+
+        # _connect_ble imports BuzzerBLEService locally — patch at the source
+        with patch("buzzerboard_tui.ble_service.BuzzerBLEService") as MockCls, \
+             patch("buzzerboard_tui.port_picker.CentralDispatch"):
+            MockCls.return_value = MagicMock()
+            # Should not raise even though buzzer_serial already exists
+            activity._connect_ble("AA:BB:CC:DD:EE:FF")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_continuous_scan_restarts(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """After scan completes, the next scan starts automatically."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+        mock_ble_scan.reset_mock()
+
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard")])
+        # Should immediately start another scan
+        mock_ble_scan.assert_called_once()
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_scan_stops_on_connect(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Connecting to a device should stop the continuous scan."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard")])
+        mock_ble_scan.reset_mock()
+
+        with patch("buzzerboard_tui.ble_service.BuzzerBLEService") as MockCls, \
+             patch("buzzerboard_tui.port_picker.CentralDispatch"):
+            MockCls.return_value = MagicMock()
+            activity._connect_ble("AA:BB:CC:DD:EE:FF")
+        assert activity._ble_scan_active is False
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_scan_preserves_selection(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Rescan should preserve the user's selected device."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+
+        # First scan finds two devices
+        activity._on_ble_scan_done([
+            ("AA:BB:CC:DD:EE:01", "Device-A"),
+            ("AA:BB:CC:DD:EE:02", "Device-B"),
+        ])
+        # User selects second device
+        activity.display_state["ble_devices"]["selected_index"] = 1
+
+        # Next scan returns same devices (maybe different order)
+        activity._on_ble_scan_done([
+            ("AA:BB:CC:DD:EE:02", "Device-B"),
+            ("AA:BB:CC:DD:EE:01", "Device-A"),
+        ])
+        # Selection should still point to Device-B
+        idx = activity.display_state["ble_devices"]["selected_index"]
+        assert activity.ble_devices[idx][0] == "AA:BB:CC:DD:EE:02"
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_scan_merges_devices(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """New scan results should merge with existing devices, not replace."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:01", "Device-A")])
+        activity._on_ble_scan_done([("AA:BB:CC:DD:EE:02", "Device-B")])
+        assert len(activity.ble_devices) == 2

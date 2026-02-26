@@ -1,5 +1,6 @@
 """BLE communication service for BuzzerBoard firmware via Nordic UART Service."""
 
+import atexit
 import asyncio
 import threading
 
@@ -31,6 +32,7 @@ class BuzzerBLEService(Service):
 
     def on_start(self):
         """Start asyncio loop in background thread, connect, verify PING."""
+        import time as _time
         import bleak  # noqa: F401 — verify import at start
 
         self._loop = asyncio.new_event_loop()
@@ -40,24 +42,28 @@ class BuzzerBLEService(Service):
         self._loop_thread.start()
 
         # Connect and verify
+        t0 = _time.monotonic()
         future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
         future.result(timeout=15.0)
+        logger.info(f"BLE connect took {_time.monotonic() - t0:.2f}s")
 
         # Verify firmware responds
         response = ""
         for attempt in range(3):
+            t1 = _time.monotonic()
             response = self.send_command("PING")
+            logger.info(f"PING attempt {attempt+1}: {response!r} ({_time.monotonic() - t1:.2f}s)")
             if "+PONG" in response:
                 break
-            import time
-            time.sleep(0.5)
+            _time.sleep(0.5)
 
         if "+PONG" not in response:
             self._disconnect_sync()
             raise ConnectionError(
                 f"BLE firmware did not respond to PING (got: {response!r})"
             )
-        logger.info(f"BuzzerBoard connected via BLE to {self.address}")
+        logger.info(f"BuzzerBoard connected via BLE to {self.address} (total {_time.monotonic() - t0:.2f}s)")
+        atexit.register(self._atexit_disconnect)
         self._running_event.set()
 
     def on_stop(self):
@@ -114,6 +120,37 @@ class BuzzerBLEService(Service):
         """Send STOP command."""
         self.send_command("STOP")
 
+    def fetch_log(self) -> list[str]:
+        """Fetch timestamped command log from firmware. Returns list of log lines."""
+        with self._lock:
+            if not self._client or not self._loop:
+                return []
+            lines = []
+            self._response_event.clear()
+            self._response_line = ""
+            data = b"LOG\n"
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.write_gatt_char(self.NUS_TX, data), self._loop
+            )
+            try:
+                future.result(timeout=3.0)
+            except Exception:
+                return []
+            # Collect multi-line response
+            import time
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if self._response_event.wait(timeout=0.5):
+                    self._response_event.clear()
+                    line = self._response_line
+                    if line == "+LOG END":
+                        break
+                    if line.startswith("+LOG "):
+                        lines.append(line[5:])
+                else:
+                    break
+            return lines
+
     def _run_loop(self):
         """Run the asyncio event loop in a background thread."""
         asyncio.set_event_loop(self._loop)
@@ -133,6 +170,12 @@ class BuzzerBLEService(Service):
         if line:
             self._response_line = line
             self._response_event.set()
+
+    def _atexit_disconnect(self):
+        """Last-resort cleanup if on_stop() was never called."""
+        if self._client:
+            logger.info("atexit: forcing BLE disconnect")
+            self._disconnect_sync()
 
     def _disconnect_sync(self):
         """Disconnect and shut down the asyncio loop."""
@@ -157,14 +200,19 @@ class BuzzerBLEService(Service):
         """Scan for BLE devices advertising NUS. Returns [(address, name), ...]."""
         from bleak import BleakScanner
 
+        # Don't pass service_uuids to CoreBluetooth — its filtering is
+        # unreliable on macOS and silently drops matching devices.
+        # Instead, scan everything and filter ourselves.
         devices = await BleakScanner.discover(
             timeout=timeout,
-            service_uuids=[BuzzerBLEService.NUS_SVC],
             return_adv=True,
         )
         results = []
+        nus_lower = BuzzerBLEService.NUS_SVC.lower()
         for addr, (device, adv_data) in devices.items():
-            # Use the raw advertised name, not the OS-cached name
+            adv_uuids = [u.lower() for u in (adv_data.service_uuids or [])]
+            if nus_lower not in adv_uuids:
+                continue
             name = adv_data.local_name or device.name or "Unknown"
             results.append((device.address, name))
         return results
