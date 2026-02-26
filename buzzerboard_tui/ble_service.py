@@ -44,7 +44,7 @@ class BuzzerBLEService(Service):
         # Connect and verify
         t0 = _time.monotonic()
         future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
-        future.result(timeout=15.0)
+        future.result(timeout=45.0)
         logger.info(f"BLE connect took {_time.monotonic() - t0:.2f}s")
 
         # Verify firmware responds
@@ -157,10 +157,25 @@ class BuzzerBLEService(Service):
         self._loop.run_forever()
 
     async def _connect(self):
-        """Connect to the BLE device and subscribe to NUS RX notifications."""
-        from bleak import BleakClient
+        """Connect to the BLE device and subscribe to NUS RX notifications.
 
-        self._client = BleakClient(self.address)
+        On macOS, CoreBluetooth gives each asyncio event loop its own
+        CBCentralManager.  BleakClient.connect() only works when the
+        *same* manager discovered the device, so we scan in THIS loop
+        first to populate the cache, then hand the BLEDevice object
+        (which carries the manager reference) to BleakClient.
+        """
+        from bleak import BleakClient, BleakScanner
+
+        device = await BleakScanner.find_device_by_address(
+            self.address, timeout=30.0
+        )
+        if device is None:
+            raise ConnectionError(
+                f"BLE device {self.address} not found during pre-connect scan"
+            )
+
+        self._client = BleakClient(device)
         await self._client.connect()
         await self._client.start_notify(self.NUS_RX, self._on_nus_rx)
 
@@ -221,6 +236,7 @@ class BuzzerBLEService(Service):
     def scan_sync(timeout: float = 5.0) -> list:
         """Blocking wrapper around scan() for use from sync code."""
         loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
             return loop.run_until_complete(BuzzerBLEService.scan(timeout))
         finally:

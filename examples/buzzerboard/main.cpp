@@ -47,6 +47,19 @@ static uint16_t cmd_len = 0;
 static char ble_cmd_buf[CMD_BUF_SIZE];
 static uint16_t ble_cmd_len = 0;
 
+// Diagnostic log ring buffer
+#define LOG_MAX_ENTRIES 64
+#define LOG_ENTRY_SIZE 64
+static char log_ring[LOG_MAX_ENTRIES][LOG_ENTRY_SIZE];
+static uint16_t log_head = 0;   // next write slot
+static uint16_t log_count = 0;  // entries stored
+
+static void log_command(const char* cmd) {
+  snprintf(log_ring[log_head], LOG_ENTRY_SIZE, "t=%lu %s", millis(), cmd);
+  log_head = (log_head + 1) % LOG_MAX_ENTRIES;
+  if (log_count < LOG_MAX_ENTRIES) log_count++;
+}
+
 // Activity tracking
 static unsigned long last_activity_ms = 0;
 
@@ -62,6 +75,7 @@ static void cmd_tone_start(const char* args, Stream* reply);
 static void cmd_stop(Stream* reply);
 static void cmd_rtttl(const char* args, Stream* reply);
 static void cmd_status(Stream* reply);
+static void cmd_log(Stream* reply);
 static void setup_ble();
 static void disable_peripherals();
 static void buzzer_on();
@@ -215,6 +229,26 @@ void loop() {
     }
   }
 
+  // Advertising LED blink — short flash every 2s when not connected
+  {
+    static unsigned long blink_start_ms = 0;
+    static bool blink_on = false;
+    unsigned long now = millis();
+    if (!Bluefruit.connected()) {
+      if (!blink_on && (now - blink_start_ms >= 2000)) {
+        digitalWrite(LED_PIN, HIGH);
+        blink_on = true;
+        blink_start_ms = now;
+      } else if (blink_on && (now - blink_start_ms >= 30)) {
+        digitalWrite(LED_PIN, LOW);
+        blink_on = false;
+      }
+    } else if (blink_on) {
+      digitalWrite(LED_PIN, LOW);
+      blink_on = false;
+    }
+  }
+
   // Button and power management
   check_button();
   check_inactivity();
@@ -228,7 +262,11 @@ static void handle_command(char* cmd, Stream* reply) {
 
   reset_activity();
 
-  if (strncasecmp(cmd, "PING", 4) == 0) {
+  log_command(cmd);
+
+  if (strncasecmp(cmd, "LOG", 3) == 0) {
+    cmd_log(reply);
+  } else if (strncasecmp(cmd, "PING", 4) == 0) {
     cmd_ping(reply);
   } else if (strncasecmp(cmd, "TONE_START ", 11) == 0) {
     cmd_tone_start(cmd + 11, reply);
@@ -306,6 +344,24 @@ static void cmd_status(Stream* reply) {
   reply->println(" buzzer=on");
 }
 
+static void cmd_log(Stream* reply) {
+  if (log_count == 0) {
+    reply->println("+LOG EMPTY");
+    return;
+  }
+  // Walk the ring buffer oldest-first
+  uint16_t start = (log_count < LOG_MAX_ENTRIES) ? 0 : log_head;
+  for (uint16_t i = 0; i < log_count; i++) {
+    uint16_t idx = (start + i) % LOG_MAX_ENTRIES;
+    reply->print("+LOG ");
+    reply->println(log_ring[idx]);
+  }
+  reply->println("+LOG END");
+  // Clear after dump
+  log_count = 0;
+  log_head = 0;
+}
+
 // --- Button handling ---
 
 static void check_button() {
@@ -348,15 +404,9 @@ static void reset_activity() {
 }
 
 static void check_inactivity() {
-  // Don't sleep while a BLE client is connected
-  if (Bluefruit.connected()) {
-    reset_activity();
-    return;
-  }
-
-  if ((millis() - last_activity_ms) >= INACTIVITY_TIMEOUT_MS) {
-    go_to_sleep();
-  }
+  // No auto-sleep — just keep advertising at the slow interval.
+  // Long-press button (4s) is the only way to enter deep sleep.
+  (void)last_activity_ms;
 }
 
 static void go_to_sleep() {

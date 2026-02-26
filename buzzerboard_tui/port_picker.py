@@ -108,7 +108,7 @@ class PortPickerActivity(Activity):
         def do_scan():
             try:
                 from .ble_service import BuzzerBLEService
-                devices = BuzzerBLEService.scan_sync(timeout=5.0)
+                devices = BuzzerBLEService.scan_sync(timeout=15.0)
             except Exception:
                 devices = []
             self.main_thread.submit_async(self._on_ble_scan_done, devices)
@@ -207,7 +207,7 @@ class PortPickerActivity(Activity):
             try:
                 svc.on_start()
             except Exception as e:
-                self.main_thread.submit_async(self._show_error, str(e))
+                self.main_thread.submit_async(self._on_connect_failed, str(e))
                 return
             self.main_thread.submit_async(
                 lambda: self.application.segue_to(InstrumentActivity())
@@ -215,33 +215,59 @@ class PortPickerActivity(Activity):
 
         CentralDispatch.future(do_connect)
 
-    def _connect_ble(self, address: str):
-        """Register BLE service and segue to InstrumentActivity."""
+    def _connect_ble(self, address: str, max_attempts: int = 3):
+        """Register BLE service and segue to InstrumentActivity, with retries."""
         self._ble_scan_active = False
-        from .ble_service import BuzzerBLEService
-        from .instrument import InstrumentActivity
 
-        svc = BuzzerBLEService(address)
-        self.application._services.pop("buzzer_serial", None)
-        self.application.register_service("buzzer_serial", svc)
-
-        self.display_state["bottom"]["items"]["status"] = f"Connecting BLE {address}..."
+        self.display_state["bottom"]["items"]["status"] = "Waiting for scan..."
         self.refresh_screen()
 
         def do_connect():
-            try:
-                svc.on_start()
-            except Exception as e:
-                from loguru import logger
-                logger.exception("BLE connect failed")
-                msg = str(e) or f"{type(e).__name__}"
-                self.main_thread.submit_async(self._show_error, msg)
-                return
-            self.main_thread.submit_async(
-                lambda: self.application.segue_to(InstrumentActivity())
-            )
+            import time as _time
+            from .ble_service import BuzzerBLEService
+            from .instrument import InstrumentActivity
+
+            # Wait for any in-progress BLE scan to finish —
+            # CoreBluetooth can't scan and connect at the same time.
+            while self._ble_scanning:
+                _time.sleep(0.25)
+
+            for attempt in range(1, max_attempts + 1):
+                self.main_thread.submit_async(
+                    self._set_status, "Connecting ({}/{})...".format(attempt, max_attempts)
+                )
+                svc = BuzzerBLEService(address)
+                self.application._services.pop("buzzer_serial", None)
+                self.application.register_service("buzzer_serial", svc)
+                try:
+                    svc.on_start()
+                    self.main_thread.submit_async(
+                        lambda: self.application.segue_to(InstrumentActivity())
+                    )
+                    return
+                except Exception as e:
+                    from loguru import logger
+                    logger.warning(f"BLE connect attempt {attempt}/{max_attempts} failed: {type(e).__name__}: {e}")
+                    try:
+                        svc._disconnect_sync()
+                    except Exception:
+                        pass
+
+            # All attempts failed — show error and resume scanning
+            self.main_thread.submit_async(self._on_connect_failed, "Connection failed after {} attempts".format(max_attempts))
 
         CentralDispatch.future(do_connect)
+
+    def _set_status(self, message: str):
+        self.display_state["bottom"]["items"]["status"] = message
+        self.refresh_screen()
+
+    def _on_connect_failed(self, message: str):
+        """Show error and resume scanning so user can retry."""
+        self.display_state["bottom"]["items"]["status"] = f"Error: {message}"
+        self._ble_scan_active = True
+        self._start_ble_scan()
+        self.refresh_screen()
 
     def _show_error(self, message: str):
         self.display_state["bottom"]["items"]["status"] = f"Error: {message}"

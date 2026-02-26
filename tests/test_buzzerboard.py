@@ -714,13 +714,14 @@ class TestBLEConnection:
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
     def test_connect_failure_shows_error(self, mock_scan, mock_ble_scan, app, mock_screen):
-        """Connection failure should display an error message."""
+        """Connection failure should display an error and resume scanning."""
         mock_scan.return_value = []
         app.start_activity(PortPickerActivity())
         activity = app.current_activity()
-        # Simulate error via _show_error (same path _connect_ble uses on failure)
-        activity._show_error("fail")
-        assert activity.display_state["bottom"]["items"]["status"] == "Error: fail"
+        activity._on_connect_failed("timeout")
+        assert "Error:" in activity.display_state["bottom"]["items"]["status"]
+        # Scanning should resume so user can retry
+        assert activity._ble_scan_active is True
 
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
@@ -808,3 +809,133 @@ class TestBLEConnection:
         activity._on_ble_scan_done([("AA:BB:CC:DD:EE:01", "Device-A")])
         activity._on_ble_scan_done([("AA:BB:CC:DD:EE:02", "Device-B")])
         assert len(activity.ble_devices) == 2
+
+
+# ===========================================================================
+# 15. BLE end-to-end: scan → connect → play
+# ===========================================================================
+
+
+class TestBLEEndToEnd:
+    """Full user journey: scan → select → connect → play notes."""
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_scan_connect_play_notes(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Scan finds BuzzerBoard, user connects, plays C-D-E."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        picker = app.current_activity()
+
+        # BLE scan discovers the BuzzerBoard
+        picker._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard")])
+        mock_screen.assert_text_on_screen("BuzzerBoard")
+
+        # User presses ENTER — mock the async connect to run synchronously
+        mock_svc = MockBuzzerBLE()
+
+        def sync_connect(address, max_attempts=3):
+            picker._ble_scan_active = False
+            app._services.pop("buzzer_serial", None)
+            app.register_service("buzzer_serial", mock_svc)
+            app.start_service_sync("buzzer_serial")
+            from buzzerboard_tui.instrument import InstrumentActivity
+            app.segue_to(InstrumentActivity())
+
+        with patch.object(picker, "_connect_ble", side_effect=sync_connect):
+            app.send_key(Keys.ENTER)
+
+        # Now on InstrumentActivity
+        mock_screen.assert_text_on_screen("Oct: 5")
+
+        # Play C5, D5, E5
+        app.send_key(ord("a"))
+        app.send_key(ord("s"))
+        app.send_key(ord("d"))
+
+        tone_cmds = [c for c in mock_svc.commands if c[0] == "TONE_START"]
+        assert len(tone_cmds) == 3
+        assert tone_cmds[0][1] == note_freq("C", 5)
+        assert tone_cmds[1][1] == note_freq("D", 5)
+        assert tone_cmds[2][1] == note_freq("E", 5)
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_connect_fail_retry_then_play(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Connection fails, scanning resumes, user retries and connects."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        picker = app.current_activity()
+
+        # First scan finds the device
+        picker._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard")])
+        mock_screen.assert_text_on_screen("BuzzerBoard")
+
+        # First connection attempt fails
+        picker._on_connect_failed("TimeoutError")
+        assert "Error:" in picker.display_state["bottom"]["items"]["status"]
+        # Scanning should have resumed
+        assert picker._ble_scan_active is True
+
+        # Device is still in the list from the merge
+        assert any(addr == "AA:BB:CC:DD:EE:FF" for addr, _ in picker.ble_devices)
+
+        # User retries — this time it works
+        mock_svc = MockBuzzerBLE()
+
+        def sync_connect(address, max_attempts=3):
+            picker._ble_scan_active = False
+            app._services.pop("buzzer_serial", None)
+            app.register_service("buzzer_serial", mock_svc)
+            app.start_service_sync("buzzer_serial")
+            from buzzerboard_tui.instrument import InstrumentActivity
+            app.segue_to(InstrumentActivity())
+
+        with patch.object(picker, "_connect_ble", side_effect=sync_connect):
+            app.send_key(Keys.ENTER)
+
+        # Should be on InstrumentActivity now
+        mock_screen.assert_text_on_screen("Oct: 5")
+
+        # Play a note to confirm everything works
+        app.send_key(ord("a"))
+        tone_cmds = [c for c in mock_svc.commands if c[0] == "TONE_START"]
+        assert len(tone_cmds) == 1
+        assert tone_cmds[0][1] == note_freq("C", 5)
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_scan_connect_record_playback(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Connect via BLE, record notes, play back the recording."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        picker = app.current_activity()
+
+        picker._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard")])
+
+        mock_svc = MockBuzzerBLE()
+
+        def sync_connect(address, max_attempts=3):
+            picker._ble_scan_active = False
+            app._services.pop("buzzer_serial", None)
+            app.register_service("buzzer_serial", mock_svc)
+            app.start_service_sync("buzzer_serial")
+            from buzzerboard_tui.instrument import InstrumentActivity
+            app.segue_to(InstrumentActivity())
+
+        with patch.object(picker, "_connect_ble", side_effect=sync_connect):
+            app.send_key(Keys.ENTER)
+
+        # Record a melody: C-E-G
+        app.send_key(Keys.FORWARD_SLASH)  # start recording
+        mock_screen.assert_text_on_screen("[REC]")
+        app.send_key(ord("a"))  # C5
+        app.send_key(ord("d"))  # E5
+        app.send_key(ord("g"))  # G5
+        mock_screen.assert_text_on_screen("3 notes")
+        app.send_key(Keys.FORWARD_SLASH)  # stop recording
+
+        # Play it back
+        app.send_key(ord("."))
+        rtttl_cmds = [c for c in mock_svc.commands if c[0] == "RTTTL"]
+        assert len(rtttl_cmds) == 1
