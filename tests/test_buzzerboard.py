@@ -1,12 +1,12 @@
 """Tests for BuzzerBoard TUI.
 
 Uses MockScreen + HarnessApplication from pyos.testing.
-Serial communication is mocked -- no hardware needed.
+Serial and BLE communication are mocked -- no hardware needed.
 """
 
 import curses
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from pyos.testing import MockScreen, HarnessApplication
 from pyos import Keys
@@ -342,15 +342,17 @@ class TestRecording:
 
 
 class TestPortPicker:
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
-    def test_renders_title(self, mock_scan, app, mock_screen):
+    def test_renders_title(self, mock_scan, mock_ble_scan, app, mock_screen):
         mock_scan.return_value = [("/dev/ttyUSB0", "USB Serial")]
         app.start_activity(PortPickerActivity())
         mock_screen.assert_text_on_screen("BuzzerBoard")
-        mock_screen.assert_text_on_screen("Select Serial Port")
+        mock_screen.assert_text_on_screen("Select Connection")
 
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
-    def test_shows_ports(self, mock_scan, app, mock_screen):
+    def test_shows_ports(self, mock_scan, mock_ble_scan, app, mock_screen):
         mock_scan.return_value = [
             ("/dev/ttyUSB0", "USB Serial"),
             ("/dev/ttyACM0", "nRF52840"),
@@ -359,14 +361,16 @@ class TestPortPicker:
         mock_screen.assert_text_on_screen("/dev/ttyUSB0")
         mock_screen.assert_text_on_screen("/dev/ttyACM0")
 
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
-    def test_no_ports_message(self, mock_scan, app, mock_screen):
+    def test_no_ports_message(self, mock_scan, mock_ble_scan, app, mock_screen):
         mock_scan.return_value = []
         app.start_activity(PortPickerActivity())
         mock_screen.assert_text_on_screen("No serial ports found")
 
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
-    def test_esc_quits(self, mock_scan, app, mock_screen):
+    def test_esc_quits(self, mock_scan, mock_ble_scan, app, mock_screen):
         mock_scan.return_value = []
         app.start_activity(PortPickerActivity())
         app.send_key(Keys.ESC)
@@ -385,4 +389,164 @@ class TestInstrumentNavigation:
         assert instrument_app.activity_stack_depth() == 1
         instrument_app.send_key(Keys.ESC)
         stops = instrument_app.flush_stop_events()
+        assert len(stops) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Mock BLE service
+# ---------------------------------------------------------------------------
+
+
+class MockBuzzerBLE(Service):
+    """Fake BLE service that captures commands (same interface as serial)."""
+
+    def __init__(self):
+        super().__init__()
+        self.commands = []
+        self.address = "AA:BB:CC:DD:EE:FF"
+
+    def on_start(self):
+        self._running_event.set()
+
+    def on_stop(self):
+        pass
+
+    def play_tone(self, freq, duration_ms=150):
+        self.commands.append(("TONE", freq, duration_ms))
+
+    def play_rtttl(self, rtttl_str):
+        self.commands.append(("RTTTL", rtttl_str))
+        return "+OK PLAYING"
+
+    def stop_playback(self):
+        self.commands.append(("STOP",))
+
+    def send_command(self, cmd):
+        self.commands.append(("CMD", cmd))
+        if cmd == "PING":
+            return "+PONG"
+        return "+OK"
+
+
+@pytest.fixture
+def mock_ble():
+    return MockBuzzerBLE()
+
+
+@pytest.fixture
+def instrument_app_ble(app, mock_ble):
+    """HarnessApplication with mock BLE service, ready for InstrumentActivity."""
+    app.register_service("buzzer_serial", mock_ble)
+    app.start_service_sync("buzzer_serial")
+    return app
+
+
+# ===========================================================================
+# 10. BLE service interface (polymorphism with serial)
+# ===========================================================================
+
+
+class TestBLEServiceInterface:
+    """BLE mock has the same interface as serial -- instrument works unchanged."""
+
+    def test_ble_play_tone(self, instrument_app_ble, mock_screen, mock_ble):
+        instrument_app_ble.start_activity(InstrumentActivity())
+        instrument_app_ble.send_key(ord("a"))
+        assert len(mock_ble.commands) >= 1
+        cmd = mock_ble.commands[-1]
+        assert cmd[0] == "TONE"
+        assert cmd[1] == note_freq("C", 5)
+
+    def test_ble_play_rtttl(self, mock_ble):
+        result = mock_ble.play_rtttl("Test:d=4,o=5,b=120:c,e,g")
+        assert result == "+OK PLAYING"
+        assert ("RTTTL", "Test:d=4,o=5,b=120:c,e,g") in mock_ble.commands
+
+    def test_ble_stop_playback(self, mock_ble):
+        mock_ble.stop_playback()
+        assert ("STOP",) in mock_ble.commands
+
+    def test_ble_send_command_ping(self, mock_ble):
+        result = mock_ble.send_command("PING")
+        assert result == "+PONG"
+
+    def test_ble_recording_playback(self, instrument_app_ble, mock_screen, mock_ble):
+        """Record and playback works the same over BLE."""
+        instrument_app_ble.start_activity(InstrumentActivity())
+        instrument_app_ble.send_key(Keys.FORWARD_SLASH)  # record
+        instrument_app_ble.send_key(ord("a"))
+        instrument_app_ble.send_key(ord("s"))
+        instrument_app_ble.send_key(Keys.FORWARD_SLASH)  # stop
+        instrument_app_ble.send_key(ord("."))  # playback
+        rtttl_cmds = [c for c in mock_ble.commands if c[0] == "RTTTL"]
+        assert len(rtttl_cmds) == 1
+
+
+# ===========================================================================
+# 11. Port Picker with dual lists
+# ===========================================================================
+
+
+class TestPortPickerDualList:
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_renders_connection_title(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = [("/dev/ttyUSB0", "USB Serial")]
+        app.start_activity(PortPickerActivity())
+        mock_screen.assert_text_on_screen("BuzzerBoard")
+        mock_screen.assert_text_on_screen("Select Connection")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_shows_serial_ports_label(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = [("/dev/ttyUSB0", "USB Serial")]
+        app.start_activity(PortPickerActivity())
+        mock_screen.assert_text_on_screen("Serial Ports:")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_shows_ble_devices_label(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        mock_screen.assert_text_on_screen("BLE Devices:")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_tab_cycles_focus(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = [("/dev/ttyUSB0", "USB Serial")]
+        app.start_activity(PortPickerActivity())
+        activity = app.current_activity()
+
+        # Initially focused on serial_ports
+        assert activity.focus == "serial_ports"
+
+        # TAB moves to ble_devices
+        app.send_key(Keys.TAB)
+        assert activity.focus == "ble_devices"
+
+        # TAB wraps back to serial_ports
+        app.send_key(Keys.TAB)
+        assert activity.focus == "serial_ports"
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_shows_no_ble_devices_message(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        mock_screen.assert_text_on_screen("No BLE devices found")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_bottom_bar_shows_tab_hint(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        mock_screen.assert_text_on_screen("TAB: switch")
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_esc_quits(self, mock_scan, mock_ble_scan, app, mock_screen):
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        app.send_key(Keys.ESC)
+        stops = app.flush_stop_events()
         assert len(stops) >= 1

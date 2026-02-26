@@ -10,6 +10,7 @@ requires-python = ">=3.9"
 dependencies = [
     "pyos-tui>=0.1.0",
     "pyserial>=3.5",
+    "bleak>=0.21.0",
 ]
 
 [project.scripts]

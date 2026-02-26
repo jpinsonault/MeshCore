@@ -1,8 +1,7 @@
 /*
  * BuzzerBoard — Minimal Buzzer Firmware for Seeed SenseCAP T1000-E
  *
- * No LoRa, no BLE, no GPS, no mesh.
- * Accepts TONE and RTTTL commands over USB serial.
+ * Accepts TONE and RTTTL commands over USB serial and BLE (Nordic UART Service).
  *
  * Protocol (newline-delimited):
  *   PING                       → +PONG
@@ -14,26 +13,35 @@
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
+#include <bluefruit.h>
 #include <NonBlockingRtttl.h>
 #include "variant.h"
 
-#define FIRMWARE_VERSION "0.1.0"
+#define FIRMWARE_VERSION "0.2.0"
+
+// BLE configuration
+BLEUart bleuart;
+#define BLE_PIN_CODE   1812
+#define BLE_DEVICE_NAME "BuzzerBoard"
 
 // Startup melody
 static const char STARTUP_MELODY[] = "BB:d=16,o=6,b=200:c,e,g";
 
-// Serial command buffer (larger for RTTTL strings)
+// Command buffers (larger for RTTTL strings)
 #define CMD_BUF_SIZE 512
 static char cmd_buf[CMD_BUF_SIZE];
 static uint16_t cmd_len = 0;
+static char ble_cmd_buf[CMD_BUF_SIZE];
+static uint16_t ble_cmd_len = 0;
 
 // Forward declarations
-static void handle_command(char* cmd);
-static void cmd_ping();
-static void cmd_tone(const char* args);
-static void cmd_stop();
-static void cmd_rtttl(const char* args);
-static void cmd_status();
+static void handle_command(char* cmd, Stream* reply);
+static void cmd_ping(Stream* reply);
+static void cmd_tone(const char* args, Stream* reply);
+static void cmd_stop(Stream* reply);
+static void cmd_rtttl(const char* args, Stream* reply);
+static void cmd_status(Stream* reply);
+static void setup_ble();
 static void disable_peripherals();
 static void buzzer_on();
 static void buzzer_off();
@@ -95,6 +103,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);  // longer delay for USB CDC enumeration
 
+  setup_ble();
+
   Serial.println("+READY BuzzerBoard v" FIRMWARE_VERSION);
 
   // Play startup melody AFTER serial is up
@@ -103,59 +113,100 @@ void setup() {
   buzzer_off();
 }
 
+// --- BLE setup ---
+
+static void setup_ble() {
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4);
+  Bluefruit.setName(BLE_DEVICE_NAME);
+
+  // Security: static PIN 1812, MITM protection
+  char pin_str[8];
+  snprintf(pin_str, sizeof(pin_str), "%lu", (unsigned long)BLE_PIN_CODE);
+  Bluefruit.Security.setMITM(true);
+  Bluefruit.Security.setPIN(pin_str);
+  Bluefruit.Security.setIOCaps(true, false, false);  // display only
+
+  // NUS (Nordic UART Service)
+  bleuart.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_ENC_WITH_MITM);
+  bleuart.begin();
+
+  // Advertising
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+}
+
 // --- Main loop ---
 
 void loop() {
   // Advance RTTTL if playing
   if (!rtttl::done()) rtttl::play();
 
-  // Non-blocking serial read
+  // USB Serial commands
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\r' || c == '\n') {
       if (cmd_len > 0) {
         cmd_buf[cmd_len] = '\0';
-        handle_command(cmd_buf);
+        handle_command(cmd_buf, &Serial);
         cmd_len = 0;
       }
     } else if (cmd_len < CMD_BUF_SIZE - 1) {
       cmd_buf[cmd_len++] = c;
     }
   }
+
+  // BLE commands
+  while (bleuart.available()) {
+    char c = bleuart.read();
+    if (c == '\r' || c == '\n') {
+      if (ble_cmd_len > 0) {
+        ble_cmd_buf[ble_cmd_len] = '\0';
+        handle_command(ble_cmd_buf, &bleuart);
+        ble_cmd_len = 0;
+      }
+    } else if (ble_cmd_len < CMD_BUF_SIZE - 1) {
+      ble_cmd_buf[ble_cmd_len++] = c;
+    }
+  }
 }
 
 // --- Command dispatch ---
 
-static void handle_command(char* cmd) {
+static void handle_command(char* cmd, Stream* reply) {
   // Skip leading whitespace
   while (*cmd == ' ') cmd++;
 
   if (strncasecmp(cmd, "PING", 4) == 0) {
-    cmd_ping();
+    cmd_ping(reply);
   } else if (strncasecmp(cmd, "TONE ", 5) == 0) {
-    cmd_tone(cmd + 5);
+    cmd_tone(cmd + 5, reply);
   } else if (strncasecmp(cmd, "STOP", 4) == 0) {
-    cmd_stop();
+    cmd_stop(reply);
   } else if (strncasecmp(cmd, "RTTTL ", 6) == 0) {
-    cmd_rtttl(cmd + 6);
+    cmd_rtttl(cmd + 6, reply);
   } else if (strncasecmp(cmd, "STATUS", 6) == 0) {
-    cmd_status();
+    cmd_status(reply);
   } else {
-    Serial.print("+ERR Unknown command: ");
-    Serial.println(cmd);
+    reply->print("+ERR Unknown command: ");
+    reply->println(cmd);
   }
 }
 
 // --- Commands ---
 
-static void cmd_ping() {
-  Serial.println("+PONG");
+static void cmd_ping(Stream* reply) {
+  reply->println("+PONG");
 }
 
-static void cmd_tone(const char* args) {
+static void cmd_tone(const char* args, Stream* reply) {
   int freq = 0, dur = 0;
   if (sscanf(args, "%d %d", &freq, &dur) != 2 || freq < 20 || freq > 20000 || dur < 1) {
-    Serial.println("+ERR Invalid TONE args");
+    reply->println("+ERR Invalid TONE args");
     return;
   }
   // Stop any RTTTL playback first
@@ -163,19 +214,19 @@ static void cmd_tone(const char* args) {
   // Enable buzzer gate and play
   buzzer_on();
   tone(BUZZER_PIN, freq, dur);
-  Serial.println("+OK");
+  reply->println("+OK");
 }
 
-static void cmd_stop() {
+static void cmd_stop(Stream* reply) {
   if (!rtttl::done()) rtttl::stop();
   noTone(BUZZER_PIN);
   buzzer_off();
-  Serial.println("+OK");
+  reply->println("+OK");
 }
 
-static void cmd_rtttl(const char* args) {
+static void cmd_rtttl(const char* args, Stream* reply) {
   if (!args || strlen(args) < 5) {
-    Serial.println("+ERR Empty RTTTL");
+    reply->println("+ERR Empty RTTTL");
     return;
   }
   // Copy to static buffer since rtttl::begin reads from the pointer over time
@@ -185,13 +236,13 @@ static void cmd_rtttl(const char* args) {
 
   buzzer_on();
   rtttl::begin(BUZZER_PIN, rtttl_buf);
-  Serial.println("+OK PLAYING");
+  reply->println("+OK PLAYING");
 }
 
-static void cmd_status() {
-  Serial.print("+STATUS playing=");
-  Serial.print(rtttl::done() ? "0" : "1");
-  Serial.println(" buzzer=on");
+static void cmd_status(Stream* reply) {
+  reply->print("+STATUS playing=");
+  reply->print(rtttl::done() ? "0" : "1");
+  reply->println(" buzzer=on");
 }
 
 // --- Buzzer helpers ---
