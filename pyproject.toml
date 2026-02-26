@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "buzzerboard-tui"
+version = "0.1.0"
+description = "TUI musical instrument for the Seeed SenseCAP T1000-E buzzer"
+requires-python = ">=3.9"
+dependencies = [
+    "pyos-tui>=0.1.0",
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+buzzerboard = "buzzerboard_tui.__main__:main_cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["buzzerboard_tui*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
