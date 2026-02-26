@@ -6,9 +6,15 @@
  * Protocol (newline-delimited):
  *   PING                       → +PONG
  *   TONE <freq_hz> <dur_ms>    → +OK
+ *   TONE_START <freq_hz>       → +OK  (plays until STOP)
  *   STOP                       → +OK
  *   RTTTL <rtttl_string>       → +OK PLAYING
  *   STATUS                     → +STATUS playing=<0|1> buzzer=on
+ *
+ * Power management:
+ *   - BLE advertises at 1s for 60s, then 5s thereafter
+ *   - After 1 hour of inactivity → deep sleep (button press to wake)
+ *   - Long press button (4s) → shutdown chime + deep sleep
  */
 
 #include <Arduino.h>
@@ -17,15 +23,22 @@
 #include <NonBlockingRtttl.h>
 #include "variant.h"
 
-#define FIRMWARE_VERSION "0.2.0"
+#define FIRMWARE_VERSION "0.3.0"
 
 // BLE configuration
 BLEUart bleuart;
-#define BLE_PIN_CODE   1812
 #define BLE_DEVICE_NAME "BuzzerBoard"
 
-// Startup melody
-static const char STARTUP_MELODY[] = "BB:d=16,o=6,b=200:c,e,g";
+// Advertising
+#define ADV_FAST_TIMEOUT_S  60      // fast mode (1s interval) for 60 seconds, then 5s
+
+// Power management
+#define INACTIVITY_TIMEOUT_MS  3600000UL  // 1 hour
+#define LONG_PRESS_MS          4000       // 4 seconds
+
+// Melodies
+static const char STARTUP_MELODY[]  = "BB:d=16,o=6,b=200:c,e,g";
+static const char SHUTDOWN_MELODY[] = "SD:d=16,o=6,b=200:g,e,c";
 
 // Command buffers (larger for RTTTL strings)
 #define CMD_BUF_SIZE 512
@@ -34,10 +47,18 @@ static uint16_t cmd_len = 0;
 static char ble_cmd_buf[CMD_BUF_SIZE];
 static uint16_t ble_cmd_len = 0;
 
+// Activity tracking
+static unsigned long last_activity_ms = 0;
+
+// Button state
+static bool button_was_down = false;
+static unsigned long button_down_ms = 0;
+
 // Forward declarations
 static void handle_command(char* cmd, Stream* reply);
 static void cmd_ping(Stream* reply);
 static void cmd_tone(const char* args, Stream* reply);
+static void cmd_tone_start(const char* args, Stream* reply);
 static void cmd_stop(Stream* reply);
 static void cmd_rtttl(const char* args, Stream* reply);
 static void cmd_status(Stream* reply);
@@ -45,6 +66,12 @@ static void setup_ble();
 static void disable_peripherals();
 static void buzzer_on();
 static void buzzer_off();
+static void reset_activity();
+static void check_button();
+static void check_inactivity();
+static void go_to_sleep();
+static void connect_callback(uint16_t conn_handle);
+static void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 
 // --- Peripheral shutdown (from t1000e_power_test) ---
 
@@ -100,6 +127,9 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
+  // Init button
+  pinMode(BUTTON_PIN, INPUT);
+
   Serial.begin(115200);
   delay(1000);  // longer delay for USB CDC enumeration
 
@@ -111,6 +141,8 @@ void setup() {
   rtttl::begin(BUZZER_PIN, STARTUP_MELODY);
   while (!rtttl::done()) rtttl::play();
   buzzer_off();
+
+  reset_activity();
 }
 
 // --- BLE setup ---
@@ -120,24 +152,33 @@ static void setup_ble() {
   Bluefruit.setTxPower(4);
   Bluefruit.setName(BLE_DEVICE_NAME);
 
-  // Security: static PIN 1812, MITM protection
-  char pin_str[8];
-  snprintf(pin_str, sizeof(pin_str), "%lu", (unsigned long)BLE_PIN_CODE);
-  Bluefruit.Security.setMITM(true);
-  Bluefruit.Security.setPIN(pin_str);
-  Bluefruit.Security.setIOCaps(true, false, false);  // display only
-
-  // NUS (Nordic UART Service)
-  bleuart.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_ENC_WITH_MITM);
+  // NUS (Nordic UART Service) — no security (it's a buzzer)
   bleuart.begin();
 
-  // Advertising
+  // Connection callbacks
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+
+  // Advertising: 1s fast for 60s, then 5s slow
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(bleuart);
   Bluefruit.ScanResponse.addName();
   Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setIntervalMS(1000, 5000);
+  Bluefruit.Advertising.setFastTimeout(ADV_FAST_TIMEOUT_S);
   Bluefruit.Advertising.start(0);
+}
+
+static void connect_callback(uint16_t conn_handle) {
+  (void)conn_handle;
+  reset_activity();
+}
+
+static void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  (void)conn_handle;
+  (void)reason;
+  reset_activity();
 }
 
 // --- Main loop ---
@@ -173,6 +214,10 @@ void loop() {
       ble_cmd_buf[ble_cmd_len++] = c;
     }
   }
+
+  // Button and power management
+  check_button();
+  check_inactivity();
 }
 
 // --- Command dispatch ---
@@ -181,8 +226,12 @@ static void handle_command(char* cmd, Stream* reply) {
   // Skip leading whitespace
   while (*cmd == ' ') cmd++;
 
+  reset_activity();
+
   if (strncasecmp(cmd, "PING", 4) == 0) {
     cmd_ping(reply);
+  } else if (strncasecmp(cmd, "TONE_START ", 11) == 0) {
+    cmd_tone_start(cmd + 11, reply);
   } else if (strncasecmp(cmd, "TONE ", 5) == 0) {
     cmd_tone(cmd + 5, reply);
   } else if (strncasecmp(cmd, "STOP", 4) == 0) {
@@ -217,6 +266,18 @@ static void cmd_tone(const char* args, Stream* reply) {
   reply->println("+OK");
 }
 
+static void cmd_tone_start(const char* args, Stream* reply) {
+  int freq = 0;
+  if (sscanf(args, "%d", &freq) != 1 || freq < 20 || freq > 20000) {
+    reply->println("+ERR Invalid TONE_START args");
+    return;
+  }
+  if (!rtttl::done()) rtttl::stop();
+  buzzer_on();
+  tone(BUZZER_PIN, freq);  // no duration = play indefinitely
+  reply->println("+OK");
+}
+
 static void cmd_stop(Stream* reply) {
   if (!rtttl::done()) rtttl::stop();
   noTone(BUZZER_PIN);
@@ -243,6 +304,75 @@ static void cmd_status(Stream* reply) {
   reply->print("+STATUS playing=");
   reply->print(rtttl::done() ? "0" : "1");
   reply->println(" buzzer=on");
+}
+
+// --- Button handling ---
+
+static void check_button() {
+  bool is_down = (digitalRead(BUTTON_PIN) == HIGH);
+
+  if (is_down && !button_was_down) {
+    // Button just pressed
+    button_down_ms = millis();
+    button_was_down = true;
+  } else if (is_down && button_was_down) {
+    // Button held — check for long press
+    if ((millis() - button_down_ms) >= LONG_PRESS_MS) {
+      // Long press: shutdown with chime
+      if (!rtttl::done()) rtttl::stop();
+      noTone(BUZZER_PIN);
+      buzzer_on();
+      rtttl::begin(BUZZER_PIN, SHUTDOWN_MELODY);
+      while (!rtttl::done()) rtttl::play();
+      buzzer_off();
+
+      // Wait for button release so it doesn't immediately wake
+      while (digitalRead(BUTTON_PIN) == HIGH) delay(10);
+      delay(100);  // debounce
+
+      go_to_sleep();
+    }
+  } else if (!is_down && button_was_down) {
+    // Button released (short press) — restart fast advertising
+    button_was_down = false;
+    reset_activity();
+    Bluefruit.Advertising.restartOnDisconnect(true);
+    Bluefruit.Advertising.start(0);
+  }
+}
+
+// --- Power management ---
+
+static void reset_activity() {
+  last_activity_ms = millis();
+}
+
+static void check_inactivity() {
+  // Don't sleep while a BLE client is connected
+  if (Bluefruit.connected()) {
+    reset_activity();
+    return;
+  }
+
+  if ((millis() - last_activity_ms) >= INACTIVITY_TIMEOUT_MS) {
+    go_to_sleep();
+  }
+}
+
+static void go_to_sleep() {
+  // Silence everything
+  if (!rtttl::done()) rtttl::stop();
+  noTone(BUZZER_PIN);
+  buzzer_off();
+
+  // Stop BLE
+  Bluefruit.Advertising.stop();
+
+  // Configure button as wake source (active HIGH)
+  nrf_gpio_cfg_sense_input(BUTTON_PIN, NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_SENSE_HIGH);
+
+  // Deep sleep — wakes via button, runs setup() again
+  sd_power_system_off();
 }
 
 // --- Buzzer helpers ---

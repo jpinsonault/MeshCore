@@ -4,12 +4,11 @@ Uses MockScreen + HarnessApplication from pyos.testing.
 Serial and BLE communication are mocked -- no hardware needed.
 """
 
-import curses
 import pytest
 from unittest.mock import patch, MagicMock
 
 from pyos.testing import MockScreen, HarnessApplication
-from pyos import Keys
+from pyos import Keys, Attrs
 from pyos.Service import Service
 
 from buzzerboard_tui.notes import (
@@ -44,6 +43,9 @@ class MockBuzzerSerial(Service):
 
     def play_tone(self, freq, duration_ms=150):
         self.commands.append(("TONE", freq, duration_ms))
+
+    def tone_start(self, freq):
+        self.commands.append(("TONE_START", freq))
 
     def play_rtttl(self, rtttl_str):
         self.commands.append(("RTTTL", rtttl_str))
@@ -232,19 +234,19 @@ class TestInstrumentRendering:
 
 
 class TestNotePlayback:
-    def test_pressing_a_sends_tone(self, instrument_app, mock_screen, mock_serial):
+    def test_pressing_a_sends_tone_start(self, instrument_app, mock_screen, mock_serial):
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("a"))
         assert len(mock_serial.commands) >= 1
         cmd = mock_serial.commands[-1]
-        assert cmd[0] == "TONE"
+        assert cmd[0] == "TONE_START"
         assert cmd[1] == note_freq("C", 5)
 
     def test_pressing_w_sends_sharp(self, instrument_app, mock_screen, mock_serial):
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("w"))
         cmd = mock_serial.commands[-1]
-        assert cmd[0] == "TONE"
+        assert cmd[0] == "TONE_START"
         assert cmd[1] == note_freq("C#", 5)
 
     def test_note_name_displayed_after_press(self, instrument_app, mock_screen):
@@ -256,7 +258,7 @@ class TestNotePlayback:
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("a"))
         # The active key cell should have REVERSE attribute
-        mock_screen.assert_text_has_attr(" C ", curses.A_REVERSE)
+        mock_screen.assert_text_has_attr(" C ", Attrs.REVERSE)
 
 
 # ===========================================================================
@@ -291,8 +293,8 @@ class TestOctaveShift:
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(Keys.RIGHT_BRACKET)  # octave 6
         instrument_app.send_key(ord("a"))  # C6
-        cmd = mock_serial.commands[-1]
-        assert cmd[1] == note_freq("C", 6)
+        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        assert tone_cmds[-1][1] == note_freq("C", 6)
 
 
 # ===========================================================================
@@ -414,6 +416,9 @@ class MockBuzzerBLE(Service):
     def play_tone(self, freq, duration_ms=150):
         self.commands.append(("TONE", freq, duration_ms))
 
+    def tone_start(self, freq):
+        self.commands.append(("TONE_START", freq))
+
     def play_rtttl(self, rtttl_str):
         self.commands.append(("RTTTL", rtttl_str))
         return "+OK PLAYING"
@@ -449,12 +454,12 @@ def instrument_app_ble(app, mock_ble):
 class TestBLEServiceInterface:
     """BLE mock has the same interface as serial -- instrument works unchanged."""
 
-    def test_ble_play_tone(self, instrument_app_ble, mock_screen, mock_ble):
+    def test_ble_play_tone_start(self, instrument_app_ble, mock_screen, mock_ble):
         instrument_app_ble.start_activity(InstrumentActivity())
         instrument_app_ble.send_key(ord("a"))
         assert len(mock_ble.commands) >= 1
         cmd = mock_ble.commands[-1]
-        assert cmd[0] == "TONE"
+        assert cmd[0] == "TONE_START"
         assert cmd[1] == note_freq("C", 5)
 
     def test_ble_play_rtttl(self, mock_ble):
@@ -550,3 +555,44 @@ class TestPortPickerDualList:
         app.send_key(Keys.ESC)
         stops = app.flush_stop_events()
         assert len(stops) >= 1
+
+
+# ===========================================================================
+# 12. Sustained notes (hold-key-to-sustain)
+# ===========================================================================
+
+
+class TestSustainedNotes:
+    def test_key_press_sends_tone_start(self, instrument_app, mock_screen, mock_serial):
+        """First press of a note key sends TONE_START with correct frequency."""
+        instrument_app.start_activity(InstrumentActivity())
+        instrument_app.send_key(ord("a"))
+        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        assert len(tone_cmds) == 1
+        assert tone_cmds[0][1] == note_freq("C", 5)
+
+    def test_key_repeat_does_not_resend(self, instrument_app, mock_screen, mock_serial):
+        """Repeating the same key should NOT send another TONE_START."""
+        instrument_app.start_activity(InstrumentActivity())
+        instrument_app.send_key(ord("a"))
+        instrument_app.send_key(ord("a"))  # repeat
+        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        assert len(tone_cmds) == 1
+
+    def test_different_key_sends_new_tone_start(self, instrument_app, mock_screen, mock_serial):
+        """Pressing a different key sends a new TONE_START."""
+        instrument_app.start_activity(InstrumentActivity())
+        instrument_app.send_key(ord("a"))  # C5
+        instrument_app.send_key(ord("s"))  # D5
+        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        assert len(tone_cmds) == 2
+        assert tone_cmds[0][1] == note_freq("C", 5)
+        assert tone_cmds[1][1] == note_freq("D", 5)
+
+    def test_quit_sends_stop_when_held(self, instrument_app, mock_screen, mock_serial):
+        """ESC while holding a note should send STOP before quitting."""
+        instrument_app.start_activity(InstrumentActivity())
+        instrument_app.send_key(ord("a"))  # hold a note
+        instrument_app.send_key(Keys.ESC)  # quit
+        stop_cmds = [c for c in mock_serial.commands if c[0] == "STOP"]
+        assert len(stop_cmds) >= 1

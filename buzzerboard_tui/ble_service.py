@@ -95,6 +95,17 @@ class BuzzerBLEService(Service):
                 self._loop,
             )
 
+    def tone_start(self, freq: int):
+        """Fire-and-forget TONE_START command over BLE -- plays until STOP."""
+        with self._lock:
+            if not self._client or not self._loop:
+                return
+            data = f"TONE_START {freq}\n".encode("ascii")
+            asyncio.run_coroutine_threadsafe(
+                self._client.write_gatt_char(self.NUS_TX, data, response=False),
+                self._loop,
+            )
+
     def play_rtttl(self, rtttl_str: str) -> str:
         """Send RTTTL string for melody playback."""
         return self.send_command(f"RTTTL {rtttl_str}")

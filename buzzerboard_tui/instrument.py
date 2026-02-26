@@ -1,12 +1,12 @@
 """Instrument activity -- main BuzzerBoard screen."""
 
-import curses
 from functools import partial
 
 from pyos.Activity import Activity
-from pyos import Keys
+from pyos import Keys, Attrs
 from pyos.KeyMap import KeyMap
 from pyos.EventTypes import KeyStroke
+from pyos.CentralDispatch import CentralDispatch
 from pyos.printers.TopBar import TopBar
 from pyos.printers.BottomBar import BottomBar
 from pyos.printers.printers import print_line, print_empty_line
@@ -22,6 +22,7 @@ from .recorder import Recorder
 
 
 NOTE_DURATION_MS = 150
+RELEASE_TIMEOUT_S = 0.2  # seconds — time after last repeat before "key released"
 
 
 class InstrumentActivity(Activity):
@@ -35,6 +36,10 @@ class InstrumentActivity(Activity):
         self.last_note = ""
         self.active_key = None
         self.status_message = ""
+
+        self._held_key = None
+        self._release_timer = None
+        self._release_generation = 0
 
         self.serial = self.application.service("buzzer_serial")
 
@@ -167,9 +172,9 @@ class InstrumentActivity(Activity):
         _, num_cols = screen.getmaxyx()
         for text, is_active in segments:
             if is_active:
-                attr = curses.A_REVERSE | curses.A_BOLD
+                attr = Attrs.REVERSE | Attrs.BOLD
             else:
-                attr = curses.A_NORMAL
+                attr = Attrs.NORMAL
             if x + len(text) < num_cols:
                 screen.addstr(y, x, text, attr)
             x += len(text)
@@ -184,16 +189,23 @@ class InstrumentActivity(Activity):
         result = key_to_note_and_freq(key, self.octave)
         if result:
             display_name, freq = result
-            self._play_note(key, display_name, freq)
+            if self._held_key == key:
+                # Same key repeating — just reset the release timer
+                self._reset_release_timer()
+            else:
+                # New key pressed
+                self._play_note(key, display_name, freq)
             return
 
     def _play_note(self, key_code: int, display_name: str, freq: int):
-        """Send tone to firmware, update display, record if active."""
+        """Send tone_start to firmware, start release timer, record if active."""
+        self._held_key = key_code
         self.active_key = key_code
         self.last_note = display_name
         self.status_message = ""
 
-        self.serial.play_tone(freq, NOTE_DURATION_MS)
+        self.serial.tone_start(freq)
+        self._reset_release_timer()
 
         if self.recorder.recording:
             if "#" in display_name:
@@ -204,6 +216,33 @@ class InstrumentActivity(Activity):
                 octave = int(display_name[1:])
             self.recorder.add_note(note_name, octave, freq)
 
+        self._update_display()
+
+    def _reset_release_timer(self):
+        if self._release_timer:
+            self._release_timer.cancel()
+        self._release_generation += 1
+        gen = self._release_generation
+        self._release_timer = CentralDispatch.timer(
+            RELEASE_TIMEOUT_S, self._on_release_timeout, gen
+        )
+        self._release_timer.start()
+
+    def _on_release_timeout(self, generation):
+        """Fires on background thread when timer expires."""
+        if generation != self._release_generation:
+            return
+        self.main_thread.submit_async(self._do_release, generation)
+
+    def _do_release(self, generation):
+        """Runs on main thread — stop tone and update display."""
+        if generation != self._release_generation:
+            return
+        if self._held_key is None:
+            return
+        self.serial.stop_playback()
+        self._held_key = None
+        self.active_key = None
         self._update_display()
 
     def _octave_down(self):
@@ -241,6 +280,11 @@ class InstrumentActivity(Activity):
         self.status_message = f"Saved to {path}"
 
     def _quit(self):
+        if self._release_timer:
+            self._release_timer.cancel()
+        if self._held_key is not None:
+            self.serial.stop_playback()
+            self._held_key = None
         self.application.pop_activity()
 
     def _update_display(self):

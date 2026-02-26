@@ -78,6 +78,14 @@ class BuzzerSerialService(Service):
             self._serial.write(cmd.encode("ascii"))
             self._serial.flush()
 
+    def tone_start(self, freq: int):
+        """Send TONE_START command. Fire-and-forget -- plays until STOP."""
+        with self._lock:
+            if not self._serial or not self._serial.is_open:
+                return
+            self._serial.write(f"TONE_START {freq}\n".encode("ascii"))
+            self._serial.flush()
+
     def play_rtttl(self, rtttl_str: str) -> str:
         """Send RTTTL string for melody playback."""
         return self.send_command(f"RTTTL {rtttl_str}")
