@@ -108,7 +108,7 @@ class PortPickerActivity(Activity):
         def do_scan():
             try:
                 from .ble_service import BuzzerBLEService
-                devices = BuzzerBLEService.scan_sync(timeout=15.0)
+                devices = BuzzerBLEService.scan_sync(timeout=5.0)
             except Exception:
                 devices = []
             self.main_thread.submit_async(self._on_ble_scan_done, devices)
@@ -215,8 +215,8 @@ class PortPickerActivity(Activity):
 
         CentralDispatch.future(do_connect)
 
-    def _connect_ble(self, address: str, max_attempts: int = 3):
-        """Register BLE service and segue to InstrumentActivity, with retries."""
+    def _connect_ble(self, address: str):
+        """Register BLE service and segue to InstrumentActivity."""
         self._ble_scan_active = False
 
         self.display_state["bottom"]["items"]["status"] = "Waiting for scan..."
@@ -232,29 +232,23 @@ class PortPickerActivity(Activity):
             while self._ble_scanning:
                 _time.sleep(0.25)
 
-            for attempt in range(1, max_attempts + 1):
+            self.main_thread.submit_async(self._set_status, "Connecting...")
+            svc = BuzzerBLEService(address)
+            self.application._services.pop("buzzer_serial", None)
+            self.application.register_service("buzzer_serial", svc)
+            try:
+                svc.on_start()
                 self.main_thread.submit_async(
-                    self._set_status, "Connecting ({}/{})...".format(attempt, max_attempts)
+                    lambda: self.application.segue_to(InstrumentActivity())
                 )
-                svc = BuzzerBLEService(address)
-                self.application._services.pop("buzzer_serial", None)
-                self.application.register_service("buzzer_serial", svc)
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"BLE connect failed: {type(e).__name__}: {e}")
                 try:
-                    svc.on_start()
-                    self.main_thread.submit_async(
-                        lambda: self.application.segue_to(InstrumentActivity())
-                    )
-                    return
-                except Exception as e:
-                    from loguru import logger
-                    logger.warning(f"BLE connect attempt {attempt}/{max_attempts} failed: {type(e).__name__}: {e}")
-                    try:
-                        svc._disconnect_sync()
-                    except Exception:
-                        pass
-
-            # All attempts failed — show error and resume scanning
-            self.main_thread.submit_async(self._on_connect_failed, "Connection failed after {} attempts".format(max_attempts))
+                    svc._disconnect_sync()
+                except Exception:
+                    pass
+                self.main_thread.submit_async(self._on_connect_failed, str(e))
 
         CentralDispatch.future(do_connect)
 

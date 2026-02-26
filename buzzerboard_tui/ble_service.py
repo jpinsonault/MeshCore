@@ -2,6 +2,7 @@
 
 import atexit
 import asyncio
+import queue
 import threading
 
 from loguru import logger
@@ -26,8 +27,8 @@ class BuzzerBLEService(Service):
         self._client = None
         self._loop = None
         self._loop_thread = None
-        self._response_event = threading.Event()
-        self._response_line = ""
+        self._rx_queue = queue.Queue()
+        self._rx_buf = ""  # reassembly buffer for fragmented BLE notifications
         self._lock = threading.Lock()
 
     def on_start(self):
@@ -75,8 +76,7 @@ class BuzzerBLEService(Service):
         with self._lock:
             if not self._client or not self._loop:
                 return ""
-            self._response_event.clear()
-            self._response_line = ""
+            self._drain_queue()
             data = (cmd + "\n").encode("ascii")
             future = asyncio.run_coroutine_threadsafe(
                 self._client.write_gatt_char(self.NUS_TX, data), self._loop
@@ -85,10 +85,10 @@ class BuzzerBLEService(Service):
                 future.result(timeout=3.0)
             except Exception:
                 return ""
-            # Wait for notification response
-            if self._response_event.wait(timeout=3.0):
-                return self._response_line
-            return ""
+            try:
+                return self._rx_queue.get(timeout=3.0)
+            except queue.Empty:
+                return ""
 
     def play_tone(self, freq: int, duration_ms: int = 150):
         """Fire-and-forget TONE command over BLE."""
@@ -125,9 +125,7 @@ class BuzzerBLEService(Service):
         with self._lock:
             if not self._client or not self._loop:
                 return []
-            lines = []
-            self._response_event.clear()
-            self._response_line = ""
+            self._drain_queue()
             data = b"LOG\n"
             future = asyncio.run_coroutine_threadsafe(
                 self._client.write_gatt_char(self.NUS_TX, data), self._loop
@@ -136,19 +134,18 @@ class BuzzerBLEService(Service):
                 future.result(timeout=3.0)
             except Exception:
                 return []
-            # Collect multi-line response
+            lines = []
             import time
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
-                if self._response_event.wait(timeout=0.5):
-                    self._response_event.clear()
-                    line = self._response_line
-                    if line == "+LOG END":
-                        break
-                    if line.startswith("+LOG "):
-                        lines.append(line[5:])
-                else:
+                try:
+                    line = self._rx_queue.get(timeout=0.5)
+                except queue.Empty:
                     break
+                if line == "+LOG END":
+                    break
+                if line.startswith("+LOG "):
+                    lines.append(line[5:])
             return lines
 
     def _run_loop(self):
@@ -156,7 +153,7 @@ class BuzzerBLEService(Service):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    async def _connect(self):
+    async def _connect(self, max_attempts: int = 3):
         """Connect to the BLE device and subscribe to NUS RX notifications.
 
         On macOS, CoreBluetooth gives each asyncio event loop its own
@@ -164,27 +161,62 @@ class BuzzerBLEService(Service):
         *same* manager discovered the device, so we scan in THIS loop
         first to populate the cache, then hand the BLEDevice object
         (which carries the manager reference) to BleakClient.
+
+        Retries happen here (same event loop) so the CBCentralManager
+        cache is preserved across attempts.
         """
         from bleak import BleakClient, BleakScanner
 
-        device = await BleakScanner.find_device_by_address(
-            self.address, timeout=30.0
-        )
-        if device is None:
-            raise ConnectionError(
-                f"BLE device {self.address} not found during pre-connect scan"
-            )
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"BLE connect attempt {attempt}/{max_attempts}")
+            try:
+                device = await BleakScanner.find_device_by_address(
+                    self.address, timeout=10.0
+                )
+                if device is None:
+                    raise ConnectionError(
+                        f"BLE device {self.address} not found during pre-connect scan"
+                    )
 
-        self._client = BleakClient(device)
-        await self._client.connect()
-        await self._client.start_notify(self.NUS_RX, self._on_nus_rx)
+                self._client = BleakClient(device)
+                await self._client.connect()
+                await self._client.start_notify(self.NUS_RX, self._on_nus_rx)
+                return  # success
+            except Exception as e:
+                last_error = e
+                logger.warning(f"BLE connect attempt {attempt}/{max_attempts} failed: {e}")
+                if self._client:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
+                if attempt < max_attempts:
+                    await asyncio.sleep(1.0)
+
+        raise last_error
 
     def _on_nus_rx(self, sender, data: bytearray):
-        """Callback for NUS RX notifications."""
-        line = data.decode("ascii", errors="replace").strip()
-        if line:
-            self._response_line = line
-            self._response_event.set()
+        """Callback for NUS RX notifications.
+
+        BLE UART fragments lines across multiple notifications (~20 byte MTU
+        chunks).  Reassemble into complete lines before enqueuing.
+        """
+        self._rx_buf += data.decode("ascii", errors="replace")
+        while "\n" in self._rx_buf:
+            line, self._rx_buf = self._rx_buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                self._rx_queue.put(line)
+
+    def _drain_queue(self):
+        """Discard stale notifications (e.g. unread +OK from fire-and-forget writes)."""
+        while not self._rx_queue.empty():
+            try:
+                self._rx_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _atexit_disconnect(self):
         """Last-resort cleanup if on_stop() was never called."""

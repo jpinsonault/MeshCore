@@ -1,5 +1,7 @@
 """Instrument activity -- main BuzzerBoard screen."""
 
+import threading
+import time
 from functools import partial
 
 from pyos.Activity import Activity
@@ -20,9 +22,9 @@ from .notes import (
 )
 from .recorder import Recorder
 
-
 NOTE_DURATION_MS = 150
-RELEASE_TIMEOUT_S = 0.2  # seconds — time after last repeat before "key released"
+RELEASE_TIMEOUT_S = 0.2   # tight — fires quickly after last repeat stops
+GRACE_PERIOD_S = 0.5      # if same key returns within this window, it's still held
 
 
 class InstrumentActivity(Activity):
@@ -40,6 +42,9 @@ class InstrumentActivity(Activity):
         self._held_key = None
         self._release_timer = None
         self._release_generation = 0
+        self._grace_key = None       # key code of recently-released key
+        self._grace_time = 0.0       # monotonic timestamp of release
+        self._grace_freq = 0         # freq to resume without re-sending TONE_START
 
         self.serial = self.application.service("buzzer_serial")
 
@@ -51,6 +56,7 @@ class InstrumentActivity(Activity):
                 Keys.FORWARD_SLASH: self._toggle_recording,
                 ord("."): self._playback,
                 ord(","): self._save,
+                ord("l"): self._dump_log,
             }
         )
 
@@ -79,6 +85,7 @@ class InstrumentActivity(Activity):
             "rec": "/: record",
             "play": ".: play",
             "save": ",: save",
+            "log": "l: log",
         }
         if self.status_message:
             items["status"] = self.status_message
@@ -192,6 +199,16 @@ class InstrumentActivity(Activity):
             if self._held_key == key:
                 # Same key repeating — just reset the release timer
                 self._reset_release_timer()
+            elif (self._grace_key == key
+                  and (time.monotonic() - self._grace_time) < GRACE_PERIOD_S):
+                # Key returned during grace period — OS repeat finally kicked in.
+                # Tone already playing on device (STOP was sent but we re-start it).
+                self._grace_key = None
+                self._held_key = key
+                self.active_key = key
+                self.serial.tone_start(self._grace_freq)
+                self._reset_release_timer()
+                self._update_display()
             else:
                 # New key pressed
                 self._play_note(key, display_name, freq)
@@ -200,10 +217,12 @@ class InstrumentActivity(Activity):
     def _play_note(self, key_code: int, display_name: str, freq: int):
         """Send tone_start to firmware, start release timer, record if active."""
         self._held_key = key_code
+        self._grace_key = None
         self.active_key = key_code
         self.last_note = display_name
         self.status_message = ""
 
+        self._grace_freq = freq
         self.serial.tone_start(freq)
         self._reset_release_timer()
 
@@ -235,12 +254,15 @@ class InstrumentActivity(Activity):
         self.main_thread.submit_async(self._do_release, generation)
 
     def _do_release(self, generation):
-        """Runs on main thread — stop tone and update display."""
+        """Runs on main thread — stop tone and enter grace period."""
         if generation != self._release_generation:
             return
         if self._held_key is None:
             return
         self.serial.stop_playback()
+        # Enter grace period — if OS repeat arrives late, we can resume
+        self._grace_key = self._held_key
+        self._grace_time = time.monotonic()
         self._held_key = None
         self.active_key = None
         self._update_display()
@@ -278,6 +300,33 @@ class InstrumentActivity(Activity):
             return
         path = self.recorder.save("BuzzerBoard", self.bpm)
         self.status_message = f"Saved to {path}"
+
+    def _dump_log(self):
+        """Fetch firmware command log in background, write to buzzerboard.log."""
+        self.status_message = "Fetching log..."
+        self._update_display()
+
+        def _fetch():
+            try:
+                lines = self.serial.fetch_log()
+                if not lines:
+                    msg = "Log empty"
+                else:
+                    path = "buzzerboard.log"
+                    with open(path, "a") as f:
+                        f.write(f"--- log dump ({len(lines)} entries) ---\n")
+                        for line in lines:
+                            f.write(line + "\n")
+                    msg = f"Log: {len(lines)} entries -> {path}"
+            except Exception as e:
+                msg = f"Log error: {e}"
+            self.main_thread.submit_async(self._on_log_done, msg)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _on_log_done(self, msg: str):
+        self.status_message = msg
+        self._update_display()
 
     def _quit(self):
         if self._release_timer:

@@ -1,18 +1,12 @@
 """BuzzerBoard entry point."""
 
-import curses
-import sys
 from pyos.Application import Application
 from .port_picker import PortPickerActivity
 
 
-def main(stdscr):
-    app = Application(stdscr)
-    app.start(PortPickerActivity())
-
-
 def main_cli():
-    curses.wrapper(main)
+    app = Application()
+    app.start(PortPickerActivity())
 
 
 if __name__ == "__main__":

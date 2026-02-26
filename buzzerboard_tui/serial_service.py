@@ -93,3 +93,21 @@ class BuzzerSerialService(Service):
     def stop_playback(self):
         """Send STOP command."""
         self.send_command("STOP")
+
+    def fetch_log(self) -> list[str]:
+        """Fetch timestamped command log from firmware. Returns list of log lines."""
+        with self._lock:
+            if not self._serial or not self._serial.is_open:
+                return []
+            # Drain stale data (unread +OK from fire-and-forget tone_start)
+            self._serial.reset_input_buffer()
+            self._serial.write(b"LOG\n")
+            self._serial.flush()
+            lines = []
+            while True:
+                line = self._serial.readline().decode("ascii", errors="replace").strip()
+                if not line or line == "+LOG END":
+                    break
+                if line.startswith("+LOG "):
+                    lines.append(line[5:])  # strip "+LOG " prefix
+            return lines

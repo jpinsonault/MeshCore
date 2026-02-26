@@ -34,6 +34,7 @@ class MockBuzzerSerial(Service):
         super().__init__()
         self.commands = []
         self.port = "/dev/mock"
+        self.log_lines = []
 
     def on_start(self):
         self._running_event.set()
@@ -59,6 +60,9 @@ class MockBuzzerSerial(Service):
         if cmd == "PING":
             return "+PONG"
         return "+OK"
+
+    def fetch_log(self):
+        return self.log_lines
 
 
 @pytest.fixture
@@ -406,6 +410,7 @@ class MockBuzzerBLE(Service):
         super().__init__()
         self.commands = []
         self.address = "AA:BB:CC:DD:EE:FF"
+        self.log_lines = []
 
     def on_start(self):
         self._running_event.set()
@@ -431,6 +436,9 @@ class MockBuzzerBLE(Service):
         if cmd == "PING":
             return "+PONG"
         return "+OK"
+
+    def fetch_log(self):
+        return self.log_lines
 
 
 @pytest.fixture
