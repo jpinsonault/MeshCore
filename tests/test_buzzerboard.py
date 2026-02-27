@@ -16,8 +16,7 @@ from pyos.Service import Service
 from buzzerboard_tui.notes import (
     note_freq,
     key_to_note_and_freq,
-    KEY_TO_NOTE,
-    KEY_TO_NOTE_SHARP,
+    KEY_NOTE_MAP,
 )
 from buzzerboard_tui.recorder import Recorder
 from buzzerboard_tui.instrument import InstrumentActivity
@@ -115,27 +114,34 @@ class TestNoteFrequencies:
 
 class TestKeyMapping:
     def test_a_key_is_c(self):
-        result = key_to_note_and_freq(ord("a"), 5)
+        result = key_to_note_and_freq(ord("a"), 4)
+        assert result is not None
+        name, freq = result
+        assert name == "C4"
+        assert freq == note_freq("C", 4)
+
+    def test_w_key_is_c_sharp(self):
+        result = key_to_note_and_freq(ord("w"), 4)
+        assert result is not None
+        name, freq = result
+        assert name == "C#4"
+
+    def test_k_key_is_c_upper(self):
+        result = key_to_note_and_freq(ord("k"), 4)
         assert result is not None
         name, freq = result
         assert name == "C5"
         assert freq == note_freq("C", 5)
 
-    def test_w_key_is_c_sharp(self):
-        result = key_to_note_and_freq(ord("w"), 5)
+    def test_z_key_is_c_lower(self):
+        result = key_to_note_and_freq(ord("z"), 4)
         assert result is not None
         name, freq = result
-        assert name == "C#5"
-
-    def test_k_key_is_c_next_octave(self):
-        result = key_to_note_and_freq(ord("k"), 5)
-        assert result is not None
-        name, freq = result
-        assert name == "C6"
-        assert freq == note_freq("C", 6)
+        assert name == "C3"
+        assert freq == note_freq("C", 3)
 
     def test_unknown_key_returns_none(self):
-        assert key_to_note_and_freq(ord("z"), 5) is None
+        assert key_to_note_and_freq(ord("1"), 4) is None
 
     def test_octave_affects_frequency(self):
         _, freq4 = key_to_note_and_freq(ord("a"), 4)
@@ -213,7 +219,7 @@ class TestInstrumentRendering:
 
     def test_top_bar_shows_octave(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        mock_screen.assert_text_on_screen("Oct: 5")
+        mock_screen.assert_text_on_screen("Oct: 3")
 
     def test_top_bar_shows_bpm(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
@@ -226,12 +232,13 @@ class TestInstrumentRendering:
 
     def test_key_hints_visible(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        for hint in ["a", "s", "d", "f", "g", "h", "j", "k"]:
+        # Hints from all three rows (QWERTY sharps, home naturals, bottom naturals)
+        for hint in ["w", "e", "t", "y", "u", "a", "s", "d", "j", "k", "z", "x", "m"]:
             mock_screen.assert_text_on_screen(hint)
 
     def test_bottom_bar_shows_controls(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        mock_screen.assert_text_on_screen("notes")
+        mock_screen.assert_text_on_screen("F2/F3: octave")
 
 
 # ===========================================================================
@@ -240,29 +247,27 @@ class TestInstrumentRendering:
 
 
 class TestNotePlayback:
-    def test_pressing_a_sends_tone_start(self, instrument_app, mock_screen, mock_serial):
+    def test_pressing_a_sends_tone(self, instrument_app, mock_screen, mock_serial):
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("a"))
         assert len(mock_serial.commands) >= 1
         cmd = mock_serial.commands[-1]
-        assert cmd[0] == "TONE_START"
-        assert cmd[1] == note_freq("C", 5)
+        assert cmd[1] == note_freq("C", 4)
 
     def test_pressing_w_sends_sharp(self, instrument_app, mock_screen, mock_serial):
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("w"))
         cmd = mock_serial.commands[-1]
-        assert cmd[0] == "TONE_START"
-        assert cmd[1] == note_freq("C#", 5)
+        assert cmd[1] == note_freq("C#", 4)
 
     def test_note_name_displayed_after_press(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("a"))
-        mock_screen.assert_text_on_screen("C5")
+        mock_screen.assert_text_on_screen("C4")
 
     def test_active_key_highlighted(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(ord("a"))
+        instrument_app.send_key(ord("a"))  # C4 (home row, first " C " on screen)
         # The active key cell should have REVERSE attribute
         mock_screen.assert_text_has_attr(" C ", Attrs.REVERSE)
 
@@ -275,32 +280,32 @@ class TestNotePlayback:
 class TestOctaveShift:
     def test_octave_up(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.RIGHT_BRACKET)
-        mock_screen.assert_text_on_screen("Oct: 6")
+        instrument_app.send_key(Keys.F3)
+        mock_screen.assert_text_on_screen("Oct: 4")
 
     def test_octave_down(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.LEFT_BRACKET)
-        mock_screen.assert_text_on_screen("Oct: 4")
+        instrument_app.send_key(Keys.F2)
+        mock_screen.assert_text_on_screen("Oct: 2")
 
-    def test_octave_clamps_at_7(self, instrument_app, mock_screen):
+    def test_octave_clamps_at_6(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
         for _ in range(5):
-            instrument_app.send_key(Keys.RIGHT_BRACKET)
-        mock_screen.assert_text_on_screen("Oct: 7")
+            instrument_app.send_key(Keys.F3)
+        mock_screen.assert_text_on_screen("Oct: 5")
 
     def test_octave_clamps_at_3(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
         for _ in range(5):
-            instrument_app.send_key(Keys.LEFT_BRACKET)
-        mock_screen.assert_text_on_screen("Oct: 3")
+            instrument_app.send_key(Keys.F2)
+        mock_screen.assert_text_on_screen("Oct: 2")
 
     def test_octave_affects_tone_frequency(self, instrument_app, mock_screen, mock_serial):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.RIGHT_BRACKET)  # octave 6
-        instrument_app.send_key(ord("a"))  # C6
-        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
-        assert tone_cmds[-1][1] == note_freq("C", 6)
+        instrument_app.send_key(Keys.F3)  # octave 5
+        instrument_app.send_key(ord("a"))  # C at offset 0 = C5
+        tone_cmds = [c for c in mock_serial.commands if c[0] in ("TONE_START", "TONE")]
+        assert tone_cmds[-1][1] == note_freq("C", 5)
 
 
 # ===========================================================================
@@ -311,18 +316,18 @@ class TestOctaveShift:
 class TestRecording:
     def test_toggle_recording_on(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.FORWARD_SLASH)
+        instrument_app.send_key(Keys.F4)
         mock_screen.assert_text_on_screen("[REC]")
 
     def test_toggle_recording_off(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.FORWARD_SLASH)  # on
-        instrument_app.send_key(Keys.FORWARD_SLASH)  # off
+        instrument_app.send_key(Keys.F4)  # on
+        instrument_app.send_key(Keys.F4)  # off
         mock_screen.assert_text_not_on_screen("[REC]")
 
     def test_recorded_notes_counted(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.FORWARD_SLASH)  # start recording
+        instrument_app.send_key(Keys.F4)  # start recording
         instrument_app.send_key(ord("a"))
         instrument_app.send_key(ord("s"))
         instrument_app.send_key(ord("d"))
@@ -330,17 +335,17 @@ class TestRecording:
 
     def test_playback_sends_rtttl(self, instrument_app, mock_screen, mock_serial):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(Keys.FORWARD_SLASH)  # record
+        instrument_app.send_key(Keys.F4)  # record
         instrument_app.send_key(ord("a"))
         instrument_app.send_key(ord("s"))
-        instrument_app.send_key(Keys.FORWARD_SLASH)  # stop
-        instrument_app.send_key(ord("."))  # playback
+        instrument_app.send_key(Keys.F4)  # stop
+        instrument_app.send_key(Keys.F5)  # playback
         rtttl_cmds = [c for c in mock_serial.commands if c[0] == "RTTTL"]
         assert len(rtttl_cmds) == 1
 
     def test_playback_empty_shows_message(self, instrument_app, mock_screen):
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(ord("."))
+        instrument_app.send_key(Keys.F5)
         mock_screen.assert_text_on_screen("Nothing recorded")
 
 
@@ -464,13 +469,12 @@ def instrument_app_ble(app, mock_ble):
 class TestBLEServiceInterface:
     """BLE mock has the same interface as serial -- instrument works unchanged."""
 
-    def test_ble_play_tone_start(self, instrument_app_ble, mock_screen, mock_ble):
+    def test_ble_play_tone(self, instrument_app_ble, mock_screen, mock_ble):
         instrument_app_ble.start_activity(InstrumentActivity())
         instrument_app_ble.send_key(ord("a"))
         assert len(mock_ble.commands) >= 1
         cmd = mock_ble.commands[-1]
-        assert cmd[0] == "TONE_START"
-        assert cmd[1] == note_freq("C", 5)
+        assert cmd[1] == note_freq("C", 4)
 
     def test_ble_play_rtttl(self, mock_ble):
         result = mock_ble.play_rtttl("Test:d=4,o=5,b=120:c,e,g")
@@ -488,11 +492,11 @@ class TestBLEServiceInterface:
     def test_ble_recording_playback(self, instrument_app_ble, mock_screen, mock_ble):
         """Record and playback works the same over BLE."""
         instrument_app_ble.start_activity(InstrumentActivity())
-        instrument_app_ble.send_key(Keys.FORWARD_SLASH)  # record
+        instrument_app_ble.send_key(Keys.F4)  # record
         instrument_app_ble.send_key(ord("a"))
         instrument_app_ble.send_key(ord("s"))
-        instrument_app_ble.send_key(Keys.FORWARD_SLASH)  # stop
-        instrument_app_ble.send_key(ord("."))  # playback
+        instrument_app_ble.send_key(Keys.F4)  # stop
+        instrument_app_ble.send_key(Keys.F5)  # playback
         rtttl_cmds = [c for c in mock_ble.commands if c[0] == "RTTTL"]
         assert len(rtttl_cmds) == 1
 
@@ -573,31 +577,31 @@ class TestPortPickerDualList:
 
 
 class TestSustainedNotes:
-    def test_key_press_sends_tone_start(self, instrument_app, mock_screen, mock_serial):
-        """First press of a note key sends TONE_START with correct frequency."""
+    def test_key_press_sends_tone(self, instrument_app, mock_screen, mock_serial):
+        """First press of a note key sends a tone with correct frequency."""
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("a"))
-        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        tone_cmds = [c for c in mock_serial.commands if c[0] in ("TONE_START", "TONE")]
         assert len(tone_cmds) == 1
-        assert tone_cmds[0][1] == note_freq("C", 5)
+        assert tone_cmds[0][1] == note_freq("C", 4)
 
     def test_key_repeat_does_not_resend(self, instrument_app, mock_screen, mock_serial):
-        """Repeating the same key should NOT send another TONE_START."""
+        """Repeating the same key should NOT send another tone immediately."""
         instrument_app.start_activity(InstrumentActivity())
         instrument_app.send_key(ord("a"))
         instrument_app.send_key(ord("a"))  # repeat
-        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        tone_cmds = [c for c in mock_serial.commands if c[0] in ("TONE_START", "TONE")]
         assert len(tone_cmds) == 1
 
-    def test_different_key_sends_new_tone_start(self, instrument_app, mock_screen, mock_serial):
-        """Pressing a different key sends a new TONE_START."""
+    def test_different_key_sends_new_tone(self, instrument_app, mock_screen, mock_serial):
+        """Pressing a different key sends a new tone."""
         instrument_app.start_activity(InstrumentActivity())
-        instrument_app.send_key(ord("a"))  # C5
-        instrument_app.send_key(ord("s"))  # D5
-        tone_cmds = [c for c in mock_serial.commands if c[0] == "TONE_START"]
+        instrument_app.send_key(ord("a"))  # C4
+        instrument_app.send_key(ord("s"))  # D4
+        tone_cmds = [c for c in mock_serial.commands if c[0] in ("TONE_START", "TONE")]
         assert len(tone_cmds) == 2
-        assert tone_cmds[0][1] == note_freq("C", 5)
-        assert tone_cmds[1][1] == note_freq("D", 5)
+        assert tone_cmds[0][1] == note_freq("C", 4)
+        assert tone_cmds[1][1] == note_freq("D", 4)
 
     def test_quit_sends_stop_when_held(self, instrument_app, mock_screen, mock_serial):
         """ESC while holding a note should send STOP before quitting."""
@@ -638,54 +642,7 @@ def _sync_log_thread(*args, **kwargs):
 
 
 class TestLogDump:
-    def test_pressing_l_shows_fetching(self, instrument_app, mock_screen, mock_serial):
-        """Press 'l' -> screen shows 'Fetching log...' (log thread is no-op)."""
-        instrument_app.start_activity(InstrumentActivity())
-        with patch("threading.Thread", side_effect=_noop_log_thread):
-            instrument_app.send_key(ord("l"))
-        mock_screen.assert_text_on_screen("Fetching log...")
-
-    def test_log_results_displayed(self, instrument_app, mock_screen):
-        """Calling _on_log_done with results updates the screen."""
-        instrument_app.start_activity(InstrumentActivity())
-        activity = instrument_app.current_activity()
-        activity._on_log_done("Log: 3 entries -> buzzerboard.log")
-        mock_screen.assert_text_on_screen("Log: 3 entries")
-
-    def test_log_empty_displayed(self, instrument_app, mock_screen):
-        """Calling _on_log_done with 'Log empty' updates the screen."""
-        instrument_app.start_activity(InstrumentActivity())
-        activity = instrument_app.current_activity()
-        activity._on_log_done("Log empty")
-        mock_screen.assert_text_on_screen("Log empty")
-
-    def test_log_dump_full_flow(self, instrument_app, mock_screen, mock_serial):
-        """Press 'l' with log data -> file written, screen shows entry count."""
-        mock_serial.log_lines = [
-            "00:00:01 TONE 440 150",
-            "00:00:02 TONE 523 150",
-            "00:00:03 STOP",
-        ]
-        instrument_app.start_activity(InstrumentActivity())
-        m = mock_open()
-        with patch("threading.Thread", side_effect=_sync_log_thread), \
-             patch("builtins.open", m):
-            instrument_app.send_key(ord("l"))
-        mock_screen.assert_text_on_screen("3 entries")
-        m.assert_called_once_with("buzzerboard.log", "a")
-
-    def test_log_empty_full_flow(self, instrument_app, mock_screen, mock_serial):
-        """Press 'l' with empty log -> screen shows 'Log empty'."""
-        mock_serial.log_lines = []
-        instrument_app.start_activity(InstrumentActivity())
-        with patch("threading.Thread", side_effect=_sync_log_thread):
-            instrument_app.send_key(ord("l"))
-        mock_screen.assert_text_on_screen("Log empty")
-
-    def test_log_bottom_bar_hint(self, instrument_app, mock_screen):
-        """Bottom bar shows 'l: log' hint."""
-        instrument_app.start_activity(InstrumentActivity())
-        mock_screen.assert_text_on_screen("l: log")
+    pass  # Log dump removed from keyboard UI (use pyos F1 log viewer instead)
 
 
 # ===========================================================================
@@ -954,18 +911,18 @@ class TestBLEEndToEnd:
             app.send_key(Keys.ENTER)
 
         # Now on InstrumentActivity
-        mock_screen.assert_text_on_screen("Oct: 5")
+        mock_screen.assert_text_on_screen("Oct: 3")
 
-        # Play C5, D5, E5
+        # Play C4, D4, E4 (home row naturals)
         app.send_key(ord("a"))
         app.send_key(ord("s"))
         app.send_key(ord("d"))
 
-        tone_cmds = [c for c in mock_svc.commands if c[0] == "TONE_START"]
+        tone_cmds = [c for c in mock_svc.commands if c[0] in ("TONE_START", "TONE")]
         assert len(tone_cmds) == 3
-        assert tone_cmds[0][1] == note_freq("C", 5)
-        assert tone_cmds[1][1] == note_freq("D", 5)
-        assert tone_cmds[2][1] == note_freq("E", 5)
+        assert tone_cmds[0][1] == note_freq("C", 4)
+        assert tone_cmds[1][1] == note_freq("D", 4)
+        assert tone_cmds[2][1] == note_freq("E", 4)
 
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
@@ -1003,13 +960,13 @@ class TestBLEEndToEnd:
             app.send_key(Keys.ENTER)
 
         # Should be on InstrumentActivity now
-        mock_screen.assert_text_on_screen("Oct: 5")
+        mock_screen.assert_text_on_screen("Oct: 3")
 
         # Play a note to confirm everything works
         app.send_key(ord("a"))
-        tone_cmds = [c for c in mock_svc.commands if c[0] == "TONE_START"]
+        tone_cmds = [c for c in mock_svc.commands if c[0] in ("TONE_START", "TONE")]
         assert len(tone_cmds) == 1
-        assert tone_cmds[0][1] == note_freq("C", 5)
+        assert tone_cmds[0][1] == note_freq("C", 4)
 
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
     @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
@@ -1034,17 +991,17 @@ class TestBLEEndToEnd:
         with patch.object(picker, "_connect_ble", side_effect=sync_connect):
             app.send_key(Keys.ENTER)
 
-        # Record a melody: C-E-G
-        app.send_key(Keys.FORWARD_SLASH)  # start recording
+        # Record a melody: C-E-G (home row naturals)
+        app.send_key(Keys.F4)  # start recording
         mock_screen.assert_text_on_screen("[REC]")
-        app.send_key(ord("a"))  # C5
-        app.send_key(ord("d"))  # E5
-        app.send_key(ord("g"))  # G5
+        app.send_key(ord("a"))  # C4
+        app.send_key(ord("d"))  # E4
+        app.send_key(ord("g"))  # G4
         mock_screen.assert_text_on_screen("3 notes")
-        app.send_key(Keys.FORWARD_SLASH)  # stop recording
+        app.send_key(Keys.F4)  # stop recording
 
         # Play it back
-        app.send_key(ord("."))
+        app.send_key(Keys.F5)
         rtttl_cmds = [c for c in mock_svc.commands if c[0] == "RTTTL"]
         assert len(rtttl_cmds) == 1
 
@@ -1076,16 +1033,9 @@ class TestBLEEndToEnd:
         with patch.object(picker, "_connect_ble", side_effect=sync_connect):
             app.send_key(Keys.ENTER)
 
-        # Play C5, D5, E5
+        # Play C4, D4, E4 (home row naturals)
         app.send_key(ord("a"))
         app.send_key(ord("s"))
         app.send_key(ord("d"))
-        tone_cmds = [c for c in mock_svc.commands if c[0] == "TONE_START"]
+        tone_cmds = [c for c in mock_svc.commands if c[0] in ("TONE_START", "TONE")]
         assert len(tone_cmds) == 3
-
-        # Dump log
-        m = mock_open()
-        with patch("threading.Thread", side_effect=_sync_log_thread), \
-             patch("builtins.open", m):
-            app.send_key(ord("l"))
-        mock_screen.assert_text_on_screen("3 entries")

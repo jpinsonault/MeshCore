@@ -14,25 +14,14 @@ from pyos.printers.printers import print_line, print_empty_line
 
 from .notes import (
     key_to_note_and_freq,
-    WHITE_KEY_LABELS,
-    WHITE_KEY_CODES,
-    BLACK_KEY_LABELS,
-    BLACK_KEY_CODES,
+    QWERTY_KEYS,
+    HOME_KEYS,
+    BOTTOM_KEYS,
+    KEY_WIDTH,
 )
 from .recorder import Recorder
 
 # Staccato timing
-#
-# Each repeat cycle:  |── tone on ──|── silence ──|
-#                     |   TONE_MS   |   GAP_MS    |
-#                     |<──────── CYCLE_S ────────>|
-#
-# CYCLE_S  = 0.15s (150ms) — matches the framework's repeat-throttle interval
-# TONE_MS  = 100          — each beep lasts 100ms (play_tone is self-terminating)
-# GAP_MS   = 50           — silence before next beep ("room")
-#
-# On release, STOP arrives during the gap (or later), so the last beep
-# always finishes naturally — no audible cut.
 STACCATO_CYCLE_S = 0.15
 STACCATO_TONE_MS = 100
 
@@ -43,7 +32,7 @@ class InstrumentActivity(Activity):
         self.application.subscribe(KeyStroke, self, self.on_key_stroke)
         self.application.subscribe(KeyRelease, self, self.on_key_release)
 
-        self.octave = 5
+        self.octave = 4
         self.bpm = 120
         self.recorder = Recorder()
         self.last_note = ""
@@ -51,8 +40,6 @@ class InstrumentActivity(Activity):
         self.status_message = ""
         self._held_key = None
         self._last_tone_time = 0.0
-        # Kitty terminals deliver real key-release → sustained notes.
-        # Non-Kitty terminals use synthetic release → staccato pattern.
         self._sustained = getattr(self.application, '_kitty_active', False)
 
         self.serial = self.application.service("buzzer_serial")
@@ -60,19 +47,18 @@ class InstrumentActivity(Activity):
         self.keymap = KeyMap(
             {
                 Keys.ESC: self._quit,
-                Keys.LEFT_BRACKET: self._octave_down,
-                Keys.RIGHT_BRACKET: self._octave_up,
-                Keys.FORWARD_SLASH: self._toggle_recording,
-                ord("."): self._playback,
-                ord(","): self._save,
-                ord("l"): self._dump_log,
+                Keys.F2: self._octave_down,
+                Keys.F3: self._octave_up,
+                Keys.F4: self._toggle_recording,
+                Keys.F5: self._playback,
+                Keys.F6: self._save,
             }
         )
 
         self.display_state = {
             "top": TopBar.display_state(items=self._top_items()),
             "piano": {
-                "layout": {"flex": 1, "min_height": 8},
+                "layout": {"flex": 1, "min_height": 10},
                 "line_generator": self._render_piano,
             },
             "bottom": BottomBar.display_state(items=self._bottom_items()),
@@ -82,19 +68,17 @@ class InstrumentActivity(Activity):
         rec_indicator = " [REC]" if self.recorder.recording else ""
         return {
             "title": "BuzzerBoard",
-            "octave": f"Oct: {self.octave}",
+            "octave": f"Oct: {self.octave - 1}\u2013{self.octave + 1}",
             "bpm": f"BPM: {self.bpm}",
             "rec": rec_indicator,
         }
 
     def _bottom_items(self) -> dict:
         items = {
-            "keys": "ASDFGHJK: notes",
-            "oct": "[]: octave",
-            "rec": "/: record",
-            "play": ".: play",
-            "save": ",: save",
-            "log": "l: log",
+            "oct": "F2/F3: octave",
+            "rec": "F4: record",
+            "play": "F5: play",
+            "save": "F6: save",
         }
         if self.status_message:
             items["status"] = self.status_message
@@ -103,23 +87,20 @@ class InstrumentActivity(Activity):
         return items
 
     def _render_piano(self, context, remaining_height):
-        """Custom line_generator that draws an ASCII piano keyboard."""
+        """Render a three-row keyboard radiating from the home row."""
         lines = []
 
-        # Black keys
-        black_line = self._make_black_key_line()
-        black_hint = self._make_black_hint_line()
-        lines.append(partial(self._print_key_line, black_line))
-        lines.append(partial(self._print_key_line, black_hint))
+        # QWERTY row — sharps (above home)
+        sharps = self._keycap_data(QWERTY_KEYS)
+        lines += self._keycap_row(sharps)
 
-        # Separator
-        lines.append(print_empty_line)
+        # Home row — naturals (center)
+        naturals = self._keycap_data(HOME_KEYS)
+        lines += self._keycap_row(naturals)
 
-        # White keys
-        white_line = self._make_white_key_line()
-        white_hint = self._make_white_hint_line()
-        lines.append(partial(self._print_key_line, white_line))
-        lines.append(partial(self._print_key_line, white_hint))
+        # Bottom row — lower octave (below home)
+        lower = self._keycap_data(BOTTOM_KEYS)
+        lines += self._keycap_row(lower)
 
         # Status area
         lines.append(print_empty_line)
@@ -141,59 +122,46 @@ class InstrumentActivity(Activity):
 
         return lines[:remaining_height]
 
-    def _make_white_key_line(self) -> list:
-        result = []
-        for i, label in enumerate(WHITE_KEY_LABELS):
-            key_code = WHITE_KEY_CODES[i]
-            is_active = self.active_key == key_code
-            result.append((f" {label:^3} ", is_active))
-        return result
+    def _keycap_row(self, caps):
+        """Return 4 line-printers for one row of keycaps."""
+        return [
+            partial(self._print_keycap_borders, caps, "\u256d\u2500\u2500\u2500\u2500\u256e"),
+            partial(self._print_keycap_content, caps, "note"),
+            partial(self._print_keycap_content, caps, "hint"),
+            partial(self._print_keycap_borders, caps, "\u2570\u2500\u2500\u2500\u2500\u256f"),
+        ]
 
-    def _make_white_hint_line(self) -> list:
-        keys = "asdfghjk"
-        result = []
-        for i, ch in enumerate(keys):
-            key_code = WHITE_KEY_CODES[i]
-            is_active = self.active_key == key_code
-            result.append((f" {ch:^3} ", is_active))
-        return result
-
-    def _make_black_key_line(self) -> list:
-        result = []
-        for i, label in enumerate(BLACK_KEY_LABELS):
-            if label:
-                key_code = BLACK_KEY_CODES[i]
-                is_active = self.active_key == key_code
-                result.append((f" {label:^3} ", is_active))
-            else:
-                result.append(("     ", False))
-        return result
-
-    def _make_black_hint_line(self) -> list:
-        keys = [ord("w"), ord("e"), None, ord("t"), ord("y"), ord("u"), None]
-        result = []
-        for key_code in keys:
-            if key_code:
-                ch = chr(key_code)
-                is_active = self.active_key == key_code
-                result.append((f"  {ch}  ", is_active))
-            else:
-                result.append(("     ", False))
-        return result
+    def _keycap_data(self, keys):
+        """Pre-compute keycap render data: [(col, note, hint, active), ...]."""
+        return [
+            (col, note, hint, self.active_key == code)
+            for col, note, hint, code in keys
+        ]
 
     @staticmethod
-    def _print_key_line(segments, screen, y):
-        """Print a row of piano key segments with highlighting for active key."""
-        x = 2  # left margin
+    def _print_keycap_borders(caps, border, screen, y):
         _, num_cols = screen.getmaxyx()
-        for text, is_active in segments:
-            if is_active:
+        for col, _, _, active in caps:
+            if col + KEY_WIDTH < num_cols:
+                attr = Attrs.BOLD if active else Attrs.NORMAL
+                screen.addstr(y, col, border, attr)
+
+    @staticmethod
+    def _print_keycap_content(caps, which, screen, y):
+        _, num_cols = screen.getmaxyx()
+        for col, note, hint, active in caps:
+            if col + KEY_WIDTH >= num_cols:
+                continue
+            if active:
                 attr = Attrs.REVERSE | Attrs.BOLD
+            elif which == "hint":
+                attr = Attrs.DIM
             else:
                 attr = Attrs.NORMAL
-            if x + len(text) < num_cols:
-                screen.addstr(y, x, text, attr)
-            x += len(text)
+            text = note if which == "note" else hint
+            screen.addstr(y, col, "\u2502", Attrs.BOLD if active else Attrs.NORMAL)
+            screen.addstr(y, col + 1, f"{text:^4}", attr)
+            screen.addstr(y, col + 5, "\u2502", Attrs.BOLD if active else Attrs.NORMAL)
 
     def on_key_stroke(self, event: KeyStroke):
         key = event.key
@@ -207,7 +175,7 @@ class InstrumentActivity(Activity):
             display_name, freq = result
             if self._held_key == key:
                 if self._sustained:
-                    return  # Kitty — tone_start is already playing
+                    return
                 now = time.monotonic()
                 if now - self._last_tone_time >= STACCATO_CYCLE_S:
                     self.serial.play_tone(freq, STACCATO_TONE_MS)
@@ -218,7 +186,7 @@ class InstrumentActivity(Activity):
     def on_key_release(self, event: KeyRelease):
         key = event.key
         if self._held_key == key:
-            self._held_key = None   # clear first so stale repeats don't match
+            self._held_key = None
             self.active_key = None
             self.serial.stop_playback()
             self._update_display()
@@ -252,7 +220,7 @@ class InstrumentActivity(Activity):
             self.octave -= 1
 
     def _octave_up(self):
-        if self.octave < 7:
+        if self.octave < 6:
             self.octave += 1
 
     def _toggle_recording(self):
@@ -280,33 +248,6 @@ class InstrumentActivity(Activity):
             return
         path = self.recorder.save("BuzzerBoard", self.bpm)
         self.status_message = f"Saved to {path}"
-
-    def _dump_log(self):
-        """Fetch firmware command log in background, write to buzzerboard.log."""
-        self.status_message = "Fetching log..."
-        self._update_display()
-
-        def _fetch():
-            try:
-                lines = self.serial.fetch_log()
-                if not lines:
-                    msg = "Log empty"
-                else:
-                    path = "buzzerboard.log"
-                    with open(path, "a") as f:
-                        f.write(f"--- log dump ({len(lines)} entries) ---\n")
-                        for line in lines:
-                            f.write(line + "\n")
-                    msg = f"Log: {len(lines)} entries -> {path}"
-            except Exception as e:
-                msg = f"Log error: {e}"
-            self.main_thread.submit_async(self._on_log_done, msg)
-
-        threading.Thread(target=_fetch, daemon=True).start()
-
-    def _on_log_done(self, msg: str):
-        self.status_message = msg
-        self._update_display()
 
     def _quit(self):
         if self._held_key is not None:
