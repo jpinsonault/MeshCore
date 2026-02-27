@@ -5,15 +5,18 @@
 // can pair from normal Bluetooth settings (no app needed).
 //
 // Controls:
-//   Single click       → Play/Pause
-//   Double click       → Next Track
-//   Flip face-down     → Mute (toggle)
-//   Hold + tilt L/R    → Volume Down/Up (repeating)
+//   Single click              → Play/Pause
+//   Double click              → Next Track
+//   Hold 400ms + tilt L/R     → Volume Down/Up (repeating)
+//   Flip face-down            → Mute (toggle)
+//   Double-press + hold 3s    → Power off (deep sleep, wake on button)
+//   Triple-press + hold 3s    → Pairing mode (clear bonds, re-advertise)
 
 #include <Arduino.h>
 #include <bluefruit.h>
 #include <NonBlockingRtttl.h>
 #include <Wire.h>
+#include "nrf_gpio.h"
 
 #include "variant.h"
 #include "qma6100p.h"
@@ -27,6 +30,7 @@
 // -- BLE objects --
 BLEHidAdafruit blehid;
 BLEDis         bledis;
+BLEUart        bleuart;
 
 // -- RTTTL melodies --
 static const char M_STARTUP[]   = "Up:d=16,o=6,b=200:c,e,g";
@@ -36,31 +40,80 @@ static const char M_DBLCLICK[]  = "Dbl:d=32,o=7,b=200:c,p,c";
 static const char M_MUTE[]      = "Mut:d=16,o=6,b=160:g,e,c";
 static const char M_UNMUTE[]    = "Unm:d=16,o=6,b=160:c,e,g";
 static const char M_GESTURE[]   = "Ges:d=32,o=7,b=200:e,p,e";
+static const char M_POWER_OFF[] = "Off:d=8,o=5,b=100:g,e,c,2c4";
+static const char M_PAIRING[]   = "Pair:d=8,o=5,b=80:g,e,c,2g";
+static const char M_NOT_CONN[]  = "Nc:d=32,o=5,b=160:e,c";
 
-// -- Button FSM --
-enum BtnState { BTN_IDLE, BTN_DOWN, BTN_WAIT_DBL, BTN_HELD };
-static BtnState btn_state = BTN_IDLE;
-static uint32_t btn_down_at  = 0;
-static uint32_t btn_up_at    = 0;
-static uint8_t  btn_prev     = LOW;
+// 16 chromatic notes (C4–D#5) for volume level feedback.
+// Mac has 16 volume steps; pitch tracks approximate position.
+static const uint16_t VOL_NOTES[] = {
+  262, 277, 294, 311, 330, 349, 370, 392,   // C4 C#4 D4 D#4 E4 F4 F#4 G4
+  415, 440, 466, 494, 523, 554, 587, 622    // G#4 A4 A#4 B4 C5 C#5 D5 D#5
+};
+#define VOL_NOTE_COUNT 16
+static int8_t vol_note_idx = 8;  // start in the middle (G#4)
 
-#define DEBOUNCE_MS    30
-#define DBLCLICK_MS    280
-#define LONGPRESS_MS   400
+// Ascending scale played during hold countdown (C5-E5-G5-C6-E6)
+static const char* const HOLD_SCALE[] = {
+  "H1:d=16,o=5,b=160:c",
+  "H2:d=16,o=5,b=160:e",
+  "H3:d=16,o=5,b=160:g",
+  "H4:d=16,o=6,b=160:c",
+  "H5:d=16,o=6,b=160:e",
+};
+#define HOLD_SCALE_LEN   5
+#define HOLD_SCALE_START 500   // ms into hold before first note
+#define HOLD_SCALE_STEP  500   // ms between notes
+
+// -- Button debounce (lockout: accept first edge, ignore bounces for N ms) --
+static uint8_t  btn_db_state = LOW;       // debounced button state
+static uint32_t btn_db_lock  = 0;        // when last edge was accepted
+
+// -- Button FSM (click counter — same pattern as OS input systems) --
+enum BtnFSM { BTN_IDLE, BTN_DOWN, BTN_UP, BTN_GESTURE };
+static BtnFSM   btn_fsm     = BTN_IDLE;
+static uint8_t  btn_clicks   = 0;        // completed press+release cycles
+static uint32_t btn_press_t  = 0;        // when current press started
+static uint32_t btn_rel_t    = 0;        // when last release happened
+static uint8_t  btn_hold_step = 0;       // next ascending scale note to play
+
+#define DEBOUNCE_MS    10
+#define CLICK_WINDOW   300   // ms after last release to wait for next click
+#define LONGPRESS_MS   400   // first-press hold → gesture mode
+#define HOLD_3S_MS     3000  // multi-press hold → power off / pairing
+
+// -- EMA-filtered accelerometer (offset-corrected, updated every loop) --
+// Calibrated offsets from accel_calibration.json — subtract to get true g values.
+// After correction: Z = face up/down, Y = left/right, X = forward/back.
+#define ACCEL_OFFSET_X  (-0.155f)
+#define ACCEL_OFFSET_Y  (-0.805f)
+#define ACCEL_OFFSET_Z  (1.055f)
+#define EMA_ALPHA  0.25f
+static float filt_gx = 0, filt_gy = 0, filt_gz = 0;  // offset-corrected & filtered
+static bool  filt_init = false;
 
 // -- Gesture mode --
+// Tilt is measured as angular change from a reference captured on gesture enter.
+// After offset correction: left/right tilt = Y axis, face up/down = Z axis.
 static bool     gesture_active  = false;
+static float    gesture_ref_angle = 0;
+static bool     gesture_tilt_pos = false;  // tilted right (vol up)
+static bool     gesture_tilt_neg = false;  // tilted left (vol down)
 static uint32_t gesture_last_vol = 0;
-#define GESTURE_DEAD_ZONE  0.25f
-#define GESTURE_REPEAT_MS  200
+#define TILT_ENTER_DEG    15.0f
+#define TILT_EXIT_DEG     10.0f
+#define TILT_ENTER_RAD    (TILT_ENTER_DEG * 3.14159f / 180.0f)
+#define TILT_EXIT_RAD     (TILT_EXIT_DEG  * 3.14159f / 180.0f)
+#define GESTURE_REPEAT_MS 250
 
 // -- Face-down mute --
+// After offset correction: Z ~ +1.0 face-up, Z ~ -1.0 face-down
 static bool     face_muted     = false;
 static bool     face_down      = false;
-static uint32_t face_enter_at  = 0;  // when Z crossed threshold
+static uint32_t face_enter_at  = 0;
 static uint32_t face_exit_at   = 0;
-#define FACE_DOWN_G       (-0.6f)
-#define FACE_UP_G         (-0.2f)
+#define FACE_DOWN_GZ     (-0.6f)   // corrected Z < this = face-down
+#define FACE_UP_GZ       (-0.2f)   // corrected Z > this = face-up (hysteresis)
 #define FACE_HOLD_MS      500
 
 // -- LED state --
@@ -70,6 +123,21 @@ static uint8_t  led_blink_cnt  = 0;   // for double-blink pattern
 
 // -- Connection tracking --
 static bool     ble_connected  = false;
+static bool     pairing_mode   = false;
+
+// -- Debug --
+static uint32_t debug_last     = 0;
+#define DEBUG_INTERVAL_MS  500
+
+// ===================== Debug log (Serial + BLE UART) =====================
+
+static char _logbuf[128];
+
+#define log(fmt, ...) do { \
+  snprintf(_logbuf, sizeof(_logbuf), fmt "\n", ##__VA_ARGS__); \
+  Serial.print(_logbuf); \
+  if (bleuart.notifyEnabled()) bleuart.print(_logbuf); \
+} while(0)
 
 // ===================== Peripheral shutdown =====================
 
@@ -102,11 +170,19 @@ static void disable_peripherals() {
 // ===================== Buzzer helpers =====================
 
 static void buzzer_on()  { digitalWrite(PIN_BZR_EN, HIGH); }
-static void buzzer_off() { digitalWrite(PIN_BZR_EN, LOW); digitalWrite(PIN_BZR, LOW); }
+static void buzzer_off() { noTone(PIN_BZR); digitalWrite(PIN_BZR_EN, LOW); digitalWrite(PIN_BZR, LOW); }
 
 static void beep(const char *melody) {
   buzzer_on();
   rtttl::begin(PIN_BZR, melody);
+}
+
+// Play a raw frequency for a short duration (used for volume feedback)
+static uint32_t tone_end_ms = 0;
+static void play_freq(uint16_t freq_hz, uint16_t dur_ms) {
+  buzzer_on();
+  tone(PIN_BZR, freq_hz, dur_ms);
+  tone_end_ms = millis() + dur_ms;
 }
 
 // ===================== HID send helper =====================
@@ -143,12 +219,59 @@ static void hid_consumer_release() {
   }
 }
 
+// ===================== Power off (deep sleep) =====================
+
+static void do_power_off() {
+  log("POWER OFF");
+  beep(M_POWER_OFF);
+  while (!rtttl::done()) rtttl::play();  // play melody to completion
+  buzzer_off();
+
+  disable_peripherals();
+  digitalWrite(PIN_3V3_ACC_EN, LOW);  // kill accelerometer rail
+  digitalWrite(PIN_LED, LOW);
+
+  // Wait for button release so we don't wake immediately
+  while (digitalRead(PIN_BUTTON) == HIGH) delay(10);
+  delay(100);
+
+  // Configure button as wake source, then enter system-off
+  nrf_gpio_cfg_sense_input(g_ADigitalPinMap[PIN_BUTTON],
+                           NRF_GPIO_PIN_NOPULL,
+                           NRF_GPIO_PIN_SENSE_HIGH);
+  sd_power_system_off();
+  // Never returns — full reset on wake
+}
+
+// ===================== Pairing mode =====================
+
+static void do_enter_pairing() {
+  log("PAIRING MODE — bonds cleared");
+  beep(M_PAIRING);
+
+  Bluefruit.Advertising.stop();
+  Bluefruit.Periph.clearBonds();
+
+  // Disconnect any current connection
+  for (uint16_t conn_hdl = 0; conn_hdl < BLE_MAX_CONNECTION; conn_hdl++) {
+    BLEConnection* connection = Bluefruit.Connection(conn_hdl);
+    if (connection && connection->connected()) {
+      connection->disconnect();
+    }
+  }
+
+  ble_connected = false;
+  pairing_mode = true;
+  Bluefruit.Advertising.start(0);
+}
+
 // ===================== BLE callbacks =====================
 
 static void connect_callback(uint16_t conn_hdl) {
   (void)conn_hdl;
   ble_connected = true;
-  Serial.println("BLE connected");
+  pairing_mode = false;
+  log("BLE connected");
   beep(M_CONNECT);
 }
 
@@ -156,7 +279,7 @@ static void disconnect_callback(uint16_t conn_hdl, uint8_t reason) {
   (void)conn_hdl;
   (void)reason;
   ble_connected = false;
-  Serial.printf("BLE disconnected, reason=0x%02X\n", reason);
+  log("BLE disconnected, reason=0x%02X", reason);
 }
 
 // ===================== BLE setup =====================
@@ -177,12 +300,16 @@ static void setup_ble() {
   // HID service
   blehid.begin();
 
-  // Advertising
+  // BLE UART (debug console — connect with nRF Connect / LightBlue)
+  bleuart.begin();
+
+  // Advertising: HID appearance in main packet, NUS in scan response
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addAppearance(BLE_APPEARANCE_HID_KEYBOARD);
   Bluefruit.Advertising.addService(blehid);
   Bluefruit.ScanResponse.addName();
+  Bluefruit.ScanResponse.addService(bleuart);
 
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.setInterval(32, 244);  // fast then slow (units of 0.625ms)
@@ -196,110 +323,176 @@ static void update_button() {
   uint32_t now = millis();
   uint8_t raw = digitalRead(PIN_BUTTON);
 
-  // Debounce
-  bool pressed  = (raw == HIGH && btn_prev == LOW  && now - btn_down_at > DEBOUNCE_MS);
-  bool released = (raw == LOW  && btn_prev == HIGH && now - btn_up_at   > DEBOUNCE_MS);
-  btn_prev = raw;
+  // Lockout debounce: accept first edge instantly, ignore for DEBOUNCE_MS after
+  bool pressed = false, released = false;
+  if (raw != btn_db_state && now - btn_db_lock >= DEBOUNCE_MS) {
+    btn_db_state = raw;
+    btn_db_lock = now;
+    if (raw == HIGH) pressed = true;
+    else released = true;
+  }
 
-  switch (btn_state) {
+  switch (btn_fsm) {
     case BTN_IDLE:
       if (pressed) {
-        btn_down_at = now;
-        btn_state = BTN_DOWN;
+        btn_clicks = 0;
+        btn_press_t = now;
+        btn_fsm = BTN_DOWN;
       }
       break;
 
     case BTN_DOWN:
       if (released) {
-        btn_up_at = now;
-        btn_state = BTN_WAIT_DBL;
-      } else if (now - btn_down_at > LONGPRESS_MS) {
-        // Long press → enter gesture mode
+        btn_clicks++;
+        btn_rel_t = now;
+        btn_fsm = BTN_UP;
+      } else if (btn_clicks == 0 && now - btn_press_t > LONGPRESS_MS) {
+        // First press held → gesture mode
         gesture_active = true;
+        gesture_ref_angle = atan2f(filt_gy, filt_gz);
+        gesture_tilt_pos = false;
+        gesture_tilt_neg = false;
         gesture_last_vol = now;
-        btn_state = BTN_HELD;
-        Serial.println("GESTURE enter");
+        btn_fsm = BTN_GESTURE;
+        log("GESTURE enter (ref=%.1f deg)", gesture_ref_angle * 180.0f / 3.14159f);
         beep(M_GESTURE);
+      } else if (btn_clicks >= 1) {
+        // Multi-press hold: ascending scale counting up to action
+        uint32_t held = now - btn_press_t;
+        if (held >= HOLD_SCALE_START && btn_hold_step < HOLD_SCALE_LEN) {
+          uint32_t next_at = HOLD_SCALE_START + (uint32_t)btn_hold_step * HOLD_SCALE_STEP;
+          if (held >= next_at) {
+            beep(HOLD_SCALE[btn_hold_step]);
+            btn_hold_step++;
+          }
+        }
+        if (btn_clicks == 1 && now - btn_press_t > HOLD_3S_MS) {
+          do_power_off();  // never returns
+        } else if (btn_clicks == 2 && now - btn_press_t > HOLD_3S_MS) {
+          do_enter_pairing();
+          btn_fsm = BTN_IDLE;
+        }
       }
       break;
 
-    case BTN_WAIT_DBL:
+    case BTN_UP:
       if (pressed) {
-        // Second press within window → double click
-        btn_down_at = now;
-        Serial.println("ACTION next_track");
-        hid_consumer_tap(HID_USAGE_CONSUMER_SCAN_NEXT);
-        beep(M_DBLCLICK);
-        // Wait for this press to release before going idle
-        btn_state = BTN_DOWN;
-        // Override: after double-click action, go idle on next release
-        // We reuse BTN_DOWN but the action was already fired. On release
-        // we'll transition to WAIT_DBL again, but that's harmless — it
-        // will time out to idle. To keep it clean, consume via a flag:
-        // Actually, let's just go to a simple wait for release.
-      } else if (now - btn_up_at > DBLCLICK_MS) {
-        // Timeout → single click confirmed
-        Serial.println("ACTION play_pause");
-        hid_consumer_tap(HID_USAGE_CONSUMER_PLAY_PAUSE);
-        beep(M_CLICK);
-        btn_state = BTN_IDLE;
+        btn_press_t = now;
+        btn_hold_step = 0;
+        btn_fsm = BTN_DOWN;
+      } else if (now - btn_rel_t > CLICK_WINDOW) {
+        // Window expired — fire action based on click count
+        if (btn_clicks == 1) {
+          if (ble_connected) {
+            log("ACTION play_pause");
+            hid_consumer_tap(HID_USAGE_CONSUMER_PLAY_PAUSE);
+            beep(M_CLICK);
+          } else {
+            beep(M_NOT_CONN);
+          }
+        } else if (btn_clicks == 2) {
+          if (ble_connected) {
+            log("ACTION next_track");
+            hid_consumer_tap(HID_USAGE_CONSUMER_SCAN_NEXT);
+            beep(M_DBLCLICK);
+          } else {
+            beep(M_NOT_CONN);
+          }
+        }
+        btn_fsm = BTN_IDLE;
       }
       break;
 
-    case BTN_HELD:
+    case BTN_GESTURE:
       if (released) {
-        // Release from gesture mode
         hid_consumer_release();
         gesture_active = false;
-        btn_up_at = now;
-        btn_state = BTN_IDLE;
-        Serial.println("GESTURE exit");
+        btn_fsm = BTN_IDLE;
+        log("GESTURE exit");
       }
       break;
   }
 }
 
-// ===================== Gesture volume =====================
+// ===================== Gesture volume (relative tilt with atan2) =====================
+
+static uint32_t gesture_log_last = 0;
 
 static void update_gesture() {
-  if (!gesture_active || !ble_connected) return;
+  if (!gesture_active) return;
 
+  // Compute current tilt angle relative to reference
+  float cur_angle = atan2f(filt_gy, filt_gz);
+  float delta = cur_angle - gesture_ref_angle;
+  float delta_deg = delta * 180.0f / 3.14159f;
+
+  // Log tilt state every 200ms while gesture is active
   uint32_t now = millis();
-  if (now - gesture_last_vol < GESTURE_REPEAT_MS) return;
+  if (now - gesture_log_last >= 200) {
+    gesture_log_last = now;
+    log("TILT gX=%.2f gY=%.2f gZ=%.2f ref=%.1f cur=%.1f delta=%.1f%s%s",
+        filt_gx, filt_gy, filt_gz,
+        gesture_ref_angle * 180.0f / 3.14159f,
+        cur_angle * 180.0f / 3.14159f,
+        delta_deg,
+        gesture_tilt_pos ? " [+]" : "",
+        gesture_tilt_neg ? " [-]" : "");
+  }
 
-  qma6100p::Accel a = qma6100p::readXYZ();
-  float gy = a.y / 4096.0f;
+  // Hysteresis state machine for positive tilt direction
+  if (!gesture_tilt_pos && delta > TILT_ENTER_RAD) {
+    gesture_tilt_pos = true;
+    gesture_tilt_neg = false;
+    log("TILT -> positive (%.1f deg)", delta_deg);
+  } else if (gesture_tilt_pos && delta < TILT_EXIT_RAD) {
+    gesture_tilt_pos = false;
+    log("TILT -> center (%.1f deg)", delta_deg);
+  }
 
-  if (gy > GESTURE_DEAD_ZONE) {
-    hid_consumer_tap(HID_USAGE_CONSUMER_VOLUME_INCREMENT);
-    gesture_last_vol = now;
-    Serial.printf("VOL+ (gY=%.2f)\n", gy);
-  } else if (gy < -GESTURE_DEAD_ZONE) {
-    hid_consumer_tap(HID_USAGE_CONSUMER_VOLUME_DECREMENT);
-    gesture_last_vol = now;
-    Serial.printf("VOL- (gY=%.2f)\n", gy);
+  // Hysteresis state machine for negative tilt direction
+  if (!gesture_tilt_neg && delta < -TILT_ENTER_RAD) {
+    gesture_tilt_neg = true;
+    gesture_tilt_pos = false;
+    log("TILT -> negative (%.1f deg)", delta_deg);
+  } else if (gesture_tilt_neg && delta > -TILT_EXIT_RAD) {
+    gesture_tilt_neg = false;
+    log("TILT -> center (%.1f deg)", delta_deg);
+  }
+
+  // Repeat volume changes at interval
+  if (now - gesture_last_vol >= GESTURE_REPEAT_MS) {
+    if (gesture_tilt_pos) {
+      if (ble_connected) hid_consumer_tap(HID_USAGE_CONSUMER_VOLUME_INCREMENT);
+      if (vol_note_idx < VOL_NOTE_COUNT - 1) vol_note_idx++;
+      play_freq(VOL_NOTES[vol_note_idx], 50);
+      gesture_last_vol = now;
+    } else if (gesture_tilt_neg) {
+      if (ble_connected) hid_consumer_tap(HID_USAGE_CONSUMER_VOLUME_DECREMENT);
+      if (vol_note_idx > 0) vol_note_idx--;
+      play_freq(VOL_NOTES[vol_note_idx], 50);
+      gesture_last_vol = now;
+    }
   }
 }
 
-// ===================== Face-down mute =====================
+// ===================== Face-down mute (uses corrected Z axis) =====================
 
 static void update_face_mute() {
-  // Skip during gesture mode (device is tilted for volume)
   if (gesture_active) return;
 
-  float gz = qma6100p::gZ();
+  // After offset correction: Z ~ +1.0 face-up, Z ~ -1.0 face-down
+  float gz = filt_gz;
   uint32_t now = millis();
 
   if (!face_down) {
-    // Looking for face-down: Z < threshold
-    if (gz < FACE_DOWN_G) {
+    if (gz < FACE_DOWN_GZ) {
       if (face_enter_at == 0) face_enter_at = now;
       if (now - face_enter_at >= FACE_HOLD_MS) {
         face_down = true;
         face_exit_at = 0;
         if (!face_muted) {
           face_muted = true;
-          Serial.println("FACE_DOWN → mute");
+          log("FACE_DOWN -> mute (Z=%.2f)", gz);
           hid_consumer_tap(HID_USAGE_CONSUMER_MUTE);
           beep(M_MUTE);
         }
@@ -308,15 +501,14 @@ static void update_face_mute() {
       face_enter_at = 0;
     }
   } else {
-    // Looking for face-up: Z > threshold (with hysteresis)
-    if (gz > FACE_UP_G) {
+    if (gz > FACE_UP_GZ) {
       if (face_exit_at == 0) face_exit_at = now;
       if (now - face_exit_at >= FACE_HOLD_MS) {
         face_down = false;
         face_enter_at = 0;
         if (face_muted) {
           face_muted = false;
-          Serial.println("FACE_UP → unmute");
+          log("FACE_UP -> unmute (Z=%.2f)", gz);
           hid_consumer_tap(HID_USAGE_CONSUMER_MUTE);
           beep(M_UNMUTE);
         }
@@ -338,6 +530,28 @@ static void update_led() {
       led_on = !led_on;
       digitalWrite(PIN_LED, led_on);
       led_last = now;
+    }
+  } else if (pairing_mode) {
+    // Triple-blink every 1.5s: on-off-on-off-on-off-wait
+    uint32_t phase = (now - led_last);
+    if (led_blink_cnt == 0 && phase > 1500) {
+      digitalWrite(PIN_LED, HIGH); led_on = true;
+      led_blink_cnt = 1; led_last = now;
+    } else if (led_blink_cnt == 1 && phase > 80) {
+      digitalWrite(PIN_LED, LOW); led_on = false;
+      led_blink_cnt = 2; led_last = now;
+    } else if (led_blink_cnt == 2 && phase > 80) {
+      digitalWrite(PIN_LED, HIGH); led_on = true;
+      led_blink_cnt = 3; led_last = now;
+    } else if (led_blink_cnt == 3 && phase > 80) {
+      digitalWrite(PIN_LED, LOW); led_on = false;
+      led_blink_cnt = 4; led_last = now;
+    } else if (led_blink_cnt == 4 && phase > 80) {
+      digitalWrite(PIN_LED, HIGH); led_on = true;
+      led_blink_cnt = 5; led_last = now;
+    } else if (led_blink_cnt == 5 && phase > 80) {
+      digitalWrite(PIN_LED, LOW); led_on = false;
+      led_blink_cnt = 0; led_last = now;
     }
   } else if (face_muted) {
     // Double-blink every 2s: on 100ms, off 100ms, on 100ms, off 1700ms
@@ -415,8 +629,8 @@ void setup() {
   Wire.setClock(400000);
 
   bool accel_ok = qma6100p::init();
-  Serial.printf("\n=== T1000-E Media Remote ===\n");
-  Serial.printf("Accel: %s\n", accel_ok ? "OK" : "FAIL");
+  log("=== T1000-E Media Remote ===");
+  log("Accel: %s", accel_ok ? "OK" : "FAIL");
 
   // Startup melody
   rtttl::begin(PIN_BZR, M_STARTUP);
@@ -426,22 +640,54 @@ void setup() {
   led_on = false;
 
   setup_ble();
-  Serial.println("Advertising as 'T1000-E Remote'...\n");
+  log("Advertising as 'T1000-E Remote'...");
 }
 
 void loop() {
-  // Non-blocking RTTTL
+  // Non-blocking RTTTL + tone() management
   if (!rtttl::done()) {
     rtttl::play();
-  } else {
-    // Turn off buzzer gate when melody finishes to save power
+  } else if (tone_end_ms > 0 && millis() >= tone_end_ms) {
     buzzer_off();
+    tone_end_ms = 0;
+  } else if (rtttl::done() && tone_end_ms == 0) {
+    buzzer_off();
+  }
+
+  // Update EMA-filtered accelerometer with offset correction
+  {
+    qma6100p::Accel raw = qma6100p::readXYZ();
+    float gx = raw.x / 4096.0f - ACCEL_OFFSET_X;
+    float gy = raw.y / 4096.0f - ACCEL_OFFSET_Y;
+    float gz = raw.z / 4096.0f - ACCEL_OFFSET_Z;
+    if (!filt_init) {
+      filt_gx = gx; filt_gy = gy; filt_gz = gz;
+      filt_init = true;
+    } else {
+      filt_gx = EMA_ALPHA * gx + (1.0f - EMA_ALPHA) * filt_gx;
+      filt_gy = EMA_ALPHA * gy + (1.0f - EMA_ALPHA) * filt_gy;
+      filt_gz = EMA_ALPHA * gz + (1.0f - EMA_ALPHA) * filt_gz;
+    }
   }
 
   update_button();
   update_gesture();
   update_face_mute();
   update_led();
+
+  // Periodic accel debug output
+  uint32_t now = millis();
+  if (now - debug_last >= DEBUG_INTERVAL_MS) {
+    debug_last = now;
+    // Read raw values directly (bypass filter) to check if chip updates
+    qma6100p::Accel dbg_raw = qma6100p::readXYZ();
+    uint8_t pm_reg = qma6100p::readReg(0x11);
+    uint8_t bw_reg = qma6100p::readReg(0x10);
+    log("RAW x=%d y=%d z=%d  FILT gX=%.2f gY=%.2f gZ=%.2f  PM=0x%02X BW=0x%02X",
+        dbg_raw.x, dbg_raw.y, dbg_raw.z,
+        filt_gx, filt_gy, filt_gz,
+        pm_reg, bw_reg);
+  }
 
   delay(5);
 }

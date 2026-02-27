@@ -16,7 +16,8 @@ static constexpr uint8_t REG_CHIP_ID = 0x00;
 static constexpr uint8_t REG_DATA    = 0x01;  // 6 bytes: XL XH YL YH ZL ZH
 static constexpr uint8_t REG_BW      = 0x10;  // bandwidth / ODR
 static constexpr uint8_t REG_PM      = 0x11;  // power mode
-static constexpr uint8_t REG_RANGE   = 0x0F;
+static constexpr uint8_t REG_FSR     = 0x0E;  // full-scale range
+static constexpr uint8_t REG_NVM     = 0x33;
 static constexpr uint8_t REG_RESET   = 0x36;
 
 static constexpr uint8_t CHIP_ID_VAL = 0x90;
@@ -42,17 +43,36 @@ struct Accel {
 
 // Soft-reset, configure +-2g range, 250Hz BW, active mode.
 // Returns true if chip ID matches.
+//
+// Init order matters: NVM load resets PM to standby, so active mode
+// must be set AFTER NVM load. FSR/BW writes require active mode.
 static bool init() {
-  writeReg(REG_RESET, 0xB6);   // soft reset
-  delay(5);
+  // Trigger soft reset
+  writeReg(REG_RESET, 0xB6);
+  delay(50);
+
+  // Clear reset register to complete reset
+  writeReg(REG_RESET, 0x00);
+  delay(20);
 
   uint8_t id = readReg(REG_CHIP_ID);
   if (id != CHIP_ID_VAL) return false;
 
-  writeReg(REG_RANGE, 0x01);   // +/-2g
-  writeReg(REG_BW, 0x05);      // 250 Hz bandwidth
-  writeReg(REG_PM, 0x80);      // active mode
-  delay(2);
+  // NVM load first (reloads factory calibration, but resets PM to standby)
+  writeReg(REG_PM, 0x80);     // need active mode for NVM load to work
+  delay(10);
+  uint8_t nvm = readReg(REG_NVM);
+  writeReg(REG_NVM, nvm | 0x08);
+  delay(50);
+
+  // Active mode AGAIN (NVM load reset PM to standby)
+  writeReg(REG_PM, 0x80);
+  delay(10);
+
+  // Configure (must be in active mode to stick)
+  writeReg(REG_FSR, 0x01);    // +/-2g
+  writeReg(REG_BW, 0x05);     // 250 Hz bandwidth
+  delay(20);
   return true;
 }
 
