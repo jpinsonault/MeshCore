@@ -93,14 +93,4 @@ static Accel readXYZ() {
   return a;
 }
 
-// Z-axis in g-units (at +/-2g: 1g = 4096 counts)
-static float gZ() {
-  return readXYZ().z / 4096.0f;
-}
-
-// Y-axis in g-units
-static float gY() {
-  return readXYZ().y / 4096.0f;
-}
-
 }  // namespace qma6100p

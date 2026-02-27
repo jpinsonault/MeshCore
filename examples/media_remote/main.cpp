@@ -127,7 +127,7 @@ static bool     pairing_mode   = false;
 
 // -- Debug --
 static uint32_t debug_last     = 0;
-#define DEBUG_INTERVAL_MS  500
+#define DEBUG_INTERVAL_MS  2000
 
 // ===================== Debug log (Serial + BLE UART) =====================
 
@@ -195,16 +195,6 @@ static void hid_consumer_tap(uint16_t usage_code) {
       blehid.consumerKeyPress(conn_hdl, usage_code);
       delay(10);
       blehid.consumerKeyRelease(conn_hdl);
-    }
-  }
-}
-
-// Send a consumer key press (held) to all connected & secured peers.
-static void hid_consumer_press(uint16_t usage_code) {
-  for (uint16_t conn_hdl = 0; conn_hdl < BLE_MAX_CONNECTION; conn_hdl++) {
-    BLEConnection* connection = Bluefruit.Connection(conn_hdl);
-    if (connection && connection->connected() && connection->secured()) {
-      blehid.consumerKeyPress(conn_hdl, usage_code);
     }
   }
 }
@@ -416,8 +406,6 @@ static void update_button() {
 
 // ===================== Gesture volume (relative tilt with atan2) =====================
 
-static uint32_t gesture_log_last = 0;
-
 static void update_gesture() {
   if (!gesture_active) return;
 
@@ -425,19 +413,7 @@ static void update_gesture() {
   float cur_angle = atan2f(filt_gy, filt_gz);
   float delta = cur_angle - gesture_ref_angle;
   float delta_deg = delta * 180.0f / 3.14159f;
-
-  // Log tilt state every 200ms while gesture is active
   uint32_t now = millis();
-  if (now - gesture_log_last >= 200) {
-    gesture_log_last = now;
-    log("TILT gX=%.2f gY=%.2f gZ=%.2f ref=%.1f cur=%.1f delta=%.1f%s%s",
-        filt_gx, filt_gy, filt_gz,
-        gesture_ref_angle * 180.0f / 3.14159f,
-        cur_angle * 180.0f / 3.14159f,
-        delta_deg,
-        gesture_tilt_pos ? " [+]" : "",
-        gesture_tilt_neg ? " [-]" : "");
-  }
 
   // Hysteresis state machine for positive tilt direction
   if (!gesture_tilt_pos && delta > TILT_ENTER_RAD) {
@@ -650,8 +626,6 @@ void loop() {
   } else if (tone_end_ms > 0 && millis() >= tone_end_ms) {
     buzzer_off();
     tone_end_ms = 0;
-  } else if (rtttl::done() && tone_end_ms == 0) {
-    buzzer_off();
   }
 
   // Update EMA-filtered accelerometer with offset correction
@@ -675,18 +649,11 @@ void loop() {
   update_face_mute();
   update_led();
 
-  // Periodic accel debug output
+  // Periodic debug output (filtered values only)
   uint32_t now = millis();
   if (now - debug_last >= DEBUG_INTERVAL_MS) {
     debug_last = now;
-    // Read raw values directly (bypass filter) to check if chip updates
-    qma6100p::Accel dbg_raw = qma6100p::readXYZ();
-    uint8_t pm_reg = qma6100p::readReg(0x11);
-    uint8_t bw_reg = qma6100p::readReg(0x10);
-    log("RAW x=%d y=%d z=%d  FILT gX=%.2f gY=%.2f gZ=%.2f  PM=0x%02X BW=0x%02X",
-        dbg_raw.x, dbg_raw.y, dbg_raw.z,
-        filt_gx, filt_gy, filt_gz,
-        pm_reg, bw_reg);
+    log("gX=%.2f gY=%.2f gZ=%.2f", filt_gx, filt_gy, filt_gz);
   }
 
   delay(5);
