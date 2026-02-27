@@ -14,7 +14,6 @@
 
 #include <Arduino.h>
 #include <bluefruit.h>
-#include <NonBlockingRtttl.h>
 #include <Wire.h>
 #include "nrf_gpio.h"
 
@@ -32,35 +31,74 @@ BLEHidAdafruit blehid;
 BLEDis         bledis;
 BLEUart        bleuart;
 
-// -- RTTTL melodies (pinned to floor: C4=262Hz low, C#4=277Hz high) --
-static const char M_STARTUP[]   = "Up:d=16,o=4,b=200:c,c,c#";
-static const char M_CONNECT[]   = "Con:d=16,o=4,b=200:c,c#";
-static const char M_CLICK[]     = "Clk:d=32,o=4,b=200:c";
-static const char M_DBLCLICK[]  = "Dbl:d=32,o=4,b=200:c,p,c";
-static const char M_MUTE[]      = "Mut:d=16,o=4,b=160:c#,c,c";
-static const char M_UNMUTE[]    = "Unm:d=16,o=4,b=160:c,c,c#";
-static const char M_GESTURE[]   = "Ges:d=32,o=4,b=200:c#,p,c#";
-static const char M_POWER_OFF[] = "Off:d=8,o=4,b=100:c#,c,c,2c";
-static const char M_PAIRING[]   = "Pair:d=8,o=4,b=80:c#,c,c,2c";
-static const char M_NOT_CONN[]  = "Nc:d=32,o=4,b=160:c#,c";
+// -- Tiny non-blocking melody player (no octave limits, unlike RTTTL) --
+// Each note: {frequency_hz, duration_ms}. freq=0 → pause.
+struct MelNote { uint16_t freq; uint16_t dur; };
+struct Melody  { const MelNote* notes; uint8_t len; };
 
-// 16 chromatic notes (C1–D#2) for volume level feedback.
-// Mac has 16 volume steps; pitch tracks approximate position.
+static const MelNote* mel_notes = nullptr;
+static uint8_t  mel_len = 0;
+static uint8_t  mel_idx = 0;
+static uint32_t mel_end = 0;
+
+static void mel_play() {
+  if (!mel_notes) return;
+  if (millis() < mel_end) return;
+  if (mel_idx >= mel_len) {
+    noTone(PIN_BZR);
+    mel_notes = nullptr;
+    return;
+  }
+  noTone(PIN_BZR);
+  const MelNote& n = mel_notes[mel_idx++];
+  if (n.freq > 0) tone(PIN_BZR, n.freq, n.dur);
+  mel_end = millis() + n.dur;
+}
+static bool mel_done() { return mel_notes == nullptr; }
+
+// -- Tone system --
+// Everything derives from BASE_FREQ. Change this one value to shift all sounds.
+// Melodies use BASE (click), BASE+5 (mid), BASE+11 (top) for 3-note palette.
+// Volume scale: 16 steps, 5Hz apart, starting from BASE.
+// Tick duration: guaranteed 12+ cycles at BASE for reliable piezo ring-up.
+#define BASE_FREQ    82   // Hz — floor for click, mute, dblclick, vol min
+#define MID_FREQ     (BASE_FREQ + 5)   // one semitone-ish up
+#define TOP_FREQ     (BASE_FREQ + 11)  // two semitones-ish up
+#define NOTE_DUR     123  // ms — standard note (12+ cycles at 82Hz)
+#define VOL_TICK_MS  123  // ms — same as note dur so vol sounds match clicks
+
+static const MelNote N_STARTUP[]  = {{BASE_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR}};
+static const MelNote N_CONNECT[]  = {{BASE_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR}};
+static const MelNote N_CLICK[]    = {{BASE_FREQ,NOTE_DUR}};
+static const MelNote N_DBLCLICK[] = {{BASE_FREQ,NOTE_DUR},{0,50},{BASE_FREQ,NOTE_DUR}};
+static const MelNote N_MUTE[]     = {{TOP_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR}};
+static const MelNote N_UNMUTE[]   = {{BASE_FREQ,NOTE_DUR},{TOP_FREQ,NOTE_DUR},{TOP_FREQ,NOTE_DUR}};
+static const MelNote N_POWER_OFF[]= {{MID_FREQ,150},{BASE_FREQ,150},{BASE_FREQ,150},{BASE_FREQ,600}};
+static const MelNote N_PAIRING[]  = {{MID_FREQ,188},{BASE_FREQ,188},{BASE_FREQ,188},{BASE_FREQ,750}};
+static const MelNote N_NOT_CONN[] = {{MID_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR}};
+static const MelNote N_HOLD[]     = {{BASE_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR}};
+
+static const Melody M_STARTUP   = {N_STARTUP,   3};
+static const Melody M_CONNECT   = {N_CONNECT,   2};
+static const Melody M_CLICK     = {N_CLICK,     1};
+static const Melody M_DBLCLICK  = {N_DBLCLICK,  3};
+static const Melody M_MUTE      = {N_MUTE,      3};
+static const Melody M_UNMUTE    = {N_UNMUTE,     3};
+static const Melody M_POWER_OFF = {N_POWER_OFF, 4};
+static const Melody M_PAIRING   = {N_PAIRING,   4};
+static const Melody M_NOT_CONN  = {N_NOT_CONN,  2};
+static const Melody M_HOLD      = {N_HOLD,      5};
+
+// 16 linear steps from BASE_FREQ up, 5Hz per step. Vol min = click pitch.
 static const uint16_t VOL_NOTES[] = {
-  33,  35,  37,  39,  41,  44,  46,  49,    // C1 C#1 D1 D#1 E1 F1 F#1 G1
-  52,  55,  58,  62,  65,  69,  73,  78     // G#1 A1 A#1 B1 C2 C#2 D2 D#2
+  BASE_FREQ,      BASE_FREQ + 5,  BASE_FREQ + 10, BASE_FREQ + 15,
+  BASE_FREQ + 20, BASE_FREQ + 25, BASE_FREQ + 30, BASE_FREQ + 35,
+  BASE_FREQ + 40, BASE_FREQ + 45, BASE_FREQ + 50, BASE_FREQ + 55,
+  BASE_FREQ + 60, BASE_FREQ + 65, BASE_FREQ + 70, BASE_FREQ + 75
 };
 #define VOL_NOTE_COUNT 16
-static int8_t vol_note_idx = 8;  // start in the middle (G#1)
+static int8_t vol_note_idx = 6;  // 6 steps down to click pitch, 9 up to ceiling
 
-// Ascending hold countdown: C4, C4, C#4, C#4, C#4 (min interval)
-static const char* const HOLD_SCALE[] = {
-  "H1:d=16,o=4,b=160:c",
-  "H2:d=16,o=4,b=160:c",
-  "H3:d=16,o=4,b=160:c#",
-  "H4:d=16,o=4,b=160:c#",
-  "H5:d=16,o=4,b=160:c#",
-};
 #define HOLD_SCALE_LEN   5
 #define HOLD_SCALE_START 500   // ms into hold before first note
 #define HOLD_SCALE_STEP  500   // ms between notes
@@ -173,9 +211,12 @@ static void disable_peripherals() {
 static void buzzer_on()  { digitalWrite(PIN_BZR_EN, HIGH); }
 static void buzzer_off() { noTone(PIN_BZR); digitalWrite(PIN_BZR_EN, LOW); digitalWrite(PIN_BZR, LOW); }
 
-static void beep(const char *melody) {
+static void beep(const Melody& m) {
   buzzer_on();
-  rtttl::begin(PIN_BZR, melody);
+  mel_notes = m.notes;
+  mel_len = m.len;
+  mel_idx = 0;
+  mel_end = 0;
 }
 
 // Play a raw frequency for a short duration (used for volume feedback)
@@ -215,7 +256,7 @@ static void hid_consumer_release() {
 static void do_power_off() {
   log("POWER OFF");
   beep(M_POWER_OFF);
-  while (!rtttl::done()) rtttl::play();  // play melody to completion
+  while (!mel_done()) mel_play();  // play melody to completion
   buzzer_off();
 
   disable_peripherals();
@@ -350,14 +391,13 @@ static void update_button() {
         btn_fsm = BTN_GESTURE;
         log("GESTURE enter (Y=%.2f Z=%.2f mag=%.2f%s)",
             filt_gy, filt_gz, yz_mag, gesture_ref_valid ? "" : " DEFERRED");
-        beep(M_GESTURE);
       } else if (btn_clicks >= 1) {
         // Multi-press hold: ascending scale counting up to action
         uint32_t held = now - btn_press_t;
         if (held >= HOLD_SCALE_START && btn_hold_step < HOLD_SCALE_LEN) {
           uint32_t next_at = HOLD_SCALE_START + (uint32_t)btn_hold_step * HOLD_SCALE_STEP;
           if (held >= next_at) {
-            beep(HOLD_SCALE[btn_hold_step]);
+            play_freq(M_HOLD.notes[btn_hold_step].freq, M_HOLD.notes[btn_hold_step].dur);
             btn_hold_step++;
           }
         }
@@ -466,12 +506,12 @@ static void update_gesture() {
     if (gesture_tilt_pos) {
       if (ble_connected) hid_consumer_tap(HID_USAGE_CONSUMER_VOLUME_INCREMENT);
       if (vol_note_idx < VOL_NOTE_COUNT - 1) vol_note_idx++;
-      play_freq(VOL_NOTES[vol_note_idx], 50);
+      play_freq(VOL_NOTES[vol_note_idx], VOL_TICK_MS);
       gesture_last_vol = now;
     } else if (gesture_tilt_neg) {
       if (ble_connected) hid_consumer_tap(HID_USAGE_CONSUMER_VOLUME_DECREMENT);
       if (vol_note_idx > 0) vol_note_idx--;
-      play_freq(VOL_NOTES[vol_note_idx], 50);
+      play_freq(VOL_NOTES[vol_note_idx], VOL_TICK_MS);
       gesture_last_vol = now;
     }
   }
@@ -634,9 +674,9 @@ void setup() {
   log("=== T1000-E Media Remote ===");
   log("Accel: %s", accel_ok ? "OK" : "FAIL");
 
-  // Startup melody
-  rtttl::begin(PIN_BZR, M_STARTUP);
-  while (!rtttl::done()) rtttl::play();
+  // Startup melody (blocking)
+  beep(M_STARTUP);
+  while (!mel_done()) mel_play();
 
   digitalWrite(PIN_LED, LOW);
   led_on = false;
@@ -646,9 +686,9 @@ void setup() {
 }
 
 void loop() {
-  // Non-blocking RTTTL + tone() management
-  if (!rtttl::done()) {
-    rtttl::play();
+  // Non-blocking melody + tone() management
+  if (!mel_done()) {
+    mel_play();
   } else if (tone_end_ms > 0 && millis() >= tone_end_ms) {
     buzzer_off();
     tone_end_ms = 0;
