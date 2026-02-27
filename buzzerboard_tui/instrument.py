@@ -1,14 +1,13 @@
 """Instrument activity -- main BuzzerBoard screen."""
 
-import threading
 import time
+import threading
 from functools import partial
 
 from pyos.Activity import Activity
 from pyos import Keys, Attrs
 from pyos.KeyMap import KeyMap
-from pyos.EventTypes import KeyStroke
-from pyos.CentralDispatch import CentralDispatch
+from pyos.EventTypes import KeyStroke, KeyRelease
 from pyos.printers.TopBar import TopBar
 from pyos.printers.BottomBar import BottomBar
 from pyos.printers.printers import print_line, print_empty_line
@@ -22,15 +21,27 @@ from .notes import (
 )
 from .recorder import Recorder
 
-NOTE_DURATION_MS = 150
-RELEASE_TIMEOUT_S = 0.2   # tight — fires quickly after last repeat stops
-GRACE_PERIOD_S = 0.5      # if same key returns within this window, it's still held
+# Staccato timing
+#
+# Each repeat cycle:  |── tone on ──|── silence ──|
+#                     |   TONE_MS   |   GAP_MS    |
+#                     |<──────── CYCLE_S ────────>|
+#
+# CYCLE_S  = 0.15s (150ms) — matches the framework's repeat-throttle interval
+# TONE_MS  = 100          — each beep lasts 100ms (play_tone is self-terminating)
+# GAP_MS   = 50           — silence before next beep ("room")
+#
+# On release, STOP arrives during the gap (or later), so the last beep
+# always finishes naturally — no audible cut.
+STACCATO_CYCLE_S = 0.15
+STACCATO_TONE_MS = 100
 
 
 class InstrumentActivity(Activity):
 
     def on_start(self):
         self.application.subscribe(KeyStroke, self, self.on_key_stroke)
+        self.application.subscribe(KeyRelease, self, self.on_key_release)
 
         self.octave = 5
         self.bpm = 120
@@ -38,13 +49,11 @@ class InstrumentActivity(Activity):
         self.last_note = ""
         self.active_key = None
         self.status_message = ""
-
         self._held_key = None
-        self._release_timer = None
-        self._release_generation = 0
-        self._grace_key = None       # key code of recently-released key
-        self._grace_time = 0.0       # monotonic timestamp of release
-        self._grace_freq = 0         # freq to resume without re-sending TONE_START
+        self._last_tone_time = 0.0
+        # Kitty terminals deliver real key-release → sustained notes.
+        # Non-Kitty terminals use synthetic release → staccato pattern.
+        self._sustained = getattr(self.application, '_kitty_active', False)
 
         self.serial = self.application.service("buzzer_serial")
 
@@ -197,34 +206,35 @@ class InstrumentActivity(Activity):
         if result:
             display_name, freq = result
             if self._held_key == key:
-                # Same key repeating — just reset the release timer
-                self._reset_release_timer()
-            elif (self._grace_key == key
-                  and (time.monotonic() - self._grace_time) < GRACE_PERIOD_S):
-                # Key returned during grace period — OS repeat finally kicked in.
-                # Tone already playing on device (STOP was sent but we re-start it).
-                self._grace_key = None
-                self._held_key = key
-                self.active_key = key
-                self.serial.tone_start(self._grace_freq)
-                self._reset_release_timer()
-                self._update_display()
-            else:
-                # New key pressed
-                self._play_note(key, display_name, freq)
-            return
+                if self._sustained:
+                    return  # Kitty — tone_start is already playing
+                now = time.monotonic()
+                if now - self._last_tone_time >= STACCATO_CYCLE_S:
+                    self.serial.play_tone(freq, STACCATO_TONE_MS)
+                    self._last_tone_time = now
+                return
+            self._play_note(key, display_name, freq)
+
+    def on_key_release(self, event: KeyRelease):
+        key = event.key
+        if self._held_key == key:
+            self._held_key = None   # clear first so stale repeats don't match
+            self.active_key = None
+            self.serial.stop_playback()
+            self._update_display()
 
     def _play_note(self, key_code: int, display_name: str, freq: int):
-        """Send tone_start to firmware, start release timer, record if active."""
+        """Start a note — sustained (Kitty) or staccato beep (fallback)."""
         self._held_key = key_code
-        self._grace_key = None
         self.active_key = key_code
         self.last_note = display_name
         self.status_message = ""
 
-        self._grace_freq = freq
-        self.serial.tone_start(freq)
-        self._reset_release_timer()
+        if self._sustained:
+            self.serial.tone_start(freq)
+        else:
+            self.serial.play_tone(freq, STACCATO_TONE_MS)
+            self._last_tone_time = time.monotonic()
 
         if self.recorder.recording:
             if "#" in display_name:
@@ -235,36 +245,6 @@ class InstrumentActivity(Activity):
                 octave = int(display_name[1:])
             self.recorder.add_note(note_name, octave, freq)
 
-        self._update_display()
-
-    def _reset_release_timer(self):
-        if self._release_timer:
-            self._release_timer.cancel()
-        self._release_generation += 1
-        gen = self._release_generation
-        self._release_timer = CentralDispatch.timer(
-            RELEASE_TIMEOUT_S, self._on_release_timeout, gen
-        )
-        self._release_timer.start()
-
-    def _on_release_timeout(self, generation):
-        """Fires on background thread when timer expires."""
-        if generation != self._release_generation:
-            return
-        self.main_thread.submit_async(self._do_release, generation)
-
-    def _do_release(self, generation):
-        """Runs on main thread — stop tone and enter grace period."""
-        if generation != self._release_generation:
-            return
-        if self._held_key is None:
-            return
-        self.serial.stop_playback()
-        # Enter grace period — if OS repeat arrives late, we can resume
-        self._grace_key = self._held_key
-        self._grace_time = time.monotonic()
-        self._held_key = None
-        self.active_key = None
         self._update_display()
 
     def _octave_down(self):
@@ -329,8 +309,6 @@ class InstrumentActivity(Activity):
         self._update_display()
 
     def _quit(self):
-        if self._release_timer:
-            self._release_timer.cancel()
         if self._held_key is not None:
             self.serial.stop_playback()
             self._held_key = None

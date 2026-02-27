@@ -1,12 +1,12 @@
 """BuzzerBoard entry point."""
 
 from pyos.Application import Application
-from .port_picker import PortPickerActivity
+from .autoconnect import AutoConnectActivity
 
 
 def main_cli():
-    app = Application()
-    app.start(PortPickerActivity())
+    app = Application(enable_kitty=True)
+    app.start(AutoConnectActivity())
 
 
 if __name__ == "__main__":
