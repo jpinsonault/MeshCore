@@ -411,6 +411,28 @@ class TestChatCommands:
         app.drain()
         mock_screen.assert_text_on_screen("Usage:")
 
+    def test_part_psk_channel(self, app, mock_screen):
+        """PSK channels (no # prefix) can be parted by exact name."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity._channels = [{"name": "MyRoom", "msg_count": 5}]
+        activity.display_state["command_input"]["text"] = "/part MyRoom"
+        activity._on_text_submit(None)
+        app.drain()
+        assert not any(ch["name"] == "MyRoom" for ch in activity._channels)
+        assert any("Left MyRoom" in m["text"] for m in activity._system_messages)
+
+    def test_part_hashtag_still_works(self, app, mock_screen):
+        """Parting #channel with or without # prefix both work."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity._channels = [{"name": "#test", "msg_count": 0}]
+        # Part without # prefix — should still match #test via fallback
+        activity.display_state["command_input"]["text"] = "/part test"
+        activity._on_text_submit(None)
+        app.drain()
+        assert not any(ch["name"] == "#test" for ch in activity._channels)
+
     def test_search_command(self, app, mock_screen):
         activity = _make_chat()
         app.start_activity(activity)
@@ -497,6 +519,17 @@ class TestChatSystemMessages:
         system_items = [i for i in items if "* " in i]
         assert len(system_items) >= 2
 
+    def test_system_messages_capped(self, app, mock_screen):
+        """System messages should not grow unbounded."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        for i in range(300):
+            activity._add_system_message(f"msg {i}")
+        assert len(activity._system_messages) == 200
+        # Oldest messages dropped, newest preserved
+        assert activity._system_messages[-1]["text"] == "msg 299"
+        assert activity._system_messages[0]["text"] == "msg 100"
+
 
 class TestChatSidebarClamping:
     def test_left_selected_clamped_to_selectable(self, app, mock_screen):
@@ -516,6 +549,42 @@ class TestChatSidebarClamping:
         max_idx = activity._max_selectable_sidebar_idx()
         assert activity.display_state["split"]["left_selected"] == max_idx
 
+    def test_scroll_skips_separators(self, app, mock_screen):
+        """Scrolling should skip separator and non-selectable lines."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity._channels = [{"name": "#ch1", "msg_count": 0}]
+        activity._update_display()
+        activity._set_focus("split")
+        activity.display_state["split"]["focused_panel"] = "left"
+        # Start on channel #ch1 (index 1, after separator at 0)
+        activity.display_state["split"]["left_selected"] = 1
+        # Scroll DOWN — should skip network separator and land on Repeaters nav
+        app.send_key(0x102)  # KEY_DOWN
+        idx = activity.display_state["split"]["left_selected"]
+        target = activity._sidebar_nav_targets[idx]
+        assert target is not None, f"Landed on non-selectable at index {idx}"
+
+    def test_scroll_up_skips_separators(self, app, mock_screen):
+        """Scrolling UP from a nav item should skip separator lines."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity._channels = [{"name": "#ch1", "msg_count": 0}]
+        activity._update_display()
+        activity._set_focus("split")
+        activity.display_state["split"]["focused_panel"] = "left"
+        # Start on the first nav item (Repeaters)
+        for i, t in enumerate(activity._sidebar_nav_targets):
+            if t == ("nav", "repeaters"):
+                activity.display_state["split"]["left_selected"] = i
+                break
+        # Scroll UP — should skip network separator and land on last channel
+        app.send_key(0x103)  # KEY_UP
+        idx = activity.display_state["split"]["left_selected"]
+        target = activity._sidebar_nav_targets[idx]
+        assert target is not None, f"Landed on non-selectable at index {idx}"
+        assert target == ("channel", "#ch1")
+
 
 class TestChatReentry:
     def test_service_persists_across_segue(self, app, mock_screen):
@@ -529,6 +598,64 @@ class TestChatReentry:
         app.drain()
         # Service should still be marked started
         assert activity._service_started is True
+
+
+class TestChatAutoScroll:
+    def test_auto_scrolls_when_not_focused_right(self, app, mock_screen):
+        """Messages auto-scroll to bottom when right panel is not focused."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        # Default focus is command_input
+        for i in range(10):
+            app.dispatch_event(ChannelMessage(_group_msg(
+                sender=f"u{i}", text=f"m{i}", channel="#scroll"
+            )))
+        app.drain()
+        split = activity.display_state["split"]
+        right_len = len(split["right_items"])
+        assert split["right_selected"] == right_len - 1
+
+    def test_preserves_scroll_when_focused_right(self, app, mock_screen):
+        """When user is browsing the right panel, new frames don't reset scroll."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        # Add some messages
+        for i in range(20):
+            app.dispatch_event(ChannelMessage(_group_msg(
+                sender=f"u{i}", text=f"m{i}", channel="#scroll"
+            )))
+        app.drain()
+        # Focus split right panel and scroll up
+        activity._set_focus("split")
+        activity.display_state["split"]["focused_panel"] = "right"
+        activity.display_state["split"]["right_selected"] = 5  # scroll up
+        # New frame arrives — should NOT snap to bottom
+        app.dispatch_event(CollectorFrame(_rx_frame()))
+        app.drain()
+        assert activity.display_state["split"]["right_selected"] == 5
+
+    def test_auto_scrolls_when_at_bottom(self, app, mock_screen):
+        """Even when focused right, if user is at bottom, follow new messages."""
+        activity = _make_chat()
+        app.start_activity(activity)
+        for i in range(5):
+            app.dispatch_event(ChannelMessage(_group_msg(
+                sender=f"u{i}", text=f"m{i}", channel="#scroll"
+            )))
+        app.drain()
+        # Focus right, stay at bottom
+        activity._set_focus("split")
+        activity.display_state["split"]["focused_panel"] = "right"
+        old_bottom = len(activity.display_state["split"]["right_items"]) - 1
+        activity.display_state["split"]["right_selected"] = old_bottom
+        # New message — should follow
+        app.dispatch_event(ChannelMessage(_group_msg(
+            sender="new", text="latest", channel="#scroll"
+        )))
+        app.drain()
+        new_bottom = len(activity.display_state["split"]["right_items"]) - 1
+        assert activity.display_state["split"]["right_selected"] == new_bottom
+        assert new_bottom > old_bottom
 
 
 def _setup_with_mock_service(app):
@@ -586,6 +713,17 @@ class TestChatSend:
         activity._on_text_submit(None)
         app.drain()
         assert any("Failed to send" in m["text"] for m in activity._system_messages)
+
+    def test_bare_text_psk_channel_sends(self, app, mock_screen):
+        """Sending on a PSK channel (e.g. 'Public') works — firmware handles lookup."""
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._selected_channel = "Public"
+        activity._sender_name = "collector"
+        activity.display_state["command_input"]["text"] = "hello"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_called_once_with("Public", "collector", "hello")
 
     def test_bare_text_uses_sender_name(self, app, mock_screen):
         """Send uses the configured sender name."""

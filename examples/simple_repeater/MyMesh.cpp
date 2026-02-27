@@ -774,6 +774,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _collector_enabled = false;
   _next_heartbeat = 0;
   _next_diagnostics = 0;
+  _num_channels = 0;
+  memset(_channels, 0, sizeof(_channels));
   region_load_active = false;
 
 #if MAX_NEIGHBOURS
@@ -832,6 +834,18 @@ void MyMesh::begin(FILESYSTEM *fs) {
     bridge.begin();
   }
 #endif
+
+  // Pre-configure Public channel (same PSK as companion_radio)
+  {
+    #include <base64.hpp>
+    #define PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
+    auto dest = &_channels[_num_channels];
+    memset(dest->channel.secret, 0, sizeof(dest->channel.secret));
+    int len = decode_base64((unsigned char *)PUBLIC_GROUP_PSK, strlen(PUBLIC_GROUP_PSK), dest->channel.secret);
+    mesh::Utils::sha256(dest->channel.hash, sizeof(dest->channel.hash), dest->channel.secret, len);
+    StrHelper::strncpy(dest->name, "Public", sizeof(dest->name));
+    _num_channels++;
+  }
 
   radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_set_tx_power(_prefs.tx_power_dbm);
@@ -1003,6 +1017,13 @@ void MyMesh::clearStats() {
   radio_driver.resetStats();
   resetStats();
   ((SimpleMeshTables *)getTables())->resetStats();
+}
+
+const ChannelDetails* MyMesh::findChannelByName(const char* name) const {
+  for (int i = 0; i < _num_channels; i++) {
+    if (strcmp(_channels[i].name, name) == 0) return &_channels[i];
+  }
+  return nullptr;
 }
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
@@ -1228,15 +1249,15 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       const char *args = sub + (do_send ? 5 : 7);
       while (*args == ' ') args++;
 
-      if (*args != '#') {
-        strcpy(reply, do_send ? "Err - use: collector send #channel sender message"
-                              : "Err - use: collector inject #channel sender message");
+      if (!*args) {
+        strcpy(reply, do_send ? "Err - use: collector send <channel> sender message"
+                              : "Err - use: collector inject <channel> sender message");
         return;
       }
 
-      // Parse channel name
+      // Parse channel name (may or may not start with #)
       const char *chan_start = args;
-      const char *p = args + 1;
+      const char *p = args;
       while (*p && *p != ' ') p++;
       if (!*p) { strcpy(reply, "Err - need sender and message"); return; }
 
@@ -1262,19 +1283,27 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       while (*p == ' ') p++;
       const char *message = p;
 
-      // Derive channel key: PSK = SHA256(channel_name)[:16]
-      uint8_t psk[CIPHER_KEY_SIZE];
-      mesh::Utils::sha256(psk, CIPHER_KEY_SIZE, (const uint8_t *)chan_name, strlen(chan_name));
-
-      // Zero-pad to 32-byte secret (HMAC needs full PUB_KEY_SIZE)
+      // Look up channel: try registered PSK channels first, then hashtag derivation
       uint8_t secret[PUB_KEY_SIZE];
-      memcpy(secret, psk, CIPHER_KEY_SIZE);
-      memset(secret + CIPHER_KEY_SIZE, 0, PUB_KEY_SIZE - CIPHER_KEY_SIZE);
-
-      // Channel hash = SHA256(psk)[0]
-      uint8_t hash_buf[32];
-      mesh::Utils::sha256(hash_buf, sizeof(hash_buf), psk, CIPHER_KEY_SIZE);
-      uint8_t channel_hash = hash_buf[0];
+      uint8_t channel_hash;
+      const ChannelDetails *registered = findChannelByName(chan_name);
+      if (registered) {
+        // Use pre-configured secret/hash from channel registry
+        memcpy(secret, registered->channel.secret, PUB_KEY_SIZE);
+        channel_hash = registered->channel.hash[0];
+      } else if (chan_name[0] == '#') {
+        // Hashtag channel: derive key via SHA-256
+        uint8_t psk[CIPHER_KEY_SIZE];
+        mesh::Utils::sha256(psk, CIPHER_KEY_SIZE, (const uint8_t *)chan_name, strlen(chan_name));
+        memcpy(secret, psk, CIPHER_KEY_SIZE);
+        memset(secret + CIPHER_KEY_SIZE, 0, PUB_KEY_SIZE - CIPHER_KEY_SIZE);
+        uint8_t hash_buf[32];
+        mesh::Utils::sha256(hash_buf, sizeof(hash_buf), psk, CIPHER_KEY_SIZE);
+        channel_hash = hash_buf[0];
+      } else {
+        sprintf(reply, "Err - unknown channel '%s' (use #name for hashtag channels)", chan_name);
+        return;
+      }
 
       // Build plaintext: [timestamp(4 LE)][flags=0(1)][sender: message\0]
       uint8_t plaintext[MAX_PACKET_PAYLOAD];

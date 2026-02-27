@@ -89,6 +89,11 @@ class CollectorCore:
         self._thread = None
         self._connected = False
 
+        # Group message dedup — tracks recent payload hashes to suppress
+        # relay echoes (same message arriving via different paths).
+        self._msg_dedup = set()
+        self._msg_dedup_max = 256
+
         # Reliable delivery state (v2)
         self._protocol_version = 1
         self._highest_seq_seen = 0
@@ -309,6 +314,21 @@ class CollectorCore:
         ):
             raw = frame["parsed"].get("raw")
             if raw and isinstance(raw, bytes):
+                # Dedup: extract the payload portion (after path) which is
+                # identical across relay paths.  Use its hash to suppress
+                # duplicates from echo + relay.
+                from .crypto import extract_group_payload
+                extracted = extract_group_payload(raw)
+                if extracted:
+                    dedup_key = (extracted["channel_hash"], hash(extracted["mac_and_data"]))
+                    if dedup_key in self._msg_dedup:
+                        return  # already decoded this message
+                    self._msg_dedup.add(dedup_key)
+                    if len(self._msg_dedup) > self._msg_dedup_max:
+                        # Evict oldest ~half to avoid unbounded growth
+                        to_remove = list(self._msg_dedup)[:self._msg_dedup_max // 2]
+                        self._msg_dedup -= set(to_remove)
+
                 msg = None
                 if self._channels:
                     msg = try_decode_group_message(
@@ -322,11 +342,8 @@ class CollectorCore:
                     self._undecryptable_count += 1
                     if self.on_undecryptable:
                         self.on_undecryptable(self._undecryptable_count)
-                    if self._cracker:
-                        from .crypto import extract_group_payload
-                        extracted = extract_group_payload(raw)
-                        if extracted:
-                            self._cracker.notify_unknown_hash(extracted["channel_hash"])
+                    if self._cracker and extracted:
+                        self._cracker.notify_unknown_hash(extracted["channel_hash"])
 
     def _send_ack(self, seq):
         """Send HOST_ACK frame and persist last committed seq."""
@@ -354,16 +371,16 @@ class CollectorCore:
         return self.send_command("collector screen\r")
 
     def send_channel_message(self, channel_name, sender_name, text):
-        """Send a group message on a hashtag channel via the firmware.
+        """Send a group message on a channel via the firmware.
 
         Uses the firmware's ``collector send`` CLI command which encrypts,
         transmits over LoRa, and echoes the packet back into the collector
-        pipeline.
+        pipeline.  The firmware handles channel lookup: registered PSK
+        channels (e.g. "Public") use their pre-configured key, while
+        hashtag channels (``#name``) derive the key via SHA-256.
 
         Returns True if the command was sent to the device, False otherwise.
         """
-        if not channel_name.startswith("#"):
-            channel_name = f"#{channel_name}"
         cmd = f"collector send {channel_name} {sender_name} {text}\r"
         return self.send_command(cmd)
 

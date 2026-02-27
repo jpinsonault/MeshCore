@@ -230,17 +230,19 @@ class TestSendChannelMessage:
         written = core._ser.write.call_args[0][0]
         assert written == b"collector send #test alice hello world\r"
 
-    def test_adds_hash_prefix(self):
-        """If channel name lacks #, it is added."""
+    def test_sends_psk_channel(self):
+        """PSK channels (e.g. 'Public') are sent to firmware — firmware handles lookup."""
         from unittest.mock import MagicMock
         core = CollectorCore(port=None)
         core._ser = MagicMock()
         core._ser.is_open = True
         core._ser.write = MagicMock()
 
-        core.send_channel_message("test", "bob", "hi")
+        result = core.send_channel_message("Public", "bob", "hi")
+        assert result is True
+        core._ser.write.assert_called_once()
         written = core._ser.write.call_args[0][0]
-        assert written == b"collector send #test bob hi\r"
+        assert written == b"collector send Public bob hi\r"
 
     def test_returns_false_when_disconnected(self):
         """Returns False when no serial connection."""

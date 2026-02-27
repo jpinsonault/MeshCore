@@ -122,7 +122,7 @@ class ChatActivity(Activity):
 
         # Message state
         self._messages = []         # list of message dicts for display
-        self._system_messages = []  # in-memory system messages
+        self._system_messages = deque(maxlen=200)  # capped ring buffer
 
         # Dashboard stats (woven into sidebar)
         self._node_count = 0
@@ -506,6 +506,15 @@ class ChatActivity(Activity):
     def _update_display(self):
         """Refresh display with current data."""
         split = self.display_state["split"]
+
+        # Capture scroll state before replacing items
+        old_right_len = len(split.get("right_items", []))
+        was_at_bottom = split["right_selected"] >= max(0, old_right_len - 1)
+        focused_right = (
+            self.focus == "split"
+            and split.get("focused_panel") == "right"
+        )
+
         split["left_items"] = self._sidebar_items()
         split["right_items"] = self._message_items()
         split["right_title"] = self._selected_channel or "All"
@@ -513,9 +522,10 @@ class ChatActivity(Activity):
         max_sel = self._max_selectable_sidebar_idx()
         if split["left_selected"] > max_sel:
             split["left_selected"] = max_sel
-        # Auto-scroll messages to bottom
+        # Auto-scroll messages to bottom unless user is browsing
         right_items = split["right_items"]
-        split["right_selected"] = max(0, len(right_items) - 1)
+        if not focused_right or was_at_bottom:
+            split["right_selected"] = max(0, len(right_items) - 1)
 
         self.display_state["bottom"]["items"]["status"] = self._bottom_status()
         self.display_state["split"]["focused"] = (self.focus == "split")
@@ -529,6 +539,28 @@ class ChatActivity(Activity):
             if t is not None:
                 max_idx = i
         return max_idx
+
+    def _snap_to_selectable(self, idx, direction=1):
+        """Snap idx to the nearest selectable sidebar item in the given direction."""
+        targets = self._sidebar_nav_targets
+        if not targets:
+            return idx
+        if 0 <= idx < len(targets) and targets[idx] is not None:
+            return idx
+        max_idx = self._max_selectable_sidebar_idx()
+        # Search in direction of movement
+        i = idx + direction
+        while 0 <= i <= max_idx:
+            if i < len(targets) and targets[i] is not None:
+                return i
+            i += direction
+        # Reverse if nothing found
+        i = idx - direction
+        while 0 <= i <= max_idx:
+            if i < len(targets) and targets[i] is not None:
+                return i
+            i -= direction
+        return idx
 
     def _add_system_message(self, text):
         """Add an in-memory system message (shown with * prefix)."""
@@ -571,14 +603,16 @@ class ChatActivity(Activity):
                 self._select_channel_from_sidebar()
                 return
 
+        # Track sidebar position before delegating for direction detection
+        old_left_idx = self.display_state["split"]["left_selected"]
         self.delegate_to_focused(event)
-        # Clamp left_selected after any scroll to selectable items only
+        # Snap left_selected to nearest selectable item
         if self.focus == "split":
             split = self.display_state["split"]
             if split["focused_panel"] == "left" and self._sidebar_nav_targets:
-                max_idx = self._max_selectable_sidebar_idx()
-                if split["left_selected"] > max_idx:
-                    split["left_selected"] = max_idx
+                new_idx = split["left_selected"]
+                direction = 1 if new_idx >= old_left_idx else -1
+                split["left_selected"] = self._snap_to_selectable(new_idx, direction)
         self.refresh_screen()
 
     def _cycle_focus(self):
@@ -808,8 +842,8 @@ class ChatActivity(Activity):
             return
         try:
             svc = self.application.service("collector")
-            success = svc.send_message(self._selected_channel, self._sender_name, text)
-            if not success:
+            result = svc.send_message(self._selected_channel, self._sender_name, text)
+            if not result:
                 self._add_system_message("Failed to send (connection lost)")
         except (KeyError, RuntimeError) as e:
             self._add_system_message(f"Send error: {e}")
@@ -849,8 +883,8 @@ class ChatActivity(Activity):
             return
         try:
             svc = self.application.service("collector")
-            success = svc.send_message(channel, self._sender_name, text)
-            if not success:
+            result = svc.send_message(channel, self._sender_name, text)
+            if not result:
                 self._add_system_message("Failed to send (connection lost)")
         except (KeyError, RuntimeError) as e:
             self._add_system_message(f"Send error: {e}")
@@ -927,7 +961,11 @@ class ChatActivity(Activity):
             else:
                 self._add_system_message("Usage: /part #channelname (or select a channel first)")
                 return
-        name = arg if arg.startswith("#") else f"#{arg}"
+        # Try exact match first, fall back to adding # prefix
+        if any(ch["name"] == arg for ch in self._channels):
+            name = arg
+        else:
+            name = arg if arg.startswith("#") else f"#{arg}"
         # Remove from core
         try:
             svc = self.application.service("collector")
