@@ -163,6 +163,8 @@ static uint8_t  led_blink_cnt  = 0;   // for double-blink pattern
 // -- Connection tracking --
 static bool     ble_connected  = false;
 static bool     pairing_mode   = false;
+static uint32_t connect_t      = 0;     // when last BLE connect happened
+static bool     connect_beeped = false; // true once we've confirmed + beeped
 
 // -- Debug --
 static uint32_t debug_last     = 0;
@@ -302,15 +304,16 @@ static void do_enter_pairing() {
 static void connect_callback(uint16_t conn_hdl) {
   (void)conn_hdl;
   ble_connected = true;
-  pairing_mode = false;
-  log("BLE connected");
-  beep(M_CONNECT);
+  connect_t = millis();
+  connect_beeped = false;
+  log("BLE connected (confirming...)");
 }
 
 static void disconnect_callback(uint16_t conn_hdl, uint8_t reason) {
   (void)conn_hdl;
   (void)reason;
   ble_connected = false;
+  connect_beeped = false;
   log("BLE disconnected, reason=0x%02X", reason);
 }
 
@@ -713,6 +716,16 @@ void loop() {
   update_button();
   update_gesture();
   update_face_mute();
+
+  // Deferred connection confirmation: failed bond attempts disconnect in <100ms.
+  // Only beep + exit pairing mode once the connection survives 500ms.
+  if (ble_connected && !connect_beeped && millis() - connect_t > 500) {
+    connect_beeped = true;
+    pairing_mode = false;
+    log("BLE connection confirmed");
+    beep(M_CONNECT);
+  }
+
   update_led();
 
   // Periodic debug output (filtered values only)
