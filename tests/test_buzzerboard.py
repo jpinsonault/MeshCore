@@ -4,8 +4,10 @@ Uses MockScreen + HarnessApplication from pyos.testing.
 Serial and BLE communication are mocked -- no hardware needed.
 """
 
+import threading as _real_threading
+
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock, mock_open
 
 from pyos.testing import MockScreen, HarnessApplication
 from pyos import Keys, Attrs
@@ -607,7 +609,87 @@ class TestSustainedNotes:
 
 
 # ===========================================================================
-# 13. BLE scanning
+# 13. Log dump (UI-level)
+# ===========================================================================
+
+
+# Save real Thread class before any patching so selective mocks can delegate
+_RealThread = _real_threading.Thread
+
+
+def _noop_log_thread(*args, **kwargs):
+    """Thread factory: _dump_log's thread becomes no-op, all others pass through."""
+    target = kwargs.get("target")
+    qualname = getattr(target, "__qualname__", "") if target else ""
+    if "_dump_log" in qualname:
+        return MagicMock()  # .start() is a no-op
+    return _RealThread(*args, **kwargs)
+
+
+def _sync_log_thread(*args, **kwargs):
+    """Thread factory: _dump_log's thread runs synchronously, others pass through."""
+    target = kwargs.get("target")
+    qualname = getattr(target, "__qualname__", "") if target else ""
+    if "_dump_log" in qualname:
+        mock_thread = MagicMock()
+        mock_thread.start.side_effect = lambda: target()
+        return mock_thread
+    return _RealThread(*args, **kwargs)
+
+
+class TestLogDump:
+    def test_pressing_l_shows_fetching(self, instrument_app, mock_screen, mock_serial):
+        """Press 'l' -> screen shows 'Fetching log...' (log thread is no-op)."""
+        instrument_app.start_activity(InstrumentActivity())
+        with patch("threading.Thread", side_effect=_noop_log_thread):
+            instrument_app.send_key(ord("l"))
+        mock_screen.assert_text_on_screen("Fetching log...")
+
+    def test_log_results_displayed(self, instrument_app, mock_screen):
+        """Calling _on_log_done with results updates the screen."""
+        instrument_app.start_activity(InstrumentActivity())
+        activity = instrument_app.current_activity()
+        activity._on_log_done("Log: 3 entries -> buzzerboard.log")
+        mock_screen.assert_text_on_screen("Log: 3 entries")
+
+    def test_log_empty_displayed(self, instrument_app, mock_screen):
+        """Calling _on_log_done with 'Log empty' updates the screen."""
+        instrument_app.start_activity(InstrumentActivity())
+        activity = instrument_app.current_activity()
+        activity._on_log_done("Log empty")
+        mock_screen.assert_text_on_screen("Log empty")
+
+    def test_log_dump_full_flow(self, instrument_app, mock_screen, mock_serial):
+        """Press 'l' with log data -> file written, screen shows entry count."""
+        mock_serial.log_lines = [
+            "00:00:01 TONE 440 150",
+            "00:00:02 TONE 523 150",
+            "00:00:03 STOP",
+        ]
+        instrument_app.start_activity(InstrumentActivity())
+        m = mock_open()
+        with patch("threading.Thread", side_effect=_sync_log_thread), \
+             patch("builtins.open", m):
+            instrument_app.send_key(ord("l"))
+        mock_screen.assert_text_on_screen("3 entries")
+        m.assert_called_once_with("buzzerboard.log", "a")
+
+    def test_log_empty_full_flow(self, instrument_app, mock_screen, mock_serial):
+        """Press 'l' with empty log -> screen shows 'Log empty'."""
+        mock_serial.log_lines = []
+        instrument_app.start_activity(InstrumentActivity())
+        with patch("threading.Thread", side_effect=_sync_log_thread):
+            instrument_app.send_key(ord("l"))
+        mock_screen.assert_text_on_screen("Log empty")
+
+    def test_log_bottom_bar_hint(self, instrument_app, mock_screen):
+        """Bottom bar shows 'l: log' hint."""
+        instrument_app.start_activity(InstrumentActivity())
+        mock_screen.assert_text_on_screen("l: log")
+
+
+# ===========================================================================
+# 15. BLE scanning
 # ===========================================================================
 
 
@@ -630,6 +712,25 @@ def _make_adv_data(service_uuids=None, local_name=None):
 NUS_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 
 
+def _mock_scanner_with_devices(device_adv_pairs):
+    """Create a mock BleakScanner that delivers devices via detection callback.
+
+    ``device_adv_pairs`` is a list of (device, adv_data) tuples.  When
+    ``start()`` is called the callback registered in the constructor is
+    invoked once per pair, simulating discovery.
+    """
+    def scanner_init(self_or_cb=None, *, detection_callback=None, **kw):
+        # Handle both BleakScanner(cb) and BleakScanner(detection_callback=cb)
+        cb = detection_callback or self_or_cb
+        mock_scanner = MagicMock()
+        mock_scanner.start = AsyncMock(
+            side_effect=lambda: [cb(dev, adv) for dev, adv in device_adv_pairs]
+        )
+        mock_scanner.stop = AsyncMock()
+        return mock_scanner
+    return scanner_init
+
+
 class TestBLEScanning:
     def test_scan_filters_nus_devices(self):
         """Only devices advertising NUS UUID should be returned."""
@@ -641,13 +742,10 @@ class TestBLEScanning:
         dev_other = _make_ble_device("AA:BB:CC:DD:EE:02", "SomeOther")
         adv_other = _make_adv_data(service_uuids=["0000180a-0000-1000-8000-00805f9b34fb"])
 
-        scan_result = {
-            "AA:BB:CC:DD:EE:01": (dev_nus, adv_nus),
-            "AA:BB:CC:DD:EE:02": (dev_other, adv_other),
-        }
-
-        with patch("bleak.BleakScanner.discover", return_value=scan_result):
-            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        with patch("bleak.BleakScanner", side_effect=_mock_scanner_with_devices(
+            [(dev_nus, adv_nus), (dev_other, adv_other)]
+        )):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=0.01))
         assert len(results) == 1
         assert results[0][0] == "AA:BB:CC:DD:EE:01"
         assert results[0][1] == "BuzzerBoard"
@@ -657,8 +755,8 @@ class TestBLEScanning:
         import asyncio
         from buzzerboard_tui.ble_service import BuzzerBLEService
 
-        with patch("bleak.BleakScanner.discover", return_value={}):
-            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        with patch("bleak.BleakScanner", side_effect=_mock_scanner_with_devices([])):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=0.01))
         assert results == []
 
     def test_scan_uses_advertised_name(self):
@@ -669,9 +767,10 @@ class TestBLEScanning:
         dev = _make_ble_device("AA:BB:CC:DD:EE:03", "CachedName")
         adv = _make_adv_data(service_uuids=[NUS_UUID], local_name="BuzzerBoard-Live")
 
-        with patch("bleak.BleakScanner.discover",
-                   return_value={"AA:BB:CC:DD:EE:03": (dev, adv)}):
-            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        with patch("bleak.BleakScanner", side_effect=_mock_scanner_with_devices(
+            [(dev, adv)]
+        )):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=0.01))
         assert results[0][1] == "BuzzerBoard-Live"
 
     def test_scan_case_sensitivity(self):
@@ -682,15 +781,16 @@ class TestBLEScanning:
         dev = _make_ble_device("AA:BB:CC:DD:EE:04", "BB")
         adv = _make_adv_data(service_uuids=[NUS_UUID.upper()], local_name="BB")
 
-        with patch("bleak.BleakScanner.discover",
-                   return_value={"AA:BB:CC:DD:EE:04": (dev, adv)}):
-            results = asyncio.run(BuzzerBLEService.scan(timeout=1.0))
+        with patch("bleak.BleakScanner", side_effect=_mock_scanner_with_devices(
+            [(dev, adv)]
+        )):
+            results = asyncio.run(BuzzerBLEService.scan(timeout=0.01))
         assert len(results) == 1
         assert results[0][0] == "AA:BB:CC:DD:EE:04"
 
 
 # ===========================================================================
-# 14. BLE connection via port picker
+# 16. BLE connection via port picker
 # ===========================================================================
 
 
@@ -820,7 +920,7 @@ class TestBLEConnection:
 
 
 # ===========================================================================
-# 15. BLE end-to-end: scan → connect → play
+# 17. BLE end-to-end: scan → connect → play
 # ===========================================================================
 
 
@@ -947,3 +1047,45 @@ class TestBLEEndToEnd:
         app.send_key(ord("."))
         rtttl_cmds = [c for c in mock_svc.commands if c[0] == "RTTTL"]
         assert len(rtttl_cmds) == 1
+
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._start_ble_scan")
+    @patch("buzzerboard_tui.port_picker.PortPickerActivity._scan_ports")
+    def test_scan_connect_play_dump_log(self, mock_scan, mock_ble_scan, app, mock_screen):
+        """Full journey: scan → connect → play C-D-E → dump log → verify."""
+        mock_scan.return_value = []
+        app.start_activity(PortPickerActivity())
+        picker = app.current_activity()
+
+        picker._on_ble_scan_done([("AA:BB:CC:DD:EE:FF", "BuzzerBoard")])
+
+        mock_svc = MockBuzzerBLE()
+        mock_svc.log_lines = [
+            "00:00:01 TONE_START 523",
+            "00:00:02 TONE_START 587",
+            "00:00:03 TONE_START 659",
+        ]
+
+        def sync_connect(address, max_attempts=3):
+            picker._ble_scan_active = False
+            app._services.pop("buzzer_serial", None)
+            app.register_service("buzzer_serial", mock_svc)
+            app.start_service_sync("buzzer_serial")
+            from buzzerboard_tui.instrument import InstrumentActivity
+            app.segue_to(InstrumentActivity())
+
+        with patch.object(picker, "_connect_ble", side_effect=sync_connect):
+            app.send_key(Keys.ENTER)
+
+        # Play C5, D5, E5
+        app.send_key(ord("a"))
+        app.send_key(ord("s"))
+        app.send_key(ord("d"))
+        tone_cmds = [c for c in mock_svc.commands if c[0] == "TONE_START"]
+        assert len(tone_cmds) == 3
+
+        # Dump log
+        m = mock_open()
+        with patch("threading.Thread", side_effect=_sync_log_thread), \
+             patch("builtins.open", m):
+            app.send_key(ord("l"))
+        mock_screen.assert_text_on_screen("3 entries")

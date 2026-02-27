@@ -76,6 +76,8 @@ static void cmd_stop(Stream* reply);
 static void cmd_rtttl(const char* args, Stream* reply);
 static void cmd_status(Stream* reply);
 static void cmd_log(Stream* reply);
+static void cmd_ble_restart(Stream* reply);
+static void cmd_reset(Stream* reply);
 static void setup_ble();
 static void disable_peripherals();
 static void buzzer_on();
@@ -173,13 +175,15 @@ static void setup_ble() {
   Bluefruit.Periph.setConnectCallback(connect_callback);
   Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
 
-  // Advertising: 1s fast for 60s, then 5s slow
+  // Advertising: 200ms fast for 60s, then 1s slow
+  // Fast interval matters for initial discovery; slow must still be
+  // short enough that a 10s scan reliably catches the device.
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(bleuart);
   Bluefruit.ScanResponse.addName();
   Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.setIntervalMS(1000, 5000);
+  Bluefruit.Advertising.setIntervalMS(200, 1000);
   Bluefruit.Advertising.setFastTimeout(ADV_FAST_TIMEOUT_S);
   Bluefruit.Advertising.start(0);
 }
@@ -278,6 +282,10 @@ static void handle_command(char* cmd, Stream* reply) {
     cmd_rtttl(cmd + 6, reply);
   } else if (strncasecmp(cmd, "STATUS", 6) == 0) {
     cmd_status(reply);
+  } else if (strncasecmp(cmd, "BLE_RESTART", 11) == 0) {
+    cmd_ble_restart(reply);
+  } else if (strncasecmp(cmd, "RESET", 5) == 0) {
+    cmd_reset(reply);
   } else {
     reply->print("+ERR Unknown command: ");
     reply->println(cmd);
@@ -341,7 +349,19 @@ static void cmd_rtttl(const char* args, Stream* reply) {
 static void cmd_status(Stream* reply) {
   reply->print("+STATUS playing=");
   reply->print(rtttl::done() ? "0" : "1");
-  reply->println(" buzzer=on");
+  reply->print(" buzzer=on");
+  reply->print(" ble_conn=");
+  reply->print(Bluefruit.connected());
+  reply->print(" ble_addr=");
+  uint8_t addr[6];
+  Bluefruit.getAddr(addr);
+  char addr_str[18];
+  snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+           addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+  reply->print(addr_str);
+  reply->print(" adv=");
+  reply->print(Bluefruit.Advertising.isRunning() ? "yes" : "no");
+  reply->println();
 }
 
 static void cmd_log(Stream* reply) {
@@ -360,6 +380,20 @@ static void cmd_log(Stream* reply) {
   // Clear after dump
   log_count = 0;
   log_head = 0;
+}
+
+static void cmd_ble_restart(Stream* reply) {
+  Bluefruit.Advertising.stop();
+  delay(100);
+  Bluefruit.Advertising.start(0);
+  reply->println("+OK BLE advertising restarted");
+}
+
+static void cmd_reset(Stream* reply) {
+  reply->println("+OK resetting...");
+  reply->flush();
+  delay(100);
+  NVIC_SystemReset();
 }
 
 // --- Button handling ---

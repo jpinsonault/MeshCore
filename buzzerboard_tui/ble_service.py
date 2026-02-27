@@ -156,33 +156,54 @@ class BuzzerBLEService(Service):
     async def _connect(self, max_attempts: int = 3):
         """Connect to the BLE device and subscribe to NUS RX notifications.
 
-        On macOS, CoreBluetooth gives each asyncio event loop its own
-        CBCentralManager.  BleakClient.connect() only works when the
-        *same* manager discovered the device, so we scan in THIS loop
-        first to populate the cache, then hand the BLEDevice object
-        (which carries the manager reference) to BleakClient.
+        Uses a detection-callback scan instead of find_device_by_address()
+        or discover(), both of which rely on CoreBluetooth's internal
+        address filtering and are unreliable on macOS.
 
-        Retries happen here (same event loop) so the CBCentralManager
-        cache is preserved across attempts.
+        Strategy order:
+
+        1. Callback scan (fast path): start a BleakScanner with a
+           detection_callback that fires the moment our device is seen.
+           Connect via the same CBCentralManager — instant.
+
+        2. Direct connect (fallback): BleakClient(address).connect()
+           uses the OS-level CoreBluetooth cache.  Works when the device
+           isn't actively advertising, but slow (10-30 s) because
+           CoreBluetooth does an internal re-scan.
         """
         from bleak import BleakClient, BleakScanner
 
         last_error = None
         for attempt in range(1, max_attempts + 1):
             logger.info(f"BLE connect attempt {attempt}/{max_attempts}")
-            try:
-                device = await BleakScanner.find_device_by_address(
-                    self.address, timeout=10.0
-                )
-                if device is None:
-                    raise ConnectionError(
-                        f"BLE device {self.address} not found during pre-connect scan"
-                    )
 
-                self._client = BleakClient(device)
+            # Strategy 1: callback scan — stops as soon as device is seen
+            try:
+                device = await self._scan_for_device(timeout=10.0)
+                if device:
+                    self._client = BleakClient(device)
+                    await self._client.connect()
+                    await self._client.start_notify(self.NUS_RX, self._on_nus_rx)
+                    logger.info("BLE scan-then-connect succeeded")
+                    return
+                else:
+                    logger.debug(f"Device {self.address} not found in scan")
+            except Exception as e:
+                logger.debug(f"Scan-then-connect failed: {e}")
+                if self._client:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
+
+            # Strategy 2: direct connect via OS-level cache (slow fallback)
+            try:
+                self._client = BleakClient(self.address)
                 await self._client.connect()
                 await self._client.start_notify(self.NUS_RX, self._on_nus_rx)
-                return  # success
+                logger.info("BLE direct connect succeeded (OS cache)")
+                return
             except Exception as e:
                 last_error = e
                 logger.warning(f"BLE connect attempt {attempt}/{max_attempts} failed: {e}")
@@ -192,10 +213,41 @@ class BuzzerBLEService(Service):
                     except Exception:
                         pass
                     self._client = None
-                if attempt < max_attempts:
-                    await asyncio.sleep(1.0)
+
+            if attempt < max_attempts:
+                await asyncio.sleep(1.0)
 
         raise last_error
+
+    async def _scan_for_device(self, timeout: float = 10.0):
+        """Scan for our device using a detection callback.
+
+        Unlike find_device_by_address() and discover(), this avoids
+        CoreBluetooth's unreliable internal address filtering.  The
+        callback fires for every device seen; we match the address
+        ourselves and stop immediately.
+        """
+        from bleak import BleakScanner
+
+        found_device = None
+        found_event = asyncio.Event()
+
+        def on_detect(device, _adv_data):
+            nonlocal found_device
+            if device.address == self.address:
+                found_device = device
+                found_event.set()
+
+        scanner = BleakScanner(detection_callback=on_detect)
+        await scanner.start()
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            await scanner.stop()
+
+        return found_device
 
     def _on_nus_rx(self, sender, data: bytearray):
         """Callback for NUS RX notifications.
@@ -247,22 +299,23 @@ class BuzzerBLEService(Service):
         """Scan for BLE devices advertising NUS. Returns [(address, name), ...]."""
         from bleak import BleakScanner
 
-        # Don't pass service_uuids to CoreBluetooth — its filtering is
-        # unreliable on macOS and silently drops matching devices.
-        # Instead, scan everything and filter ourselves.
-        devices = await BleakScanner.discover(
-            timeout=timeout,
-            return_adv=True,
-        )
-        results = []
+        # Use a detection callback instead of discover() — CoreBluetooth's
+        # internal filtering (service_uuids, address matching) is unreliable
+        # on macOS.  The callback fires for every device; we filter ourselves.
+        results = {}
         nus_lower = BuzzerBLEService.NUS_SVC.lower()
-        for addr, (device, adv_data) in devices.items():
+
+        def on_detect(device, adv_data):
             adv_uuids = [u.lower() for u in (adv_data.service_uuids or [])]
-            if nus_lower not in adv_uuids:
-                continue
-            name = adv_data.local_name or device.name or "Unknown"
-            results.append((device.address, name))
-        return results
+            if nus_lower in adv_uuids:
+                name = adv_data.local_name or device.name or "Unknown"
+                results[device.address] = (device.address, name)
+
+        scanner = BleakScanner(detection_callback=on_detect)
+        await scanner.start()
+        await asyncio.sleep(timeout)
+        await scanner.stop()
+        return list(results.values())
 
     @staticmethod
     def scan_sync(timeout: float = 5.0) -> list:
