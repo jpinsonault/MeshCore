@@ -1220,14 +1220,17 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
       );
       strcpy(reply, "OK");
-    } else if (strncmp(sub, "inject ", 7) == 0) {
-      // Inject a synthetic group message into the collector pipeline (not transmitted over radio).
-      // Usage: collector inject #channel sender message text here
-      const char *args = sub + 7;
+    } else if (strncmp(sub, "inject ", 7) == 0 || strncmp(sub, "send ", 5) == 0) {
+      // inject: feed a synthetic group message into the collector pipeline (local only).
+      // send:   encrypt, transmit over LoRa via sendFlood(), AND echo into collector pipeline.
+      // Usage: collector inject|send #channel sender message text here
+      bool do_send = (sub[0] == 's');
+      const char *args = sub + (do_send ? 5 : 7);
       while (*args == ' ') args++;
 
       if (*args != '#') {
-        strcpy(reply, "Err - use: collector inject #channel sender message");
+        strcpy(reply, do_send ? "Err - use: collector send #channel sender message"
+                              : "Err - use: collector inject #channel sender message");
         return;
       }
 
@@ -1282,25 +1285,64 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       pt_len += snprintf((char *)&plaintext[pt_len], sizeof(plaintext) - pt_len, "%s: %s", sender_name, message);
       pt_len++;  // include null terminator
 
-      // Build packet payload: [channel_hash(1)] [mac(2)] [ciphertext...]
+      // Build raw wire bytes for collector echo: [header(1)] [path_len=0(1)] [payload...]
       uint8_t payload[MAX_PACKET_PAYLOAD];
       payload[0] = channel_hash;
       int enc_len = mesh::Utils::encryptThenMAC(secret, &payload[1], plaintext, pt_len);
       int payload_len = 1 + enc_len;
 
-      // Build raw wire bytes: [header(1)] [path_len=0(1)] [payload...]
       uint8_t raw[MAX_TRANS_UNIT + 1];
       raw[0] = (PAYLOAD_TYPE_GRP_TXT << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD;
       raw[1] = 0;  // path_len = 0 (no hops)
       memcpy(&raw[2], payload, payload_len);
       int raw_len = 2 + payload_len;
 
-      // Feed into collector pipeline only — NOT transmitted over radio
-      logRxRaw(-50.0f, -90.0f, raw, raw_len);
+      if (do_send) {
+        // Transmit over LoRa
+        mesh::GroupChannel channel;
+        memcpy(channel.hash, &channel_hash, PATH_HASH_SIZE);
+        memcpy(channel.secret, secret, PUB_KEY_SIZE);
 
-      sprintf(reply, "OK - injected %d bytes on %s", raw_len, chan_name);
+        mesh::Packet *pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, plaintext, pt_len);
+        if (pkt) {
+          sendFlood(pkt);
+          // Echo into collector pipeline so the host sees it
+          logRxRaw(-50.0f, -90.0f, raw, raw_len);
+          sprintf(reply, "OK - sent %d bytes on %s", raw_len, chan_name);
+        } else {
+          strcpy(reply, "Err - packet pool empty");
+        }
+      } else {
+        // Inject only — feed into collector pipeline, NOT transmitted over radio
+        logRxRaw(-50.0f, -90.0f, raw, raw_len);
+        sprintf(reply, "OK - injected %d bytes on %s", raw_len, chan_name);
+      }
+    } else if (strncmp(sub, "screen ", 7) == 0) {
+      // Show arbitrary text on the OLED display.
+      // Usage: collector screen Hello World
+      const char *text = sub + 7;
+      while (*text == ' ') text++;
+#ifdef DISPLAY_CLASS
+      display.turnOn();
+      display.startFrame();
+      display.setTextSize(2);
+      display.setCursor(0, 10);
+      display.print(text);
+      display.endFrame();
+      sprintf(reply, "OK - screen: %s", text);
+#else
+      strcpy(reply, "Err - no display on this board");
+#endif
+    } else if (strcmp(sub, "screen") == 0) {
+      // Clear the display
+#ifdef DISPLAY_CLASS
+      display.clear();
+      strcpy(reply, "OK - screen cleared");
+#else
+      strcpy(reply, "Err - no display on this board");
+#endif
     } else {
-      strcpy(reply, "Err - use: collector start|stop|status|diag|inject");
+      strcpy(reply, "Err - use: collector start|stop|status|diag|inject|send|screen");
     }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands

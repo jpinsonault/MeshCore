@@ -213,3 +213,49 @@ class TestProcessFrameChannelDecode:
 
         # Message should still be stored
         assert core_with_store._store.get_channel_message_count() == 1
+
+
+class TestSendChannelMessage:
+    def test_sends_correct_command(self):
+        """send_channel_message builds the right CLI command."""
+        from unittest.mock import MagicMock
+        core = CollectorCore(port=None)
+        core._ser = MagicMock()
+        core._ser.is_open = True
+        core._ser.write = MagicMock()
+
+        result = core.send_channel_message("#test", "alice", "hello world")
+        assert result is True
+        core._ser.write.assert_called_once()
+        written = core._ser.write.call_args[0][0]
+        assert written == b"collector send #test alice hello world\r"
+
+    def test_adds_hash_prefix(self):
+        """If channel name lacks #, it is added."""
+        from unittest.mock import MagicMock
+        core = CollectorCore(port=None)
+        core._ser = MagicMock()
+        core._ser.is_open = True
+        core._ser.write = MagicMock()
+
+        core.send_channel_message("test", "bob", "hi")
+        written = core._ser.write.call_args[0][0]
+        assert written == b"collector send #test bob hi\r"
+
+    def test_returns_false_when_disconnected(self):
+        """Returns False when no serial connection."""
+        core = CollectorCore(port=None)
+        result = core.send_channel_message("#test", "alice", "hello")
+        assert result is False
+
+    def test_returns_false_on_serial_error(self):
+        """Returns False when serial write raises."""
+        from unittest.mock import MagicMock
+        import serial
+        core = CollectorCore(port=None)
+        core._ser = MagicMock()
+        core._ser.is_open = True
+        core._ser.write.side_effect = serial.SerialException("disconnected")
+
+        result = core.send_channel_message("#test", "alice", "hello")
+        assert result is False

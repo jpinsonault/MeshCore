@@ -128,10 +128,12 @@ Each example in `examples/` is a complete firmware:
 
 ### Goal
 
-Build a passive mesh network observer: a repeater node that functions normally on the mesh
+Build a mesh network observer and participant: a repeater node that functions normally on the mesh
 (relaying all traffic) while also dumping every packet it sees over USB serial to a host
 computer. The host runs a long-lived Python service that stores all data in SQLite for
 analysis — network topology, channel activity, routing patterns, node uptime, traffic mix.
+The collector can also send group messages on hashtag channels via the firmware's `collector send`
+CLI command, enabling full chat participation from the TUI.
 
 ### Architecture
 
@@ -140,7 +142,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - Binary frame protocol v2 over serial: `[0xC0] [len_lo] [len_hi] [type] [seq(4B)] [payload...] [crc16(2B)]`
 - 200KB ring buffer with sequence numbers, CRC-16 integrity, and ACK/RESUME handshake for reliable delivery
 - Host-to-device frames: HOST_ACK (0xA0), HOST_RESUME (0xA1) for flow control
-- Runtime-toggleable via CLI: `collector start|stop|status|diag`
+- Runtime-toggleable via CLI: `collector start|stop|status|diag|inject|send|screen`
 - Frame types: RX_RAW (0xD0), TX_RAW (0xD1), ADVERTISEMENT (0xD2), HEARTBEAT (0xD3), DIAGNOSTICS (0xD4), HANDSHAKE (0xDF)
 - Zero impact when disabled — just a bool check per packet
 
@@ -149,7 +151,7 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - SQLite storage: raw_packets, advertisements, nodes, heartbeats, diagnostics
 - pyos-based TUI with port selection and live dashboard
 - JSON HTTP API for browser access from another machine
-- 478 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels)
+- 680 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels, send, brute force)
 
 ### Current Status
 
@@ -181,6 +183,10 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - [x] IRC-style chat interface (ChatActivity) as new main screen with /commands
 - [x] Channel cracker: passive dictionary attack on hashtag channels, retroactive decrypt, /crack command
 - [x] Hardware-in-the-loop system tests (7 tests: inject pipeline, CLI commands, sequencing, cracker)
+- [x] Two-board over-the-air radio tests (6 tests: send echo, send+crack, intercept+crack, RX_RAW capture, decryption, advertisement)
+- [x] Send capability: `collector send` CLI command, bare-text chat, /nick, /send commands
+- [x] OLED display control: `collector screen <text>` shows test status / messages on device display
+- [x] Brute-force channel cracker: multicore SHA-256 grinding, ~9M candidates/sec on Apple Silicon
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -206,9 +212,16 @@ analysis — network topology, channel activity, routing patterns, node uptime, 
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/tests/` — 652 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker)
-- `collector/tests/system/` — 7 hardware-in-the-loop system tests (require MESHCORE_PORT env var)
+- `collector/brute_force.py` — Multicore brute-force channel cracker (ProcessPoolExecutor, SHA-256 + HMAC + AES)
+- `collector/tests/` — 680 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker, send, brute force)
+- `collector/tests/system/` — 14 hardware-in-the-loop system tests (require MESHCORE_PORT env var)
+- `collector/tests/system/test_radio.py` — 7 tests: single-board send echo, single-board send+crack, two-board dictionary intercept+crack, two-board brute-force crack (no wordlist), two-board RX_RAW capture, two-board decrypt, two-board advertisement (two-board tests require MESHCORE_SENDER_PORT)
 - `collector/collector_test.py` — Device-to-PC API validation test
+
+### Hardware Test Ports
+
+- Collector (repeater): `/dev/cu.usbserial-0001`
+- Sender (repeater): `/dev/cu.usbserial-5`
 
 ### Running
 
@@ -236,6 +249,16 @@ python -m pytest collector/tests/ -v
 
 # System tests (require hardware)
 MESHCORE_PORT=/dev/cu.usbserial-0001 python -m pytest collector/tests/system/ -v
+
+# Radio tests (require two boards)
+MESHCORE_PORT=/dev/cu.usbserial-0001 \
+MESHCORE_SENDER_PORT=/dev/cu.usbserial-5 \
+python -m pytest collector/tests/system/test_radio.py -v
+
+# All system tests (single-board + radio)
+MESHCORE_PORT=/dev/cu.usbserial-0001 \
+MESHCORE_SENDER_PORT=/dev/cu.usbserial-5 \
+python -m pytest collector/tests/system/ -v
 ```
 
 ## Contributing

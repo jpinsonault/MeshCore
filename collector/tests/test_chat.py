@@ -2,6 +2,7 @@
 
 import tempfile
 import time
+from unittest.mock import MagicMock
 import pytest
 
 from pyos import Keys
@@ -523,3 +524,139 @@ class TestChatReentry:
         app.drain()
         # Service should still be marked started
         assert activity._service_started is True
+
+
+def _setup_with_mock_service(app):
+    """Start a ChatActivity and register a mock collector service."""
+    activity = _make_chat()
+    app.start_activity(activity)
+    mock_svc = MagicMock()
+    mock_svc.send_message = MagicMock(return_value=True)
+    app._services["collector"] = mock_svc
+    mock_svc._application = app
+    return activity, mock_svc
+
+
+class TestChatSend:
+    def test_bare_text_sends_message(self, app, mock_screen):
+        """Bare text in command input sends to selected channel."""
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._sender_name = "collector"
+        activity._selected_channel = "#test"
+        activity.display_state["command_input"]["text"] = "hello world"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_called_once_with("#test", "collector", "hello world")
+
+    def test_bare_text_no_channel_shows_error(self, app, mock_screen):
+        """Bare text without a selected channel shows error."""
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._selected_channel = None
+        activity.display_state["command_input"]["text"] = "hello"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_not_called()
+        assert any("Select a channel" in m["text"] for m in activity._system_messages)
+
+    def test_bare_text_not_connected_shows_error(self, app, mock_screen):
+        """Bare text when disconnected shows error."""
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = False
+        activity._selected_channel = "#test"
+        activity.display_state["command_input"]["text"] = "hello"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_not_called()
+        assert any("Not connected" in m["text"] for m in activity._system_messages)
+
+    def test_bare_text_send_failure(self, app, mock_screen):
+        """When send returns False, shows failure message."""
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._selected_channel = "#test"
+        mock_svc.send_message.return_value = False
+        activity.display_state["command_input"]["text"] = "hello"
+        activity._on_text_submit(None)
+        app.drain()
+        assert any("Failed to send" in m["text"] for m in activity._system_messages)
+
+    def test_bare_text_uses_sender_name(self, app, mock_screen):
+        """Send uses the configured sender name."""
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._selected_channel = "#test"
+        activity._sender_name = "alice"
+        activity.display_state["command_input"]["text"] = "hi"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_called_once_with("#test", "alice", "hi")
+
+
+class TestChatNick:
+    def test_nick_sets_name(self, app, mock_screen):
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity.display_state["command_input"]["text"] = "/nick alice"
+        activity._on_text_submit(None)
+        app.drain()
+        assert activity._sender_name == "alice"
+        assert any("Nick set to: alice" in m["text"] for m in activity._system_messages)
+
+    def test_nick_no_arg_shows_current(self, app, mock_screen):
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity._sender_name = "bob"
+        activity.display_state["command_input"]["text"] = "/nick"
+        activity._on_text_submit(None)
+        app.drain()
+        assert any("Current nick: bob" in m["text"] for m in activity._system_messages)
+
+    def test_nick_takes_first_word(self, app, mock_screen):
+        activity = _make_chat()
+        app.start_activity(activity)
+        activity.display_state["command_input"]["text"] = "/nick alice wonderland"
+        activity._on_text_submit(None)
+        app.drain()
+        assert activity._sender_name == "alice"
+
+
+class TestChatSendCommand:
+    def test_send_to_specified_channel(self, app, mock_screen):
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._sender_name = "collector"
+        activity.display_state["command_input"]["text"] = "/send #other hello world"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_called_once_with("#other", "collector", "hello world")
+
+    def test_send_to_selected_channel(self, app, mock_screen):
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._sender_name = "collector"
+        activity._selected_channel = "#test"
+        activity.display_state["command_input"]["text"] = "/send just some text"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_called_once_with("#test", "collector", "just some text")
+
+    def test_send_no_channel_shows_error(self, app, mock_screen):
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity._selected_channel = None
+        activity.display_state["command_input"]["text"] = "/send hello"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_not_called()
+        assert any("No channel" in m["text"] for m in activity._system_messages)
+
+    def test_send_no_arg_shows_usage(self, app, mock_screen):
+        activity, mock_svc = _setup_with_mock_service(app)
+        activity._connected = True
+        activity.display_state["command_input"]["text"] = "/send"
+        activity._on_text_submit(None)
+        app.drain()
+        mock_svc.send_message.assert_not_called()
+        assert any("Usage:" in m["text"] for m in activity._system_messages)

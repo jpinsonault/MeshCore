@@ -16,6 +16,7 @@ DEFAULTS = {
     "baud": 115200,
     "db_path": "collector.db",
     "channels": [],
+    "sender_name": "collector",
 }
 
 
@@ -103,4 +104,11 @@ def remove_channel_from_config(name, path=None):
     config = load_config(path)
     channels = config.get("channels", [])
     config["channels"] = [ch for ch in channels if ch.get("name") != name]
+    save_config(config, path)
+
+
+def set_sender_name(name, path=None):
+    """Persist the sender display name in config."""
+    config = load_config(path)
+    config["sender_name"] = name
     save_config(config, path)

@@ -3,6 +3,9 @@ System test fixtures — real hardware via CollectorCore.
 
 Requires MESHCORE_PORT env var (e.g. /dev/cu.usbserial-0001).
 Tests are auto-skipped when no device is connected.
+
+Two-board radio tests additionally require MESHCORE_SENDER_PORT
+(e.g. /dev/cu.usbserial-5) and are marked with ``pytest.mark.radio``.
 """
 
 import os
@@ -12,6 +15,7 @@ import time
 import uuid
 
 import pytest
+import serial
 
 from collector.core import CollectorCore
 from collector.crypto import Channel
@@ -22,12 +26,14 @@ from collector.crypto import Channel
 # ---------------------------------------------------------------------------
 
 def pytest_collection_modifyitems(config, items):
-    if os.environ.get("MESHCORE_PORT"):
-        return
-    skip = pytest.mark.skip(reason="MESHCORE_PORT not set — no hardware")
+    has_port = bool(os.environ.get("MESHCORE_PORT"))
+    has_sender = bool(os.environ.get("MESHCORE_SENDER_PORT"))
+
     for item in items:
-        if "system" in item.keywords:
-            item.add_marker(skip)
+        if "system" in item.keywords and not has_port:
+            item.add_marker(pytest.mark.skip(reason="MESHCORE_PORT not set — no hardware"))
+        if "radio" in item.keywords and not has_sender:
+            item.add_marker(pytest.mark.skip(reason="MESHCORE_SENDER_PORT not set — no sender"))
 
 
 # ---------------------------------------------------------------------------
@@ -162,3 +168,29 @@ def hw(hw_session):
 def unique_tag():
     """Return a short unique string for test isolation."""
     return uuid.uuid4().hex[:12]
+
+
+# ---------------------------------------------------------------------------
+# Sender fixtures (two-board radio tests)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def sender_session():
+    """Session-scoped: open serial to the sender board, yield, close on teardown."""
+    port = os.environ.get("MESHCORE_SENDER_PORT")
+    if not port:
+        pytest.skip("MESHCORE_SENDER_PORT not set")
+
+    ser = serial.Serial(port, 115200, timeout=0.5)
+    time.sleep(1.0)  # let the board finish any boot output
+    ser.reset_input_buffer()
+    yield ser
+    ser.close()
+
+
+@pytest.fixture()
+def sender(sender_session):
+    """Function-scoped: flush sender input buffer between tests, yield serial object."""
+    sender_session.reset_input_buffer()
+    time.sleep(0.1)
+    yield sender_session

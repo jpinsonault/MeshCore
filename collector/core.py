@@ -336,6 +336,26 @@ class CollectorCore:
                 return False
         return False
 
+    def send_screen_text(self, text=None):
+        """Show text on the device's OLED display, or clear it if text is None."""
+        if text:
+            return self.send_command(f"collector screen {text}\r")
+        return self.send_command("collector screen\r")
+
+    def send_channel_message(self, channel_name, sender_name, text):
+        """Send a group message on a hashtag channel via the firmware.
+
+        Uses the firmware's ``collector send`` CLI command which encrypts,
+        transmits over LoRa, and echoes the packet back into the collector
+        pipeline.
+
+        Returns True if the command was sent to the device, False otherwise.
+        """
+        if not channel_name.startswith("#"):
+            channel_name = f"#{channel_name}"
+        cmd = f"collector send {channel_name} {sender_name} {text}\r"
+        return self.send_command(cmd)
+
     def _fire_text(self, line):
         if self.on_text:
             self.on_text(line)

@@ -7,12 +7,9 @@ Replaces the old DashboardActivity as the landing screen.
 """
 
 import os
-import sys
 import time
 from collections import deque
 from datetime import datetime
-
-sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
 
 from pyos.Activity import Activity
 from pyos.EventTypes import KeyStroke, ScrollChange, TextBoxChange, TextBoxSubmit
@@ -137,6 +134,9 @@ class ChatActivity(Activity):
         # Search
         self._search_text = ""
 
+        # Send
+        self._sender_name = "collector"
+
         # Focus model: split and command_input
         self.tab_order = ["split", "command_input"]
         self.focus = "command_input"
@@ -166,6 +166,7 @@ class ChatActivity(Activity):
                 self._start_cracker()
             self._service_started = True
             self._load_channels_from_config()
+            self._load_sender_name()
             self._add_system_message(f"Connected to {self._port}")
             self._add_system_message("Type /help for available commands")
             self._build_display()
@@ -246,6 +247,15 @@ class ChatActivity(Activity):
             for ch in channels:
                 if not any(c["name"] == ch.name for c in self._channels):
                     self._channels.append({"name": ch.name, "msg_count": 0})
+        except Exception:
+            pass
+
+    def _load_sender_name(self):
+        """Load sender display name from config."""
+        try:
+            from ..config import load_config
+            config = load_config()
+            self._sender_name = config.get("sender_name", "collector")
         except Exception:
             pass
 
@@ -361,7 +371,7 @@ class ChatActivity(Activity):
             ),
             "bottom": BottomBar.display_state(items={
                 "status": self._bottom_status(),
-                "help": "TAB:rooms  ?:help  /help",
+                "help": "TAB:rooms  ?:help  /nick  /help",
             }),
         }
 
@@ -670,6 +680,12 @@ class ChatActivity(Activity):
         text = text.strip()
         if not text:
             return
+
+        if not text.startswith("/"):
+            # Bare text → send to selected channel
+            self._send_message(text)
+            return
+
         parts = text.split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
@@ -678,6 +694,10 @@ class ChatActivity(Activity):
             self._cmd_join(arg)
         elif cmd == "/part":
             self._cmd_part(arg)
+        elif cmd == "/nick":
+            self._cmd_nick(arg)
+        elif cmd == "/send":
+            self._cmd_send(arg)
         elif cmd == "/search":
             self._cmd_search(arg)
         elif cmd == "/crack":
@@ -694,6 +714,63 @@ class ChatActivity(Activity):
             self._cmd_help()
         else:
             self._add_system_message(f"Unknown command: {cmd}. Type /help for commands.")
+
+    def _send_message(self, text):
+        """Send bare text to the currently selected channel."""
+        if not self._connected:
+            self._add_system_message("Not connected")
+            return
+        if not self._selected_channel:
+            self._add_system_message("Select a channel first (click sidebar or /join #name)")
+            return
+        try:
+            svc = self.application.service("collector")
+            success = svc.send_message(self._selected_channel, self._sender_name, text)
+            if not success:
+                self._add_system_message("Failed to send (connection lost)")
+        except (KeyError, RuntimeError) as e:
+            self._add_system_message(f"Send error: {e}")
+
+    def _cmd_nick(self, arg):
+        """Set sender display name."""
+        if not arg:
+            self._add_system_message(f"Current nick: {self._sender_name}")
+            self._add_system_message("Usage: /nick <name>")
+            return
+        name = arg.split()[0]  # first word only
+        self._sender_name = name
+        from ..config import set_sender_name
+        set_sender_name(name)
+        self._add_system_message(f"Nick set to: {name}")
+
+    def _cmd_send(self, arg):
+        """Explicit send: /send [#channel] message text."""
+        if not arg:
+            self._add_system_message("Usage: /send [#channel] message")
+            return
+        parts = arg.split(None, 1)
+        if parts[0].startswith("#"):
+            channel = parts[0]
+            text = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            channel = self._selected_channel
+            text = arg
+        if not channel:
+            self._add_system_message("No channel specified. Use /send #channel message")
+            return
+        if not text:
+            self._add_system_message("No message text")
+            return
+        if not self._connected:
+            self._add_system_message("Not connected")
+            return
+        try:
+            svc = self.application.service("collector")
+            success = svc.send_message(channel, self._sender_name, text)
+            if not success:
+                self._add_system_message("Failed to send (connection lost)")
+        except (KeyError, RuntimeError) as e:
+            self._add_system_message(f"Send error: {e}")
 
     def _cmd_join(self, arg):
         if not arg:
@@ -864,15 +941,18 @@ class ChatActivity(Activity):
 
     def _cmd_help(self):
         self._add_system_message("Available commands:")
-        self._add_system_message("  /join #name       - Join a hashtag channel")
-        self._add_system_message("  /join Name b64psk - Join a PSK channel")
-        self._add_system_message("  /part [#name]     - Leave current or named channel")
-        self._add_system_message("  /search text      - Filter messages (empty to clear)")
-        self._add_system_message("  /crack [status]   - Show cracker state")
-        self._add_system_message("  /crack start|stop - Toggle channel cracker")
-        self._add_system_message("  /crack wordlist f - Load custom wordlist")
-        self._add_system_message("  /diag             - Open system diagnostics")
-        self._add_system_message("  /nodes            - Open node list (dashboard)")
-        self._add_system_message("  /packets          - Open packet list (dashboard)")
-        self._add_system_message("  /status           - Show connection info")
-        self._add_system_message("  /help             - Show this help")
+        self._add_system_message("  (bare text)         - Send message to selected channel")
+        self._add_system_message("  /nick <name>        - Set your sender name")
+        self._add_system_message("  /send [#chan] <msg>  - Send to current or specified channel")
+        self._add_system_message("  /join #name         - Join a hashtag channel")
+        self._add_system_message("  /join Name b64psk   - Join a PSK channel")
+        self._add_system_message("  /part [#name]       - Leave current or named channel")
+        self._add_system_message("  /search text        - Filter messages (empty to clear)")
+        self._add_system_message("  /crack [status]     - Show cracker state")
+        self._add_system_message("  /crack start|stop   - Toggle channel cracker")
+        self._add_system_message("  /crack wordlist f   - Load custom wordlist")
+        self._add_system_message("  /diag               - Open system diagnostics")
+        self._add_system_message("  /nodes              - Open node list (dashboard)")
+        self._add_system_message("  /packets            - Open packet list (dashboard)")
+        self._add_system_message("  /status             - Show connection info")
+        self._add_system_message("  /help               - Show this help")

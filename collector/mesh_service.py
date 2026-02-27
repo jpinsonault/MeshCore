@@ -5,10 +5,6 @@ Wraps CollectorCore as a pyos Service, bridging callbacks into pyos events
 so Activities can subscribe to CollectorFrame, CollectorConnected, etc.
 """
 
-import sys
-import os
-sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
-
 from pyos.Service import Service
 
 from .core import CollectorCore
@@ -96,6 +92,10 @@ class MeshCollectorService(Service):
 
     def _on_channel_discovered(self, name, decoded_count):
         self.dispatch_event(ChannelDiscovered(name, decoded_count))
+
+    def send_message(self, channel_name, sender_name, text):
+        """Send a group message on a channel. Returns True if command was sent."""
+        return self._core.send_channel_message(channel_name, sender_name, text)
 
     def _on_error(self, msg):
         self.dispatch_event(CollectorError(msg))

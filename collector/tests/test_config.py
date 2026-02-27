@@ -1,11 +1,17 @@
-"""Tests for config.py — load_channels(), add/remove channel helpers."""
+"""Tests for config.py — load_channels(), add/remove channel helpers, set_sender_name."""
 
 import json
 import tempfile
 import pytest
 
 import base64
-from collector.config import load_channels, add_channel_to_config, remove_channel_from_config
+from collector.config import (
+    load_channels,
+    load_config,
+    add_channel_to_config,
+    remove_channel_from_config,
+    set_sender_name,
+)
 from collector.crypto import Channel
 
 
@@ -210,3 +216,38 @@ class TestRemoveChannelFromConfig:
         with open(path) as f:
             config = json.load(f)
         assert len(config["channels"]) == 0
+
+
+class TestSetSenderName:
+    def test_set_sender_name(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({}, f)
+            path = f.name
+        set_sender_name("alice", path=path)
+        config = load_config(path)
+        assert config["sender_name"] == "alice"
+
+    def test_set_sender_name_overwrites(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"sender_name": "bob"}, f)
+            path = f.name
+        set_sender_name("carol", path=path)
+        config = load_config(path)
+        assert config["sender_name"] == "carol"
+
+    def test_default_sender_name(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({}, f)
+            path = f.name
+        config = load_config(path)
+        assert config["sender_name"] == "collector"
+
+    def test_set_sender_name_preserves_other_config(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"port": "/dev/ttyUSB0", "channels": [{"name": "#test"}]}, f)
+            path = f.name
+        set_sender_name("alice", path=path)
+        config = load_config(path)
+        assert config["sender_name"] == "alice"
+        assert config["port"] == "/dev/ttyUSB0"
+        assert len(config["channels"]) == 1
