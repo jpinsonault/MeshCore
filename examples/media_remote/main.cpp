@@ -32,34 +32,34 @@ BLEHidAdafruit blehid;
 BLEDis         bledis;
 BLEUart        bleuart;
 
-// -- RTTTL melodies --
-static const char M_STARTUP[]   = "Up:d=16,o=6,b=200:c,e,g";
-static const char M_CONNECT[]   = "Con:d=16,o=6,b=200:g,c7";
-static const char M_CLICK[]     = "Clk:d=32,o=7,b=200:c";
-static const char M_DBLCLICK[]  = "Dbl:d=32,o=7,b=200:c,p,c";
-static const char M_MUTE[]      = "Mut:d=16,o=6,b=160:g,e,c";
-static const char M_UNMUTE[]    = "Unm:d=16,o=6,b=160:c,e,g";
-static const char M_GESTURE[]   = "Ges:d=32,o=7,b=200:e,p,e";
-static const char M_POWER_OFF[] = "Off:d=8,o=5,b=100:g,e,c,2c4";
-static const char M_PAIRING[]   = "Pair:d=8,o=5,b=80:g,e,c,2g";
-static const char M_NOT_CONN[]  = "Nc:d=32,o=5,b=160:e,c";
+// -- RTTTL melodies (pinned to floor: C4=262Hz low, C#4=277Hz high) --
+static const char M_STARTUP[]   = "Up:d=16,o=4,b=200:c,c,c#";
+static const char M_CONNECT[]   = "Con:d=16,o=4,b=200:c,c#";
+static const char M_CLICK[]     = "Clk:d=32,o=4,b=200:c";
+static const char M_DBLCLICK[]  = "Dbl:d=32,o=4,b=200:c,p,c";
+static const char M_MUTE[]      = "Mut:d=16,o=4,b=160:c#,c,c";
+static const char M_UNMUTE[]    = "Unm:d=16,o=4,b=160:c,c,c#";
+static const char M_GESTURE[]   = "Ges:d=32,o=4,b=200:c#,p,c#";
+static const char M_POWER_OFF[] = "Off:d=8,o=4,b=100:c#,c,c,2c";
+static const char M_PAIRING[]   = "Pair:d=8,o=4,b=80:c#,c,c,2c";
+static const char M_NOT_CONN[]  = "Nc:d=32,o=4,b=160:c#,c";
 
-// 16 chromatic notes (C4–D#5) for volume level feedback.
+// 16 chromatic notes (C1–D#2) for volume level feedback.
 // Mac has 16 volume steps; pitch tracks approximate position.
 static const uint16_t VOL_NOTES[] = {
-  262, 277, 294, 311, 330, 349, 370, 392,   // C4 C#4 D4 D#4 E4 F4 F#4 G4
-  415, 440, 466, 494, 523, 554, 587, 622    // G#4 A4 A#4 B4 C5 C#5 D5 D#5
+  33,  35,  37,  39,  41,  44,  46,  49,    // C1 C#1 D1 D#1 E1 F1 F#1 G1
+  52,  55,  58,  62,  65,  69,  73,  78     // G#1 A1 A#1 B1 C2 C#2 D2 D#2
 };
 #define VOL_NOTE_COUNT 16
-static int8_t vol_note_idx = 8;  // start in the middle (G#4)
+static int8_t vol_note_idx = 8;  // start in the middle (G#1)
 
-// Ascending scale played during hold countdown (C5-E5-G5-C6-E6)
+// Ascending hold countdown: C4, C4, C#4, C#4, C#4 (min interval)
 static const char* const HOLD_SCALE[] = {
-  "H1:d=16,o=5,b=160:c",
-  "H2:d=16,o=5,b=160:e",
-  "H3:d=16,o=5,b=160:g",
-  "H4:d=16,o=6,b=160:c",
-  "H5:d=16,o=6,b=160:e",
+  "H1:d=16,o=4,b=160:c",
+  "H2:d=16,o=4,b=160:c",
+  "H3:d=16,o=4,b=160:c#",
+  "H4:d=16,o=4,b=160:c#",
+  "H5:d=16,o=4,b=160:c#",
 };
 #define HOLD_SCALE_LEN   5
 #define HOLD_SCALE_START 500   // ms into hold before first note
