@@ -96,7 +96,8 @@ static bool  filt_init = false;
 // Tilt is measured as angular change from a reference captured on gesture enter.
 // After offset correction: left/right tilt = Y axis, face up/down = Z axis.
 static bool     gesture_active  = false;
-static float    gesture_ref_angle = 0;
+static float    gesture_ref_gy = 0, gesture_ref_gz = 0;
+static bool     gesture_ref_valid = false;
 static bool     gesture_tilt_pos = false;  // tilted right (vol up)
 static bool     gesture_tilt_neg = false;  // tilted left (vol down)
 static uint32_t gesture_last_vol = 0;
@@ -339,12 +340,16 @@ static void update_button() {
       } else if (btn_clicks == 0 && now - btn_press_t > LONGPRESS_MS) {
         // First press held → gesture mode
         gesture_active = true;
-        gesture_ref_angle = atan2f(filt_gy, filt_gz);
+        float yz_mag = sqrtf(filt_gy * filt_gy + filt_gz * filt_gz);
+        gesture_ref_valid = (yz_mag >= 0.3f);
+        gesture_ref_gy = filt_gy;
+        gesture_ref_gz = filt_gz;
         gesture_tilt_pos = false;
         gesture_tilt_neg = false;
         gesture_last_vol = now;
         btn_fsm = BTN_GESTURE;
-        log("GESTURE enter (ref=%.1f deg)", gesture_ref_angle * 180.0f / 3.14159f);
+        log("GESTURE enter (Y=%.2f Z=%.2f mag=%.2f%s)",
+            filt_gy, filt_gz, yz_mag, gesture_ref_valid ? "" : " DEFERRED");
         beep(M_GESTURE);
       } else if (btn_clicks >= 1) {
         // Multi-press hold: ascending scale counting up to action
@@ -409,9 +414,30 @@ static void update_button() {
 static void update_gesture() {
   if (!gesture_active) return;
 
-  // Compute current tilt angle relative to reference
-  float cur_angle = atan2f(filt_gy, filt_gz);
-  float delta = cur_angle - gesture_ref_angle;
+  // Guard: need enough Y-Z gravity component for reliable roll detection.
+  // Below 0.3g (~72° from horizontal) noise dominates and tilt sign reverses.
+  float yz_mag = sqrtf(filt_gy * filt_gy + filt_gz * filt_gz);
+  if (yz_mag < 0.3f) {
+    gesture_tilt_pos = false;
+    gesture_tilt_neg = false;
+    return;
+  }
+
+  // Lazy reference capture: if entry was at a bad angle, grab it now
+  if (!gesture_ref_valid) {
+    gesture_ref_gy = filt_gy;
+    gesture_ref_gz = filt_gz;
+    gesture_ref_valid = true;
+    log("GESTURE ref captured (Y=%.2f Z=%.2f)", filt_gy, filt_gz);
+    return;
+  }
+
+  // Wrap-safe angle delta via 2D cross/dot product in the Y-Z plane.
+  // cross = |ref||cur|sin(delta), dot = |ref||cur|cos(delta)
+  // atan2 gives correct signed angle without ±pi discontinuity.
+  float cross = gesture_ref_gz * filt_gy - gesture_ref_gy * filt_gz;
+  float dot   = gesture_ref_gy * filt_gy + gesture_ref_gz * filt_gz;
+  float delta = atan2f(cross, dot);
   float delta_deg = delta * 180.0f / 3.14159f;
   uint32_t now = millis();
 
