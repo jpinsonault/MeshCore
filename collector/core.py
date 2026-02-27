@@ -76,8 +76,10 @@ class CollectorCore:
         self.on_error: Callable = None
         self.on_channel_message: Callable = None
         self.on_channel_discovered: Callable = None
+        self.on_undecryptable: Callable = None
 
         self._channels = []
+        self._undecryptable_count = 0
         self._cracker = None
         self._ser = None
         self._store = None
@@ -150,6 +152,11 @@ class CollectorCore:
                 self._channels = load_channels(config)
             except Exception:
                 pass
+
+        # Ensure the default public channel is always present
+        from .crypto import default_public_channel, DEFAULT_PUBLIC_CHANNEL_NAME
+        if not any(ch.name == DEFAULT_PUBLIC_CHANNEL_NAME for ch in self._channels):
+            self._channels.insert(0, default_public_channel())
 
         try:
             self._connect_and_collect()
@@ -311,11 +318,15 @@ class CollectorCore:
                     self._store.store_channel_message(msg, raw_packet_id=raw_packet_id)
                     if self.on_channel_message:
                         self.on_channel_message(msg)
-                elif self._cracker:
-                    from .crypto import extract_group_payload
-                    extracted = extract_group_payload(raw)
-                    if extracted:
-                        self._cracker.notify_unknown_hash(extracted["channel_hash"])
+                else:
+                    self._undecryptable_count += 1
+                    if self.on_undecryptable:
+                        self.on_undecryptable(self._undecryptable_count)
+                    if self._cracker:
+                        from .crypto import extract_group_payload
+                        extracted = extract_group_payload(raw)
+                        if extracted:
+                            self._cracker.notify_unknown_hash(extracted["channel_hash"])
 
     def _send_ack(self, seq):
         """Send HOST_ACK frame and persist last committed seq."""

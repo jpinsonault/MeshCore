@@ -5,11 +5,6 @@ Accessed by pressing '?' from any screen. Displays all available
 keyboard shortcuts for the screen that was active.
 """
 
-import os
-import sys
-
-sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
-
 from pyos.Activity import Activity
 from pyos.EventTypes import KeyStroke, ScrollChange
 from pyos.input_handlers import handle_scroll_list_input
@@ -40,12 +35,14 @@ HELP_SECTIONS = {
         "keys": [
             ("TAB", "Cycle focus: rooms \u2192 messages \u2192 command input"),
             ("LEFT/RIGHT", "Resize the panel split (when split focused)"),
-            ("ENTER", "Select/deselect channel in rooms panel"),
+            ("ENTER", "Select channel or open node list in sidebar"),
             ("/join #name", "Join a hashtag channel"),
             ("/part [#name]", "Leave current or named channel"),
             ("/search text", "Filter messages (empty to clear)"),
+            ("/repeaters", "Open repeater list"),
+            ("/rooms", "Open room server list"),
+            ("/contacts", "Open all nodes list"),
             ("/diag", "Open system diagnostics"),
-            ("/nodes", "Open node list (dashboard)"),
             ("/packets", "Open packet list (dashboard)"),
             ("/status", "Show connection info"),
             ("/help", "Show available commands"),
@@ -98,6 +95,16 @@ HELP_SECTIONS = {
             ("r / R", "Request immediate diagnostics update"),
             ("ESC", "Go back to dashboard"),
             ("UP/DOWN", "Scroll through content"),
+        ],
+    },
+    "node_list": {
+        "title": "Node List",
+        "keys": [
+            ("ENTER", "Open detail view for selected node"),
+            ("r / R", "Refresh node list"),
+            ("?", "Show this help screen"),
+            ("ESC", "Go back"),
+            ("UP/DOWN", "Scroll through list"),
         ],
     },
     "debug_log": {

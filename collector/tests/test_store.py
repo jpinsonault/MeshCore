@@ -250,3 +250,103 @@ class TestLastCommittedSeq:
         s2.open()
         assert s2.get_last_committed_seq() == 99
         s2.close()
+
+
+class TestGetNodesByType:
+    def test_empty_store(self, store):
+        assert store.get_nodes_by_type(1) == []
+
+    def test_filters_by_type(self, store):
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32, name="Chat1", adv_type=1))
+        store.store_frame(_adv_frame(pub_key_hex="bb" * 32, name="Rep1", adv_type=2))
+        store.store_frame(_adv_frame(pub_key_hex="cc" * 32, name="Room1", adv_type=3))
+
+        repeaters = store.get_nodes_by_type(2)
+        assert len(repeaters) == 1
+        assert repeaters[0]["name"] == "Rep1"
+
+        rooms = store.get_nodes_by_type(3)
+        assert len(rooms) == 1
+        assert rooms[0]["name"] == "Room1"
+
+    def test_returns_multiple_of_same_type(self, store):
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32, name="Rep1", adv_type=2))
+        store.store_frame(_adv_frame(pub_key_hex="bb" * 32, name="Rep2", adv_type=2))
+        result = store.get_nodes_by_type(2)
+        assert len(result) == 2
+
+    def test_no_matches(self, store):
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32, name="Chat1", adv_type=1))
+        assert store.get_nodes_by_type(3) == []
+
+
+class TestGetNodeCountByType:
+    def test_empty_store(self, store):
+        assert store.get_node_count_by_type() == {}
+
+    def test_counts_by_type(self, store):
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32, adv_type=1))
+        store.store_frame(_adv_frame(pub_key_hex="bb" * 32, adv_type=1))
+        store.store_frame(_adv_frame(pub_key_hex="cc" * 32, adv_type=2))
+        store.store_frame(_adv_frame(pub_key_hex="dd" * 32, adv_type=3))
+
+        counts = store.get_node_count_by_type()
+        assert counts[1] == 2
+        assert counts[2] == 1
+        assert counts[3] == 1
+
+    def test_same_node_not_double_counted(self, store):
+        """Multiple adverts from the same node should not increase count."""
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32, adv_type=2))
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32, adv_type=2))
+        counts = store.get_node_count_by_type()
+        assert counts[2] == 1
+
+
+class TestGetAdvertisementSnrHistory:
+    def test_empty_store(self, store):
+        assert store.get_advertisement_snr_history("aa" * 32) == []
+
+    def test_returns_snr_tuples(self, store):
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32))
+        result = store.get_advertisement_snr_history("aa" * 32)
+        assert len(result) == 1
+        ts, snr = result[0]
+        assert snr == 6.0  # from _adv_frame default
+
+    def test_returns_oldest_first(self, store):
+        # Store two adverts with slightly different times
+        f1 = _adv_frame(pub_key_hex="aa" * 32)
+        f1["received_at"] = 1000.0
+        f1["parsed"]["snr"] = 3.0
+        store.store_frame(f1)
+
+        f2 = _adv_frame(pub_key_hex="aa" * 32)
+        f2["received_at"] = 2000.0
+        f2["parsed"]["snr"] = 7.0
+        store.store_frame(f2)
+
+        result = store.get_advertisement_snr_history("aa" * 32)
+        assert len(result) == 2
+        assert result[0][0] < result[1][0]  # oldest first
+        assert result[0][1] == 3.0
+        assert result[1][1] == 7.0
+
+    def test_limit(self, store):
+        for i in range(10):
+            f = _adv_frame(pub_key_hex="aa" * 32)
+            f["received_at"] = 1000.0 + i
+            f["parsed"]["snr"] = float(i)
+            store.store_frame(f)
+
+        result = store.get_advertisement_snr_history("aa" * 32, limit=5)
+        assert len(result) == 5
+
+    def test_filters_by_pub_key(self, store):
+        store.store_frame(_adv_frame(pub_key_hex="aa" * 32))
+        store.store_frame(_adv_frame(pub_key_hex="bb" * 32))
+
+        result_a = store.get_advertisement_snr_history("aa" * 32)
+        result_b = store.get_advertisement_snr_history("bb" * 32)
+        assert len(result_a) == 1
+        assert len(result_b) == 1

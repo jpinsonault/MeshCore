@@ -151,7 +151,7 @@ CLI command, enabling full chat participation from the TUI.
 - SQLite storage: raw_packets, advertisements, nodes, heartbeats, diagnostics
 - pyos-based TUI with port selection and live dashboard
 - JSON HTTP API for browser access from another machine
-- 680 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels, send, brute force)
+- 740 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels, send, brute force, public channel, undecryptable tracking, node list)
 
 ### Current Status
 
@@ -187,6 +187,11 @@ CLI command, enabling full chat participation from the TUI.
 - [x] Send capability: `collector send` CLI command, bare-text chat, /nick, /send commands
 - [x] OLED display control: `collector screen <text>` shows test status / messages on device display
 - [x] Brute-force channel cracker: multicore SHA-256 grinding, ~9M candidates/sec on Apple Silicon
+- [x] Default public channel auto-decode (hardcoded MeshCore PSK, no config needed)
+- [x] Undecryptable message tracking with sidebar count
+- [x] Node list activity: filterable by type (repeaters, rooms, all nodes)
+- [x] Restructured sidebar: channels + network nav + status sections
+- [x] Type-specific node detail sections (repeater/room server info)
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -213,7 +218,8 @@ CLI command, enabling full chat participation from the TUI.
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
 - `collector/brute_force.py` — Multicore brute-force channel cracker (ProcessPoolExecutor, SHA-256 + HMAC + AES)
-- `collector/tests/` — 680 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker, send, brute force)
+- `collector/activities/node_list.py` — Scrollable node list filtered by adv_type (repeaters, rooms, all)
+- `collector/tests/` — 740 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker, send, brute force, public channel, undecryptable, node list)
 - `collector/tests/system/` — 14 hardware-in-the-loop system tests (require MESHCORE_PORT env var)
 - `collector/tests/system/test_radio.py` — 7 tests: single-board send echo, single-board send+crack, two-board dictionary intercept+crack, two-board brute-force crack (no wordlist), two-board RX_RAW capture, two-board decrypt, two-board advertisement (two-board tests require MESHCORE_SENDER_PORT)
 - `collector/collector_test.py` — Device-to-PC API validation test

@@ -183,7 +183,9 @@ class TestChatEvents:
         app.dispatch_event(CollectorFrame(_hb_frame(uptime=3600, battery=3700)))
         app.drain()
         assert activity._last_heartbeat is not None
-        mock_screen.assert_text_on_screen("3700mV")
+        assert activity._last_heartbeat["battery_mv"] == 3700
+        # Uptime shows in bottom bar
+        mock_screen.assert_text_on_screen("Up:1h0m")
 
     def test_channel_message_updates_sidebar(self, app, mock_screen):
         activity = _make_chat()
@@ -287,10 +289,10 @@ class TestChatKeyboard:
         # Add a channel via message
         app.dispatch_event(ChannelMessage(_group_msg(channel="#seltest")))
         app.drain()
-        # Focus split left panel
+        # Focus split left panel — index 1 is first channel (0 is separator)
         activity._set_focus("split")
         activity.display_state["split"]["focused_panel"] = "left"
-        activity.display_state["split"]["left_selected"] = 0
+        activity.display_state["split"]["left_selected"] = 1
         # ENTER to select
         app.send_key(Keys.ENTER)
         assert activity._selected_channel == "#seltest"
@@ -303,7 +305,7 @@ class TestChatKeyboard:
         app.drain()
         activity._set_focus("split")
         activity.display_state["split"]["focused_panel"] = "left"
-        activity.display_state["split"]["left_selected"] = 0
+        activity.display_state["split"]["left_selected"] = 1
         app.send_key(Keys.ENTER)
         assert activity._selected_channel == "#seltest2"
         app.send_key(Keys.ENTER)
@@ -317,8 +319,10 @@ class TestChatCommands:
         activity.display_state["command_input"]["text"] = "/help"
         activity._on_text_submit(None)
         app.drain()
-        mock_screen.assert_text_on_screen("Available commands")
-        mock_screen.assert_text_on_screen("/join")
+        # Help text is added to system messages
+        help_texts = [m["text"] for m in activity._system_messages]
+        assert any("Available commands" in t for t in help_texts)
+        assert any("/join" in t for t in help_texts)
 
     def test_status_command(self, app, mock_screen):
         activity = _make_chat()
@@ -495,8 +499,8 @@ class TestChatSystemMessages:
 
 
 class TestChatSidebarClamping:
-    def test_left_selected_clamped_to_channels(self, app, mock_screen):
-        """UP/DOWN should not select status lines below channels."""
+    def test_left_selected_clamped_to_selectable(self, app, mock_screen):
+        """UP/DOWN should not select status lines below nav items."""
         activity = _make_chat()
         app.start_activity(activity)
         activity._channels = [{"name": "#only", "msg_count": 0}]
@@ -505,11 +509,12 @@ class TestChatSidebarClamping:
         activity._set_focus("split")
         activity.display_state["split"]["focused_panel"] = "left"
         activity.display_state["split"]["left_selected"] = 0
-        # Try to scroll down past the channel
-        for _ in range(10):
+        # Try to scroll way past all items
+        for _ in range(30):
             app.send_key(0x102)  # KEY_DOWN
-        # Should be clamped to last channel index (only 1 channel, index 0)
-        assert activity.display_state["split"]["left_selected"] == 0
+        # Should be clamped to last selectable item (All Nodes nav)
+        max_idx = activity._max_selectable_sidebar_idx()
+        assert activity.display_state["split"]["left_selected"] == max_idx
 
 
 class TestChatReentry:

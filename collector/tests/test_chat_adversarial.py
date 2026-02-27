@@ -204,17 +204,18 @@ class TestRoomManagement:
         activity._update_display()
         activity._set_focus("split")
         activity.display_state["split"]["focused_panel"] = "left"
-        activity.display_state["split"]["left_selected"] = 0
+        activity.display_state["split"]["left_selected"] = 1  # first channel (0 = separator)
 
-        # Scroll down 49 times
+        # Scroll down to last channel (index 50) — 49 key presses
         for _ in range(49):
             app.send_key(0x102)  # KEY_DOWN
-        assert activity.display_state["split"]["left_selected"] == 49
+        assert activity.display_state["split"]["left_selected"] == 50
 
-        # 10 more should stay clamped at 49
-        for _ in range(10):
+        # More scrolls should clamp at max selectable (All Nodes nav)
+        max_idx = activity._max_selectable_sidebar_idx()
+        for _ in range(20):
             app.send_key(0x102)
-        assert activity.display_state["split"]["left_selected"] == 49
+        assert activity.display_state["split"]["left_selected"] == max_idx
 
     def test_select_last_channel(self, app, mock_screen):
         activity = _make_chat()
@@ -223,7 +224,8 @@ class TestRoomManagement:
         activity._update_display()
         activity._set_focus("split")
         activity.display_state["split"]["focused_panel"] = "left"
-        activity.display_state["split"]["left_selected"] = 9
+        # Last channel is at index 10 (0=separator, 1-10=channels)
+        activity.display_state["split"]["left_selected"] = 10
         app.send_key(Keys.ENTER)
         assert activity._selected_channel == "#pick9"
 
@@ -234,7 +236,8 @@ class TestRoomManagement:
         activity._update_display()
         activity._set_focus("split")
         activity.display_state["split"]["focused_panel"] = "left"
-        activity.display_state["split"]["left_selected"] = 0
+        # First channel at index 1 (0 = separator)
+        activity.display_state["split"]["left_selected"] = 1
         app.send_key(Keys.ENTER)
         assert activity._selected_channel == "#desel"
         app.send_key(Keys.ENTER)

@@ -6,12 +6,8 @@ with sparkline visualization, and advertisement statistics.
 Accessed by pressing ENTER on a node in the dashboard.
 """
 
-import os
-import sys
 import time
 from datetime import datetime
-
-sys.path.insert(0, os.path.expanduser("~/repos/pyos"))
 
 from pyos.Activity import Activity
 from pyos.EventTypes import KeyStroke, ScrollChange
@@ -31,6 +27,23 @@ def _fmt_time(ts):
         return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, ValueError):
         return "---"
+
+
+def _fmt_active_duration(first_seen):
+    """Format the time from first_seen until now as a human-readable duration."""
+    if not first_seen:
+        return "---"
+    delta = time.time() - first_seen
+    if delta < 0:
+        return "---"
+    days = int(delta // 86400)
+    hours = int((delta % 86400) // 3600)
+    if days > 0:
+        return f"{days}d {hours}h"
+    minutes = int((delta % 3600) // 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _fmt_ago(ts):
@@ -131,6 +144,21 @@ def build_node_detail_lines(pub_key_hex, info, snr_history):
         lines.append("                 -20dB              +10dB")
     else:
         lines.append("  (no signal data yet)")
+
+    # Type-specific sections
+    adv_type = info.get("adv_type")
+    if adv_type == 2:
+        lines.append("")
+        lines.append("  --- Repeater ---")
+        active_for = _fmt_active_duration(first_seen)
+        lines.append(f"  Active for:      {active_for}")
+        lines.append(f"  Advertisements:  {count}")
+    elif adv_type == 3:
+        lines.append("")
+        lines.append("  --- Room Server ---")
+        active_for = _fmt_active_duration(first_seen)
+        lines.append(f"  Active for:      {active_for}")
+        lines.append(f"  Advertisements:  {count}")
 
     return lines
 

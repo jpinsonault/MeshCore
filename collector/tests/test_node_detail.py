@@ -12,14 +12,16 @@ from collector.activities.node_detail import (
     snr_stats,
     build_node_detail_lines,
     _fmt_ago,
+    _fmt_active_duration,
     SPARK_CHARS,
 )
 
 
-def _node_info(name="TestNode", atype="CHAT", snr=5.0, count=10, lat=None, lon=None):
+def _node_info(name="TestNode", atype="CHAT", snr=5.0, count=10, lat=None, lon=None, adv_type=1):
     """Create a node info dict for testing."""
     return {
         "name": name,
+        "adv_type": adv_type,
         "adv_type_name": atype,
         "snr": snr,
         "last_seen": time.time(),
@@ -215,12 +217,11 @@ class TestNodeDetailActivity:
         assert app.activity_stack_depth() == 0
 
     def test_scroll_works(self, app, mock_screen):
-        import curses
         history = _snr_history(list(range(20)))
         activity = NodeDetailActivity("aa" * 32, _node_info(), history)
         app.start_activity(activity)
         initial = activity.display_state["content"]["selected_index"]
-        app.send_key(curses.KEY_DOWN)
+        app.send_key(Keys.DOWN)
         assert activity.display_state["content"]["selected_index"] == initial + 1
 
     def test_shows_bottom_bar_with_key(self, app, mock_screen):
@@ -240,3 +241,57 @@ class TestNodeDetailActivity:
         activity = NodeDetailActivity("aa" * 32, info)
         app.start_activity(activity)
         mock_screen.assert_text_on_screen("37.774900")
+
+
+class TestFmtActiveDuration:
+    def test_none(self):
+        assert _fmt_active_duration(None) == "---"
+
+    def test_minutes(self):
+        result = _fmt_active_duration(time.time() - 300)
+        assert "5m" == result
+
+    def test_hours_and_minutes(self):
+        result = _fmt_active_duration(time.time() - 5400)
+        assert "1h 30m" == result
+
+    def test_days_and_hours(self):
+        result = _fmt_active_duration(time.time() - 90000)
+        assert "1d 1h" == result
+
+
+class TestTypeSpecificSections:
+    def test_repeater_section(self):
+        info = _node_info(atype="REPEATER", adv_type=2, count=42)
+        lines = build_node_detail_lines("aa" * 32, info, [])
+        text = "\n".join(lines)
+        assert "Repeater" in text
+        assert "Active for:" in text
+        assert "42" in text
+
+    def test_room_server_section(self):
+        info = _node_info(atype="ROOM_SERVER", adv_type=3, count=15)
+        lines = build_node_detail_lines("aa" * 32, info, [])
+        text = "\n".join(lines)
+        assert "Room Server" in text
+        assert "Active for:" in text
+        assert "15" in text
+
+    def test_chat_node_no_extra_section(self):
+        info = _node_info(atype="CHAT", adv_type=1, count=10)
+        lines = build_node_detail_lines("aa" * 32, info, [])
+        text = "\n".join(lines)
+        assert "Repeater" not in text
+        assert "Room Server" not in text
+
+    def test_repeater_in_activity(self, app, mock_screen):
+        info = _node_info(atype="REPEATER", adv_type=2)
+        activity = NodeDetailActivity("aa" * 32, info)
+        app.start_activity(activity)
+        mock_screen.assert_text_on_screen("Repeater")
+
+    def test_room_in_activity(self, app, mock_screen):
+        info = _node_info(atype="ROOM_SERVER", adv_type=3)
+        activity = NodeDetailActivity("aa" * 32, info)
+        app.start_activity(activity)
+        mock_screen.assert_text_on_screen("Room Server")

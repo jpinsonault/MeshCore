@@ -30,6 +30,10 @@ CIPHER_MAC_SIZE = 2
 PATH_HASH_SIZE = 1
 PUB_KEY_SIZE = 32
 
+# Default MeshCore public channel — hardcoded PSK shared by all devices
+DEFAULT_PUBLIC_PSK_B64 = "izOH6cXN6mrJ5e26oRXNcg=="  # 8b3387e9c5cdea6ac9e5edbaa115cd72
+DEFAULT_PUBLIC_CHANNEL_NAME = "Public"
+
 PAYLOAD_TYPE_GRP_TXT = 0x05
 PAYLOAD_TYPE_GRP_DATA = 0x06
 
@@ -84,6 +88,11 @@ class Channel:
         secret = raw + b"\x00" * (PUB_KEY_SIZE - len(raw))
 
         return cls(name=name, secret=secret, hash=channel_hash)
+
+
+def default_public_channel() -> "Channel":
+    """Return the default MeshCore public channel with hardcoded PSK."""
+    return Channel.from_psk(DEFAULT_PUBLIC_CHANNEL_NAME, DEFAULT_PUBLIC_PSK_B64)
 
 
 def extract_group_payload(raw_packet: bytes) -> Optional[dict]:

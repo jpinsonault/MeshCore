@@ -26,6 +26,7 @@ from ..events import (
     CollectorDisconnected,
     CollectorError,
     CollectorFrame,
+    UndecryptablePacket,
 )
 from ..mesh_service import MeshCollectorService
 from ..split_view import SplitView
@@ -96,7 +97,9 @@ def _make_sparkline(timestamps, now=None, window=SPARKLINE_WINDOW, buckets=SPARK
     return "".join(chars)
 
 
-# Separator line for the sidebar between channels and status
+# Separator lines for sidebar sections
+CHANNELS_SEPARATOR = "\u2500" * 2 + " channels " + "\u2500" * 5
+NETWORK_SEPARATOR = "\u2500" * 2 + " network " + "\u2500" * 6
 STATUS_SEPARATOR = "\u2500" * 2 + " status " + "\u2500" * 7
 
 
@@ -123,6 +126,8 @@ class ChatActivity(Activity):
 
         # Dashboard stats (woven into sidebar)
         self._node_count = 0
+        self._repeater_count = 0
+        self._room_count = 0
         self._rx_count = 0
         self._tx_count = 0
         self._adv_count = 0
@@ -130,6 +135,13 @@ class ChatActivity(Activity):
         self._packet_times = deque(maxlen=1000)
         self._status = "Connecting..."
         self._connected = False
+
+        # Sidebar navigation targets — parallel array to sidebar items
+        # Each entry: None (not selectable), ("channel", name), ("nav", key)
+        self._sidebar_nav_targets = []
+
+        # Undecryptable tracking
+        self._undecryptable_count = 0
 
         # Search
         self._search_text = ""
@@ -152,6 +164,7 @@ class ChatActivity(Activity):
         self.application.subscribe(CollectorError, self, self._on_error)
         self.application.subscribe(ChannelMessage, self, self._on_channel_message)
         self.application.subscribe(ChannelDiscovered, self, self._on_channel_discovered)
+        self.application.subscribe(UndecryptablePacket, self, self._on_undecryptable)
 
         if self._service_started:
             # Re-entry after segue — reload from store
@@ -167,6 +180,7 @@ class ChatActivity(Activity):
             self._service_started = True
             self._load_channels_from_config()
             self._load_sender_name()
+            self._reload_from_store()
             self._add_system_message(f"Connected to {self._port}")
             self._add_system_message("Type /help for available commands")
             self._build_display()
@@ -240,6 +254,11 @@ class ChatActivity(Activity):
 
     def _load_channels_from_config(self):
         """Load configured channels into the sidebar list."""
+        # Always include the default public channel
+        from ..crypto import DEFAULT_PUBLIC_CHANNEL_NAME
+        if not any(c["name"] == DEFAULT_PUBLIC_CHANNEL_NAME for c in self._channels):
+            self._channels.insert(0, {"name": DEFAULT_PUBLIC_CHANNEL_NAME, "msg_count": 0})
+
         try:
             from ..config import load_config, load_channels
             config = load_config()
@@ -278,9 +297,11 @@ class ChatActivity(Activity):
         self._status = "Connected"
         self._connected = True
 
-        # Node count
-        node_rows = store.get_nodes()
-        self._node_count = len(node_rows)
+        # Node counts by type
+        counts = store.get_node_count_by_type()
+        self._node_count = sum(counts.values())
+        self._repeater_count = counts.get(2, 0)
+        self._room_count = counts.get(3, 0)
 
         # Channel summaries
         summaries = store.get_channel_summary()
@@ -376,20 +397,49 @@ class ChatActivity(Activity):
         }
 
     def _sidebar_items(self):
-        """Build left panel: channel list + status block."""
+        """Build left panel: channels + network nav + status block."""
         items = []
+        targets = []
+
+        # --- channels section ---
+        items.append(CHANNELS_SEPARATOR)
+        targets.append(None)
+
         if not self._channels:
             items.append("  (no channels)")
+            targets.append(None)
             items.append("  /join #name")
+            targets.append(None)
         else:
-            for i, ch in enumerate(self._channels):
+            for ch in self._channels:
                 marker = " >" if ch["name"] == self._selected_channel else "  "
                 count = ch["msg_count"]
                 items.append(f"{marker} {ch['name']:14s} {count:3d}")
+                targets.append(("channel", ch["name"]))
 
-        # Status separator + stats (not selectable — below channel entries)
+        if self._undecryptable_count > 0:
+            items.append(f"   {self._undecryptable_count} encrypted")
+            targets.append(None)
+
+        # --- network section ---
+        items.append(NETWORK_SEPARATOR)
+        targets.append(None)
+
+        items.append(f"   Repeaters ({self._repeater_count})   >")
+        targets.append(("nav", "repeaters"))
+        items.append(f"   Rooms ({self._room_count})       >")
+        targets.append(("nav", "rooms"))
+        items.append(f"   All Nodes ({self._node_count})  >")
+        targets.append(("nav", "nodes"))
+
+        # --- status section ---
         items.append(STATUS_SEPARATOR)
-        items.extend(self._status_block())
+        targets.append(None)
+        for line in self._status_block():
+            items.append(line)
+            targets.append(None)
+
+        self._sidebar_nav_targets = targets
         return items
 
     def _status_block(self):
@@ -459,10 +509,10 @@ class ChatActivity(Activity):
         split["left_items"] = self._sidebar_items()
         split["right_items"] = self._message_items()
         split["right_title"] = self._selected_channel or "All"
-        # Clamp left selection to channel count (don't select status lines)
-        max_ch_idx = max(0, len(self._channels) - 1) if self._channels else 0
-        if split["left_selected"] > max_ch_idx:
-            split["left_selected"] = max_ch_idx
+        # Clamp left selection to selectable range
+        max_sel = self._max_selectable_sidebar_idx()
+        if split["left_selected"] > max_sel:
+            split["left_selected"] = max_sel
         # Auto-scroll messages to bottom
         right_items = split["right_items"]
         split["right_selected"] = max(0, len(right_items) - 1)
@@ -471,6 +521,14 @@ class ChatActivity(Activity):
         self.display_state["split"]["focused"] = (self.focus == "split")
         self.display_state["command_input"]["focused"] = (self.focus == "command_input")
         self.refresh_screen()
+
+    def _max_selectable_sidebar_idx(self):
+        """Return the highest sidebar index that has a selectable target."""
+        max_idx = 0
+        for i, t in enumerate(self._sidebar_nav_targets):
+            if t is not None:
+                max_idx = i
+        return max_idx
 
     def _add_system_message(self, text):
         """Add an in-memory system message (shown with * prefix)."""
@@ -514,11 +572,11 @@ class ChatActivity(Activity):
                 return
 
         self.delegate_to_focused(event)
-        # Clamp left_selected after any scroll to prevent selecting status lines
+        # Clamp left_selected after any scroll to selectable items only
         if self.focus == "split":
             split = self.display_state["split"]
-            if split["focused_panel"] == "left" and self._channels:
-                max_idx = len(self._channels) - 1
+            if split["focused_panel"] == "left" and self._sidebar_nav_targets:
+                max_idx = self._max_selectable_sidebar_idx()
                 if split["left_selected"] > max_idx:
                     split["left_selected"] = max_idx
         self.refresh_screen()
@@ -580,22 +638,24 @@ class ChatActivity(Activity):
             self._adv_count += 1
             pk = parsed.get("pub_key_hex", "")
             if pk:
-                self._node_count = max(self._node_count, len(self._get_known_nodes()))
+                self._update_node_counts()
         elif ft == FRAME_TYPE_HEARTBEAT:
             self._last_heartbeat = parsed
 
         self._update_display()
 
-    def _get_known_nodes(self):
-        """Get node count from store if available."""
+    def _update_node_counts(self):
+        """Refresh node/repeater/room counts from store."""
         try:
             svc = self.application.service("collector")
             store = svc.store
             if store:
-                return store.get_nodes()
+                counts = store.get_node_count_by_type()
+                self._node_count = sum(counts.values())
+                self._repeater_count = counts.get(2, 0)
+                self._room_count = counts.get(3, 0)
         except (KeyError, RuntimeError):
             pass
-        return []
 
     def _on_channel_message(self, event):
         msg = event.msg
@@ -634,6 +694,10 @@ class ChatActivity(Activity):
 
         self._update_display()
 
+    def _on_undecryptable(self, event):
+        self._undecryptable_count = event.count
+        self._update_display()
+
     def _on_channel_discovered(self, event):
         """Cracker found a new channel — add to sidebar and show system message."""
         name = event.channel_name
@@ -659,20 +723,35 @@ class ChatActivity(Activity):
     # --- Channel selection ---
 
     def _select_channel_from_sidebar(self):
-        """ENTER on a channel in the left panel: select/deselect it."""
-        if not self._channels:
-            return
+        """ENTER on a sidebar item: select channel, or navigate to node list."""
         idx = self.display_state["split"]["left_selected"]
-        if idx >= len(self._channels):
+        if idx >= len(self._sidebar_nav_targets):
             return
-        ch_name = self._channels[idx]["name"]
-        if self._selected_channel == ch_name:
-            self._selected_channel = None
-        else:
-            self._selected_channel = ch_name
-        self._selected_idx = idx
-        self._reload_messages()
-        self._update_display()
+        target = self._sidebar_nav_targets[idx]
+        if target is None:
+            return
+
+        kind, value = target
+        if kind == "channel":
+            if self._selected_channel == value:
+                self._selected_channel = None
+            else:
+                self._selected_channel = value
+            self._selected_idx = idx
+            self._reload_messages()
+            self._update_display()
+        elif kind == "nav":
+            self._navigate_to(value)
+
+    def _navigate_to(self, key):
+        """Open a sub-screen based on sidebar nav key."""
+        from .node_list import NodeListActivity
+        if key == "repeaters":
+            self.application.segue_to(NodeListActivity(adv_type=2))
+        elif key == "rooms":
+            self.application.segue_to(NodeListActivity(adv_type=3))
+        elif key == "nodes":
+            self.application.segue_to(NodeListActivity())
 
     # --- Command dispatcher ---
 
@@ -704,8 +783,12 @@ class ChatActivity(Activity):
             self._cmd_crack(arg)
         elif cmd == "/diag":
             self._cmd_segue_diag()
-        elif cmd == "/nodes":
-            self._cmd_segue_dashboard("right")
+        elif cmd == "/repeaters":
+            self._navigate_to("repeaters")
+        elif cmd == "/rooms":
+            self._navigate_to("rooms")
+        elif cmd == "/contacts" or cmd == "/nodes":
+            self._navigate_to("nodes")
         elif cmd == "/packets":
             self._cmd_segue_dashboard("left")
         elif cmd == "/status":
@@ -951,8 +1034,10 @@ class ChatActivity(Activity):
         self._add_system_message("  /crack [status]     - Show cracker state")
         self._add_system_message("  /crack start|stop   - Toggle channel cracker")
         self._add_system_message("  /crack wordlist f   - Load custom wordlist")
+        self._add_system_message("  /repeaters          - Open repeater list")
+        self._add_system_message("  /rooms              - Open room server list")
+        self._add_system_message("  /contacts           - Open all nodes list")
         self._add_system_message("  /diag               - Open system diagnostics")
-        self._add_system_message("  /nodes              - Open node list (dashboard)")
         self._add_system_message("  /packets            - Open packet list (dashboard)")
         self._add_system_message("  /status             - Show connection info")
         self._add_system_message("  /help               - Show this help")

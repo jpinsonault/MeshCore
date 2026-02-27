@@ -16,6 +16,7 @@ from .events import (
     CollectorError,
     CollectorFrame,
     CollectorText,
+    UndecryptablePacket,
 )
 
 
@@ -59,6 +60,7 @@ class MeshCollectorService(Service):
         self._core.on_error = self._on_error
         self._core.on_channel_message = self._on_channel_message
         self._core.on_channel_discovered = self._on_channel_discovered
+        self._core.on_undecryptable = self._on_undecryptable
 
         # Load channels from config
         try:
@@ -96,6 +98,9 @@ class MeshCollectorService(Service):
     def send_message(self, channel_name, sender_name, text):
         """Send a group message on a channel. Returns True if command was sent."""
         return self._core.send_channel_message(channel_name, sender_name, text)
+
+    def _on_undecryptable(self, count):
+        self.dispatch_event(UndecryptablePacket(count))
 
     def _on_error(self, msg):
         self.dispatch_event(CollectorError(msg))

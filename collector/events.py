@@ -46,3 +46,9 @@ class ChannelDiscovered:
     def __init__(self, channel_name, decoded_count):
         self.channel_name = channel_name
         self.decoded_count = decoded_count
+
+
+class UndecryptablePacket:
+    """Fired when a GRP_TXT packet fails all channel decryption attempts."""
+    def __init__(self, count):
+        self.count = count

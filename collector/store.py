@@ -441,6 +441,31 @@ class CollectorStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_nodes_by_type(self, adv_type):
+        """Return nodes filtered by advertisement type, most recently seen first."""
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE adv_type = ? ORDER BY last_seen DESC",
+            (adv_type,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_node_count_by_type(self):
+        """Return {adv_type: count} dict for all node types."""
+        rows = self._conn.execute(
+            "SELECT adv_type, COUNT(*) as cnt FROM nodes GROUP BY adv_type"
+        ).fetchall()
+        return {r["adv_type"]: r["cnt"] for r in rows}
+
+    def get_advertisement_snr_history(self, pub_key_hex, limit=50):
+        """Return [(timestamp, snr)] for a node, oldest first."""
+        rows = self._conn.execute(
+            "SELECT timestamp, snr FROM advertisements "
+            "WHERE pub_key_hex = ? AND snr IS NOT NULL "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (pub_key_hex, limit),
+        ).fetchall()
+        return [(r["timestamp"], r["snr"]) for r in reversed(rows)]
+
     def get_recent_packets(self, limit=50, direction=None, payload_type=None):
         """Return recent packets with optional filters."""
         sql = "SELECT * FROM raw_packets WHERE 1=1"
