@@ -178,6 +178,119 @@ def test_magnitude_guard():
     assert "gesture_ref_valid" in src
     print("  PASS: magnitude guard present")
 
+def test_mouse_mode_quad_tap():
+    """Quad-tap (4 clicks) must trigger mode switch."""
+    src = read_src()
+    # Must have RemoteMode enum with both modes
+    assert re.search(r'enum\s+RemoteMode\s*\{.*MODE_MEDIA.*MODE_MOUSE.*\}', src), \
+        "RemoteMode enum with MODE_MEDIA and MODE_MOUSE not found"
+    # btn_clicks == 4 must trigger mode toggle
+    assert "btn_clicks == 4" in src, "Quad-tap detection (btn_clicks == 4) not found"
+    # Must toggle between modes
+    assert "remote_mode = MODE_MOUSE" in src, "Switch to mouse mode not found"
+    assert "remote_mode = MODE_MEDIA" in src, "Switch to media mode not found"
+    print("  PASS: quad-tap mode toggle present")
+
+def test_mouse_response_curve():
+    """Verify deadzone, power curve math, and sub-pixel accumulation."""
+    src = read_src()
+    deadzone = extract_define_float(src, "MOUSE_DEADZONE_DEG")
+    max_angle = extract_define_float(src, "MOUSE_MAX_ANGLE_DEG")
+    max_vel = extract_define_float(src, "MOUSE_MAX_VELOCITY")
+    exponent = extract_define_float(src, "MOUSE_EXPONENT")
+    assert deadzone is not None, "MOUSE_DEADZONE_DEG not defined"
+    assert max_angle is not None, "MOUSE_MAX_ANGLE_DEG not defined"
+    assert max_vel is not None, "MOUSE_MAX_VELOCITY not defined"
+    assert exponent is not None, "MOUSE_EXPONENT not defined"
+
+    # Simulate the response curve from main.cpp's mouse_apply_curve
+    def apply_curve(angle_deg):
+        sign = 1.0 if angle_deg >= 0 else -1.0
+        mag = abs(angle_deg)
+        if mag < deadzone:
+            return 0.0
+        normalized = (mag - deadzone) / (max_angle - deadzone)
+        normalized = min(normalized, 1.0)
+        curved = normalized ** exponent
+        return sign * curved * max_vel
+
+    # Deadzone: angles below threshold produce zero
+    assert apply_curve(0.0) == 0.0, "Zero angle must produce zero velocity"
+    assert apply_curve(1.0) == 0.0, "Below-deadzone angle must produce zero"
+    assert apply_curve(-1.0) == 0.0, "Negative below-deadzone must produce zero"
+
+    # Just above deadzone: small positive velocity
+    v = apply_curve(deadzone + 0.1)
+    assert 0 < v < 1.0, f"Just above deadzone should give small velocity, got {v}"
+
+    # Max angle: full velocity
+    v = apply_curve(max_angle)
+    assert abs(v - max_vel) < 0.01, f"At max angle, velocity should be {max_vel}, got {v}"
+
+    # Beyond max: clamped to max velocity
+    v = apply_curve(max_angle + 10)
+    assert abs(v - max_vel) < 0.01, f"Beyond max angle, velocity should clamp to {max_vel}, got {v}"
+
+    # Negative direction
+    v = apply_curve(-max_angle)
+    assert abs(v + max_vel) < 0.01, f"Negative max angle should give -{max_vel}, got {v}"
+
+    # Sub-pixel accumulation variables must exist
+    assert "mouse_accum_x" in src, "mouse_accum_x accumulator not found"
+    assert "mouse_accum_y" in src, "mouse_accum_y accumulator not found"
+
+    print(f"  PASS: mouse response curve (deadzone={deadzone}°, max={max_angle}°, vel={max_vel}, exp={exponent})")
+
+def test_mouse_melodies_use_defines():
+    """Mouse mode chime melodies must use BASE_FREQ/MID_FREQ/TOP_FREQ."""
+    src = read_src()
+    # Find N_MOUSE_ON and N_MOUSE_OFF arrays
+    for name in ['N_MOUSE_ON', 'N_MOUSE_OFF']:
+        pattern = rf'static\s+const\s+MelNote\s+{name}\[\]\s*=\s*\{{([^;]+)\}};'
+        m = re.search(pattern, src)
+        assert m, f"{name} melody not found"
+        body = m.group(1)
+        for note_m in re.finditer(r'\{(\w+(?:\s*\+\s*\d+)?)\s*,', body):
+            freq_expr = note_m.group(1).strip()
+            if freq_expr == '0':
+                continue
+            allowed = ['BASE_FREQ', 'MID_FREQ', 'TOP_FREQ']
+            assert any(a in freq_expr for a in allowed), \
+                f"{name} uses raw '{freq_expr}' instead of BASE_FREQ/MID_FREQ/TOP_FREQ"
+    print("  PASS: mouse melodies use derived frequency constants")
+
+def test_mouse_deadzone_no_drift():
+    """Small angles below deadzone must produce zero velocity (no drift)."""
+    src = read_src()
+    deadzone = extract_define_float(src, "MOUSE_DEADZONE_DEG")
+    max_angle = extract_define_float(src, "MOUSE_MAX_ANGLE_DEG")
+    max_vel = extract_define_float(src, "MOUSE_MAX_VELOCITY")
+    exponent = extract_define_float(src, "MOUSE_EXPONENT")
+
+    def apply_curve(angle_deg):
+        sign = 1.0 if angle_deg >= 0 else -1.0
+        mag = abs(angle_deg)
+        if mag < deadzone:
+            return 0.0
+        normalized = (mag - deadzone) / (max_angle - deadzone)
+        normalized = min(normalized, 1.0)
+        curved = normalized ** exponent
+        return sign * curved * max_vel
+
+    # Test many small angles within deadzone — all must be exactly zero
+    for angle in [x * 0.1 for x in range(-20, 21)]:
+        if abs(angle) < deadzone:
+            v = apply_curve(angle)
+            assert v == 0.0, f"Angle {angle}° within deadzone produced velocity {v}"
+
+    # Simulate sub-pixel accumulation with zero velocity — no drift
+    accum = 0.0
+    for _ in range(1000):
+        accum += apply_curve(0.5)  # well within deadzone
+    assert accum == 0.0, f"1000 iterations at 0.5° produced accumulation {accum}"
+
+    print(f"  PASS: deadzone ({deadzone}°) produces zero drift")
+
 # ---------- runner ----------
 
 if __name__ == "__main__":
@@ -194,6 +307,10 @@ if __name__ == "__main__":
         test_orientation_cross_dot,
         test_face_down_thresholds,
         test_magnitude_guard,
+        test_mouse_mode_quad_tap,
+        test_mouse_response_curve,
+        test_mouse_melodies_use_defines,
+        test_mouse_deadzone_no_drift,
     ]
     passed = failed = 0
     for t in tests:

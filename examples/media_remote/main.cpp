@@ -4,13 +4,20 @@
 // Advertises as a standard Bluetooth media remote — any phone/laptop/tablet
 // can pair from normal Bluetooth settings (no app needed).
 //
-// Controls:
+// Controls (Media Mode — default):
 //   Single click              → Play/Pause
 //   Double click              → Next Track
 //   Hold 400ms + tilt L/R     → Volume Down/Up (repeating)
 //   Flip face-down            → Mute (toggle)
+//   Quad tap                  → Switch to Mouse Mode
 //   Double-press + hold 3s    → Power off (deep sleep, wake on button)
 //   Triple-press + hold 3s    → Pairing mode (clear bonds, re-advertise)
+//
+// Controls (Mouse Mode — quad-tap to enter/exit):
+//   Single click              → Left Click
+//   Double click              → Right Click
+//   Hold 400ms + tilt         → Move cursor (tilt-to-move with power curve)
+//   Quad tap                  → Switch to Media Mode
 
 #include <Arduino.h>
 #include <bluefruit.h>
@@ -77,6 +84,8 @@ static const MelNote N_POWER_OFF[]= {{MID_FREQ,150},{BASE_FREQ,150},{BASE_FREQ,1
 static const MelNote N_PAIRING[]  = {{MID_FREQ,188},{BASE_FREQ,188},{BASE_FREQ,188},{BASE_FREQ,750}};
 static const MelNote N_NOT_CONN[] = {{MID_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR}};
 static const MelNote N_HOLD[]     = {{BASE_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR}};
+static const MelNote N_MOUSE_ON[] = {{BASE_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{TOP_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR}};
+static const MelNote N_MOUSE_OFF[]= {{MID_FREQ,NOTE_DUR},{BASE_FREQ,NOTE_DUR},{MID_FREQ,NOTE_DUR},{TOP_FREQ,NOTE_DUR}};
 
 static const Melody M_STARTUP   = {N_STARTUP,   3};
 static const Melody M_CONNECT   = {N_CONNECT,   2};
@@ -88,6 +97,8 @@ static const Melody M_POWER_OFF = {N_POWER_OFF, 4};
 static const Melody M_PAIRING   = {N_PAIRING,   4};
 static const Melody M_NOT_CONN  = {N_NOT_CONN,  2};
 static const Melody M_HOLD      = {N_HOLD,      5};
+static const Melody M_MOUSE_ON  = {N_MOUSE_ON,  4};
+static const Melody M_MOUSE_OFF = {N_MOUSE_OFF, 4};
 
 // 16 linear steps from BASE_FREQ up, 5Hz per step. Vol min = click pitch.
 static const uint16_t VOL_NOTES[] = {
@@ -144,6 +155,22 @@ static uint32_t gesture_last_vol = 0;
 #define TILT_ENTER_RAD    (TILT_ENTER_DEG * 3.14159f / 180.0f)
 #define TILT_EXIT_RAD     (TILT_EXIT_DEG  * 3.14159f / 180.0f)
 #define GESTURE_REPEAT_MS 250
+
+// -- Remote mode --
+enum RemoteMode { MODE_MEDIA, MODE_MOUSE };
+static RemoteMode remote_mode = MODE_MEDIA;
+
+// -- Mouse mode --
+#define MOUSE_DEADZONE_DEG   2.0f
+#define MOUSE_MAX_ANGLE_DEG  30.0f    // reference angle where velocity = MAX_VELOCITY (no cap beyond)
+#define MOUSE_MAX_VELOCITY   15.0f
+#define MOUSE_EXPONENT       2.0f
+#define MOUSE_SMOOTH_ALPHA   0.35f
+
+static bool  mouse_gesture_active = false;
+static float mouse_ref_pitch = 0, mouse_ref_roll = 0;
+static float mouse_smooth_pitch = 0, mouse_smooth_roll = 0;
+static float mouse_accum_x = 0, mouse_accum_y = 0;
 
 // -- Face-down mute --
 // After offset correction: Z ~ +1.0 face-up, Z ~ -1.0 face-down
@@ -249,6 +276,28 @@ static void hid_consumer_release() {
     BLEConnection* connection = Bluefruit.Connection(conn_hdl);
     if (connection && connection->connected() && connection->secured()) {
       blehid.consumerKeyRelease(conn_hdl);
+    }
+  }
+}
+
+// ===================== HID mouse helpers =====================
+
+static void hid_mouse_move(int8_t dx, int8_t dy) {
+  for (uint16_t conn_hdl = 0; conn_hdl < BLE_MAX_CONNECTION; conn_hdl++) {
+    BLEConnection* connection = Bluefruit.Connection(conn_hdl);
+    if (connection && connection->connected() && connection->secured()) {
+      blehid.mouseMove(conn_hdl, dx, dy);
+    }
+  }
+}
+
+static void hid_mouse_click(uint8_t button) {
+  for (uint16_t conn_hdl = 0; conn_hdl < BLE_MAX_CONNECTION; conn_hdl++) {
+    BLEConnection* connection = Bluefruit.Connection(conn_hdl);
+    if (connection && connection->connected() && connection->secured()) {
+      blehid.mouseButtonPress(conn_hdl, button);
+      delay(10);
+      blehid.mouseButtonRelease(conn_hdl);
     }
   }
 }
@@ -382,18 +431,31 @@ static void update_button() {
         btn_rel_t = now;
         btn_fsm = BTN_UP;
       } else if (btn_clicks == 0 && now - btn_press_t > LONGPRESS_MS) {
-        // First press held → gesture mode
-        gesture_active = true;
-        float yz_mag = sqrtf(filt_gy * filt_gy + filt_gz * filt_gz);
-        gesture_ref_valid = (yz_mag >= 0.3f);
-        gesture_ref_gy = filt_gy;
-        gesture_ref_gz = filt_gz;
-        gesture_tilt_pos = false;
-        gesture_tilt_neg = false;
-        gesture_last_vol = now;
-        btn_fsm = BTN_GESTURE;
-        log("GESTURE enter (Y=%.2f Z=%.2f mag=%.2f%s)",
-            filt_gy, filt_gz, yz_mag, gesture_ref_valid ? "" : " DEFERRED");
+        // First press held → gesture mode (volume or mouse depending on mode)
+        if (remote_mode == MODE_MEDIA) {
+          gesture_active = true;
+          float yz_mag = sqrtf(filt_gy * filt_gy + filt_gz * filt_gz);
+          gesture_ref_valid = (yz_mag >= 0.3f);
+          gesture_ref_gy = filt_gy;
+          gesture_ref_gz = filt_gz;
+          gesture_tilt_pos = false;
+          gesture_tilt_neg = false;
+          gesture_last_vol = now;
+          btn_fsm = BTN_GESTURE;
+          log("GESTURE enter (Y=%.2f Z=%.2f mag=%.2f%s)",
+              filt_gy, filt_gz, yz_mag, gesture_ref_valid ? "" : " DEFERRED");
+        } else {
+          mouse_gesture_active = true;
+          mouse_ref_pitch = atan2f(filt_gx, sqrtf(filt_gy*filt_gy + filt_gz*filt_gz));
+          mouse_ref_roll  = atan2f(filt_gy, sqrtf(filt_gx*filt_gx + filt_gz*filt_gz));
+          mouse_smooth_pitch = 0;
+          mouse_smooth_roll = 0;
+          mouse_accum_x = 0;
+          mouse_accum_y = 0;
+          btn_fsm = BTN_GESTURE;
+          log("MOUSE GESTURE enter (pitch=%.2f roll=%.2f)",
+              mouse_ref_pitch, mouse_ref_roll);
+        }
       } else if (btn_clicks >= 1) {
         // Multi-press hold: ascending scale counting up to action
         uint32_t held = now - btn_press_t;
@@ -420,19 +482,42 @@ static void update_button() {
         btn_fsm = BTN_DOWN;
       } else if (now - btn_rel_t > CLICK_WINDOW) {
         // Window expired — fire action based on click count
-        if (btn_clicks == 1) {
+        if (btn_clicks == 4) {
+          // Quad-tap: toggle mode
+          if (remote_mode == MODE_MEDIA) {
+            remote_mode = MODE_MOUSE;
+            log("MODE -> MOUSE");
+            beep(M_MOUSE_ON);
+          } else {
+            remote_mode = MODE_MEDIA;
+            log("MODE -> MEDIA");
+            beep(M_MOUSE_OFF);
+          }
+        } else if (btn_clicks == 1) {
           if (ble_connected) {
-            log("ACTION play_pause");
-            hid_consumer_tap(HID_USAGE_CONSUMER_PLAY_PAUSE);
-            beep(M_CLICK);
+            if (remote_mode == MODE_MEDIA) {
+              log("ACTION play_pause");
+              hid_consumer_tap(HID_USAGE_CONSUMER_PLAY_PAUSE);
+              beep(M_CLICK);
+            } else {
+              log("ACTION left_click");
+              hid_mouse_click(MOUSE_BUTTON_LEFT);
+              beep(M_CLICK);
+            }
           } else {
             beep(M_NOT_CONN);
           }
         } else if (btn_clicks == 2) {
           if (ble_connected) {
-            log("ACTION next_track");
-            hid_consumer_tap(HID_USAGE_CONSUMER_SCAN_NEXT);
-            beep(M_DBLCLICK);
+            if (remote_mode == MODE_MEDIA) {
+              log("ACTION next_track");
+              hid_consumer_tap(HID_USAGE_CONSUMER_SCAN_NEXT);
+              beep(M_DBLCLICK);
+            } else {
+              log("ACTION right_click");
+              hid_mouse_click(MOUSE_BUTTON_RIGHT);
+              beep(M_DBLCLICK);
+            }
           } else {
             beep(M_NOT_CONN);
           }
@@ -443,10 +528,15 @@ static void update_button() {
 
     case BTN_GESTURE:
       if (released) {
-        hid_consumer_release();
-        gesture_active = false;
+        if (mouse_gesture_active) {
+          mouse_gesture_active = false;
+          log("MOUSE GESTURE exit");
+        } else {
+          hid_consumer_release();
+          gesture_active = false;
+          log("GESTURE exit");
+        }
         btn_fsm = BTN_IDLE;
-        log("GESTURE exit");
       }
       break;
   }
@@ -520,6 +610,58 @@ static void update_gesture() {
   }
 }
 
+// ===================== Mouse gesture (tilt-to-cursor) =====================
+
+static float mouse_apply_curve(float angle_deg) {
+  float sign = (angle_deg >= 0) ? 1.0f : -1.0f;
+  float mag = fabsf(angle_deg);
+  if (mag < MOUSE_DEADZONE_DEG) return 0.0f;
+  float normalized = (mag - MOUSE_DEADZONE_DEG) / (MOUSE_MAX_ANGLE_DEG - MOUSE_DEADZONE_DEG);
+  float curved = powf(normalized, MOUSE_EXPONENT);
+  return sign * curved * MOUSE_MAX_VELOCITY;
+}
+
+static void update_mouse_gesture() {
+  if (!mouse_gesture_active) return;
+
+  // Compute current pitch and roll from filtered accel
+  float cur_pitch = atan2f(filt_gx, sqrtf(filt_gy*filt_gy + filt_gz*filt_gz));
+  float cur_roll  = atan2f(filt_gy, sqrtf(filt_gx*filt_gx + filt_gz*filt_gz));
+
+  // Delta from reference (convert to degrees)
+  float d_pitch_deg = (cur_pitch - mouse_ref_pitch) * 180.0f / 3.14159f;
+  float d_roll_deg  = (cur_roll  - mouse_ref_roll)  * 180.0f / 3.14159f;
+
+  // Smooth the deltas with separate EMA
+  mouse_smooth_pitch = MOUSE_SMOOTH_ALPHA * d_pitch_deg + (1.0f - MOUSE_SMOOTH_ALPHA) * mouse_smooth_pitch;
+  mouse_smooth_roll  = MOUSE_SMOOTH_ALPHA * d_roll_deg  + (1.0f - MOUSE_SMOOTH_ALPHA) * mouse_smooth_roll;
+
+  // Apply response curve: Roll → X (left/right), Pitch → Y (up/down)
+  // Pitch gets 15% boost — harder to tilt forward/back when holding the device
+  float vx = mouse_apply_curve(mouse_smooth_roll);
+  float vy = mouse_apply_curve(mouse_smooth_pitch * 1.15f);
+
+  // Sub-pixel accumulation — extract integer part, keep fractional remainder
+  mouse_accum_x += vx;
+  mouse_accum_y += vy;
+
+  int raw_dx = (int)mouse_accum_x;
+  int raw_dy = (int)mouse_accum_y;
+  if (raw_dx > 127) raw_dx = 127;
+  if (raw_dx < -127) raw_dx = -127;
+  if (raw_dy > 127) raw_dy = 127;
+  if (raw_dy < -127) raw_dy = -127;
+
+  int8_t dx = (int8_t)raw_dx;
+  int8_t dy = (int8_t)raw_dy;
+  mouse_accum_x -= dx;
+  mouse_accum_y -= dy;
+
+  if (dx != 0 || dy != 0) {
+    hid_mouse_move(dx, dy);
+  }
+}
+
 // ===================== Face-down mute (uses corrected Z axis) =====================
 
 static void update_face_mute() {
@@ -570,11 +712,27 @@ static void update_led() {
   uint32_t now = millis();
 
   if (gesture_active) {
-    // Fast blink: 100ms toggle
+    // Fast blink: 100ms toggle (media volume gesture)
     if (now - led_last > 100) {
       led_on = !led_on;
       digitalWrite(PIN_LED, led_on);
       led_last = now;
+    }
+  } else if (mouse_gesture_active) {
+    // Double-blink: quick on-off-on-off then gap (mouse gesture)
+    uint32_t phase = (now - led_last);
+    if (led_blink_cnt == 0 && phase > 300) {
+      digitalWrite(PIN_LED, HIGH); led_on = true;
+      led_blink_cnt = 1; led_last = now;
+    } else if (led_blink_cnt == 1 && phase > 80) {
+      digitalWrite(PIN_LED, LOW); led_on = false;
+      led_blink_cnt = 2; led_last = now;
+    } else if (led_blink_cnt == 2 && phase > 80) {
+      digitalWrite(PIN_LED, HIGH); led_on = true;
+      led_blink_cnt = 3; led_last = now;
+    } else if (led_blink_cnt == 3 && phase > 80) {
+      digitalWrite(PIN_LED, LOW); led_on = false;
+      led_blink_cnt = 0; led_last = now;
     }
   } else if (pairing_mode) {
     // Triple-blink every 1.5s: on-off-on-off-on-off-wait
@@ -715,6 +873,7 @@ void loop() {
 
   update_button();
   update_gesture();
+  update_mouse_gesture();
   update_face_mute();
 
   // Deferred connection confirmation: failed bond attempts disconnect in <100ms.
