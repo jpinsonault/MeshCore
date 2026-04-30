@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "TUI musical instrument for the Seeed SenseCAP T1000-E buzzer"
 requires-python = ">=3.9"
 dependencies = [
-    "pyos-tui>=0.1.0",
+    "pyos-tui>=0.2.0",
     "pyserial>=3.5",
     "bleak>=0.21.0",
 ]
