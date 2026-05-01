@@ -114,14 +114,10 @@ static float lp1_gx = 0, lp1_gy = 0, lp1_gz = 0;
 static float filt_gx = 0, filt_gy = 0, filt_gz = 0;
 static bool  filt_init = false;
 
-// -- Mouse gesture (virtual screen model) --
-// Map tilt to position on a virtual screen. Gravity deltas on device body
-// axes — no atan2, no axis coupling regardless of hold posture.
-//
-// Smoothstep response curve (3t²−2t³): compresses BOTH center AND edges.
-// Center compression = soft deadzone (absorbs micro-jitter).
-// Edge compression = zero derivative at full tilt (kills amplified noise).
-// Mid-range = peak sensitivity for responsive movement.
+// -- Mouse gesture (g-delta model) --
+// Map raw gravity deltas on device body axes to screen position.
+// Offsets cancel in the subtraction, making this robust to calibration errors.
+// Smoothstep response curve: compresses center AND edges.
 #define SCREEN_HALF_W    960.0f
 #define SCREEN_HALF_H    540.0f
 #define TILT_MAX_G_X     0.45f   // left/right: full range at ~26.6° tilt
@@ -403,30 +399,28 @@ static void update_button() {
   }
 }
 
-// ===================== Mouse gesture (virtual screen model) =====================
+// ===================== Mouse gesture (g-delta model) =====================
 
 // Signed smoothstep with linear extension past 1.0.
 // [0,1]: 3t²−2t³ (derivative 0 at both ends — compresses center & edge)
-// >1.0: linear continuation so there's no wall. Slope matches smoothstep
-// at t=1 (which is 0), so we use a gentle fixed slope for the overshoot.
+// >1.0: gentle linear continuation so there's no wall.
 static float smoothstep_signed(float x) {
   float s = (x >= 0) ? 1.0f : -1.0f;
   float t = fabsf(x);
   if (t <= 1.0f) {
     return s * t * t * (3.0f - 2.0f * t);
   }
-  // Past the main range: gentle linear ramp (30% sensitivity)
   return s * (1.0f + (t - 1.0f) * 0.3f);
 }
 
 static void update_mouse() {
   if (!mouse_active) return;
 
-  // Gravity deltas on device body axes
+  // Gravity deltas on device body axes — offsets cancel in subtraction
   float dgy = filt_gy - mouse_ref_gy;  // left/right tilt → screen X
   float dgx = filt_gx - mouse_ref_gx;  // forward/back tilt → screen Y
 
-  // Normalize, smoothstep, scale to virtual screen
+  // Smoothstep + scale to virtual screen
   float pos_x =  smoothstep_signed(dgy / TILT_MAX_G_X) * SCREEN_HALF_W;
   float pos_y = -smoothstep_signed(dgx / TILT_MAX_G_Y) * SCREEN_HALF_H;
 
