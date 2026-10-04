@@ -241,3 +241,26 @@ def test_batch_host_fn_no_false_positive():
         targets, charset="abcdefghijklmnopqrstuvwxyz0123456789", max_length=6)
     assert solved.get(good.hash) == "#zq7"
     assert bad.hash not in solved
+
+
+# --- channel model: method + state + packets -------------------------------
+
+def test_channels_carry_method_state_packets():
+    store, _ = make_temp_store()
+    try:
+        ch = Channel.from_hashtag("#wardriving")  # in the catalog -> dictionary
+        for t in ("bob: a", "carol: b", "bob: c"):
+            store_grp_txt_packet(store, ch, t)
+        app = CrackerApp(store, use_gpu=False)
+        res = app.crack(ch.hash)
+        assert res["cracked"] and res["method"] == "dictionary"
+        chans = {c["channel_name"]: c for c in app.channels()}
+        assert "#wardriving" in chans
+        c = chans["#wardriving"]
+        assert c["method"] == "dictionary"
+        assert c["state"] == "named"
+        assert c["packets"] == 3
+        assert c["messages"] == 3
+        app.shutdown()
+    finally:
+        store.close()

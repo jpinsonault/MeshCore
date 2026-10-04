@@ -19,7 +19,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -163,6 +163,11 @@ CREATE TABLE IF NOT EXISTS crack_attempts (
 );
 """
 
+# How each cracked channel was recovered (dictionary / rules / bruteforce).
+SCHEMA_V8_SQL = """
+ALTER TABLE cracked_channels ADD COLUMN method TEXT;
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -239,6 +244,14 @@ class CollectorStore:
                 (str(7),),
             )
             current = 7
+
+        if current < 8:
+            self._conn.executescript(SCHEMA_V8_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(8),),
+            )
+            current = 8
 
     def close(self):
         if self._conn:
@@ -568,14 +581,14 @@ class CollectorStore:
 
     # --- Cracker cache methods ---
 
-    def store_cracked_channel(self, name, channel_hash, decoded_count):
+    def store_cracked_channel(self, name, channel_hash, decoded_count, method=None):
         """INSERT OR REPLACE a cracked channel into the cache."""
         with self._tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO cracked_channels "
-                "(channel_hash, channel_name, discovered_at, decoded_count) "
-                "VALUES (?, ?, ?, ?)",
-                (channel_hash, name, time.time(), decoded_count),
+                "(channel_hash, channel_name, discovered_at, decoded_count, method) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (channel_hash, name, time.time(), decoded_count, method),
             )
 
     def get_cracked_channels(self):
@@ -660,7 +673,7 @@ class CollectorStore:
         """
         rows = self._conn.execute(
             "SELECT c.channel_name, c.channel_hash, c.discovered_at, "
-            "       c.decoded_count, "
+            "       c.decoded_count, c.method, "
             "       COUNT(m.id) AS msg_count, "
             "       MAX(m.timestamp) AS last_activity, "
             "       COUNT(DISTINCT m.sender) AS unique_senders "
@@ -668,6 +681,30 @@ class CollectorStore:
             "LEFT JOIN channel_messages m ON m.channel_name = c.channel_name "
             "GROUP BY c.channel_name "
             "ORDER BY c.discovered_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_named_channel_summaries(self):
+        """Every channel that has decoded messages (includes the auto-decoded
+        public channel, not just cracked ones), with counts + how it was found.
+
+        LEFT JOINs cracked_channels so the public channel (messages but no crack
+        row) still appears; its method/channel_hash come back NULL for the caller
+        to fill in.
+        """
+        rows = self._conn.execute(
+            "SELECT m.channel_name, "
+            "       COUNT(m.id) AS msg_count, "
+            "       MAX(m.timestamp) AS last_activity, "
+            "       COUNT(DISTINCT m.sender) AS unique_senders, "
+            "       c.channel_hash AS channel_hash, "
+            "       c.discovered_at AS discovered_at, "
+            "       c.decoded_count AS decoded_count, "
+            "       c.method AS method "
+            "FROM channel_messages m "
+            "LEFT JOIN cracked_channels c ON c.channel_name = m.channel_name "
+            "GROUP BY m.channel_name "
+            "ORDER BY last_activity DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 

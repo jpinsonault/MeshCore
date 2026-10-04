@@ -27,6 +27,7 @@ from ..cracker import BUILTIN_WORDLIST, ChannelCracker, load_catalog
 from ..rules import RulesMatcher
 from ..crypto import (
     Channel,
+    DEFAULT_PUBLIC_CHANNEL_NAME,
     default_public_channel,
     extract_group_payload,
 )
@@ -358,6 +359,8 @@ class CrackerApp:
             if not self.store.has_channel_message_for_packet(pkt["id"]):
                 by_hash[h]["undecoded"] += 1
 
+        charset = self._settings["charset"]
+        max_length = self._settings["max_length"]
         pending = []
         for h, counts in by_hash.items():
             if counts["undecoded"] > 0:
@@ -365,6 +368,9 @@ class CrackerApp:
                     "hash": h,
                     "packet_count": counts["total"],
                     "undecoded_count": counts["undecoded"],
+                    # already swept at the current params without a hit?
+                    "exhausted": self.is_exhausted(
+                        h, charset, max_length, current_packets=counts["total"]),
                 })
 
         # Union with the live cracker's pending set (may include hashes whose
@@ -373,7 +379,8 @@ class CrackerApp:
         if self._cracker is not None:
             for h in self._cracker.pending_hashes:
                 if h not in seen:
-                    pending.append({"hash": h, "packet_count": 0, "undecoded_count": 0})
+                    pending.append({"hash": h, "packet_count": 0,
+                                    "undecoded_count": 0, "exhausted": False})
                     seen.add(h)
 
         pending.sort(key=lambda p: (-p["undecoded_count"], p["hash"]))
@@ -387,7 +394,11 @@ class CrackerApp:
 
     def _packet_count_for_hash(self, target_hash: int) -> int:
         """Count stored GRP_TXT packets with this channel hash."""
-        n = 0
+        return self._packet_counts_by_hash().get(int(target_hash), 0)
+
+    def _packet_counts_by_hash(self) -> dict:
+        """One scan: {channel_hash: GRP_TXT packet count}."""
+        counts = defaultdict(int)
         for pkt in self.store.get_grp_txt_packets():
             raw_hex = pkt.get("raw_hex", "")
             if not raw_hex:
@@ -397,9 +408,9 @@ class CrackerApp:
             except ValueError:
                 continue
             extracted = extract_group_payload(raw)
-            if extracted and extracted["channel_hash"] == target_hash:
-                n += 1
-        return n
+            if extracted:
+                counts[extracted["channel_hash"]] += 1
+        return counts
 
     def is_exhausted(self, target_hash, charset, max_length, current_packets=None) -> bool:
         """True if (hash, charset, max_length) was already swept without a hit
@@ -502,7 +513,7 @@ class CrackerApp:
             # at this max_length never would.
             fast_ch, method = self._fast_match(target_hash, mac_and_data)
             if fast_ch is not None:
-                decoded_count = self._on_cracked(fast_ch.name, target_hash)
+                decoded_count = self._on_cracked(fast_ch.name, target_hash, method)
                 result = {
                     "cracked": True,
                     "channel_name": fast_ch.name,
@@ -558,7 +569,7 @@ class CrackerApp:
                     result["exhausted"] = True
                 return self._finish(result)
 
-            decoded_count = self._on_cracked(name, target_hash)
+            decoded_count = self._on_cracked(name, target_hash, "bruteforce")
             result = {
                 "cracked": True,
                 "channel_name": name,
@@ -594,9 +605,9 @@ class CrackerApp:
                 return ch, "rules"
         return None, None
 
-    def _on_cracked(self, name: str, target_hash: int) -> int:
+    def _on_cracked(self, name: str, target_hash: int, method: str = "?") -> int:
         """Wire a newly cracked channel into the live/decode pipeline and
-        persist it. Returns the number of retroactively decoded messages."""
+        persist it (with how it was found). Returns retroactively-decoded count."""
         channel = Channel.from_hashtag(name)
 
         # Add to the live decode list so future packets decode too.
@@ -610,7 +621,8 @@ class CrackerApp:
 
         decoded_count = self._cracker.retroactive_decrypt(channel)
         try:
-            self.store.store_cracked_channel(channel.name, target_hash, decoded_count)
+            self.store.store_cracked_channel(channel.name, target_hash,
+                                             decoded_count, method)
         except Exception:
             pass
         return decoded_count
@@ -845,7 +857,7 @@ class CrackerApp:
                 continue
             fast_ch, method = self._fast_match(h, blobs[0])
             if fast_ch is not None:
-                self._on_cracked(fast_ch.name, h)
+                self._on_cracked(fast_ch.name, h, method)
                 solved_fast.append(fast_ch.name)
                 continue
             if self.is_exhausted(h, charset, max_length,
@@ -878,7 +890,7 @@ class CrackerApp:
 
         names = list(solved_fast)
         for hb, name in solved.items():
-            self._on_cracked(name, hb)
+            self._on_cracked(name, hb, "bruteforce")
             names.append(name)
 
         if not cancel.is_set():
@@ -960,7 +972,7 @@ class CrackerApp:
                 continue
             fast_ch, method = self._fast_match(h, blobs[0])
             if fast_ch is not None:
-                decoded = self._on_cracked(fast_ch.name, h)
+                decoded = self._on_cracked(fast_ch.name, h, method)
                 cracked.append({
                     "cracked": True, "channel_name": fast_ch.name,
                     "channel_hash": h, "decoded_count": decoded,
@@ -1021,21 +1033,40 @@ class CrackerApp:
     # --- results -------------------------------------------------------------
 
     def channels(self) -> list:
-        """Cracked channels with message counts only (no bodies) — cheap at scale."""
+        """Named channels (recovered + the auto-decoded public channel) with
+        counts, how they were found, and state. Counts only, cheap at scale."""
         try:
-            rows = self.store.get_cracked_channel_summaries()
+            rows = self.store.get_named_channel_summaries()
         except Exception:
             rows = []
+        pkt_counts = self._packet_counts_by_hash()
         out = []
         for row in rows:
+            name = row["channel_name"]
+            is_public = (name == DEFAULT_PUBLIC_CHANNEL_NAME)
+            hb = row.get("channel_hash")
+            if hb is None:
+                try:
+                    hb = (default_public_channel().hash if is_public
+                          else Channel.from_hashtag(name).hash)
+                except Exception:
+                    hb = None
+            method = row.get("method") or ("public" if is_public else "?")
+            messages = row.get("msg_count") or 0
+            packets = pkt_counts.get(hb, 0) if hb is not None else 0
             out.append({
-                "channel_name": row["channel_name"],
-                "channel_hash": row.get("channel_hash"),
-                "decoded_count": row.get("decoded_count"),
-                "discovered_at": row.get("discovered_at"),
-                "msg_count": row.get("msg_count") or 0,
-                "last_activity": row.get("last_activity"),
+                "channel_name": name,
+                "channel_hash": hb,
+                "state": "public" if is_public else "named",
+                "method": method,
+                "messages": messages,
+                "msg_count": messages,          # legacy alias
+                "packets": packets,
+                "undecoded": max(0, packets - messages),  # >0 hints a hash collision
                 "unique_senders": row.get("unique_senders") or 0,
+                "last_activity": row.get("last_activity"),
+                "discovered_at": row.get("discovered_at"),
+                "decoded_count": row.get("decoded_count"),
             })
         return out
 
