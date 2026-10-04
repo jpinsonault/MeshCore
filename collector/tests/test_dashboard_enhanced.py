@@ -59,10 +59,10 @@ def _tx_frame():
     }
 
 
-def _adv_frame(name="TestNode", pk="aa" * 32, snr=5.0, lat=None, lon=None):
+def _adv_frame(name="TestNode", pk="aa" * 32, snr=5.0, lat=None, lon=None, received_at=None):
     return {
         "type": FRAME_TYPE_ADVERTISEMENT,
-        "received_at": time.time(),
+        "received_at": time.time() if received_at is None else received_at,
         "parsed": {
             "timestamp": 1700000000,
             "snr": snr,
@@ -326,8 +326,10 @@ class TestDashboardFrameStorage:
         activity = _make_dashboard()
         app.start_activity(activity)
 
-        for name, pk in [("Alpha", "aa" * 32), ("Beta", "bb" * 32)]:
-            frame = _adv_frame(name=name, pk=pk)
+        # Explicit times: back-to-back time.time() can be equal on coarse clocks (Windows)
+        now = time.time()
+        for name, pk, t in [("Alpha", "aa" * 32, now - 1), ("Beta", "bb" * 32, now)]:
+            frame = _adv_frame(name=name, pk=pk, received_at=t)
             app.dispatch_event(CollectorFrame(frame))
         app.drain()
 

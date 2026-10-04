@@ -97,11 +97,12 @@ def make_sparkline(timestamps, now=None, window=SPARKLINE_WINDOW, buckets=SPARKL
     bucket_width = window / buckets
     counts = [0] * buckets
     for ts in timestamps:
-        if ts < cutoff:
+        if ts < cutoff or ts > now:
             continue
-        idx = int((ts - cutoff) / bucket_width)
-        if 0 <= idx < buckets:
-            counts[idx] += 1
+        # min(): a timestamp equal to `now` lands exactly on the right edge, which
+        # happens on coarse clocks (Windows) when a packet arrives in the render tick
+        idx = min(int((ts - cutoff) / bucket_width), buckets - 1)
+        counts[idx] += 1
     max_count = max(counts) if counts else 0
     if max_count == 0:
         return SPARK_CHARS[0] * buckets
