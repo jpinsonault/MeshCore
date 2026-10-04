@@ -262,6 +262,10 @@ CLI command, enabling full chat participation from the TUI.
 
 ### WiFi build (Heltec V3)
 
+User-facing guide (connection methods, `.env` credentials, flashing, gotchas): `docs/collector_repeater.md`.
+Device ops without the user in the loop: `python -m collector.remote cmd ...|flash` (reads the gitignored `.env`;
+never print or read out its password).
+
 `Heltec_v3_collector_wifi` adds a network link (`COLLECTOR_WIFI`, ESP32 only, code in
 `examples/simple_repeater/CollectorWifi.*`):
 - Credentials are set once over USB: `wifi ssid <name>`, `wifi pass <password>`, `wifi on`; check with `wifi status`.
