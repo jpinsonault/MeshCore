@@ -33,6 +33,14 @@
   #define ADMIN_PASSWORD "password"
 #endif
 
+// Heap stats for collector diagnostics frames; the ESP heap API only exists on ESP32.
+// Other platforms report 0, which the host treats as "not available".
+#if defined(ESP32)
+  #define COLLECTOR_HEAP_STATS  ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize()
+#else
+  #define COLLECTOR_HEAP_STATS  0, 0, 0
+#endif
+
 #ifndef SERVER_RESPONSE_DELAY
   #define SERVER_RESPONSE_DELAY 300
 #endif
@@ -992,14 +1000,16 @@ void MyMesh::begin(FILESYSTEM *fs) {
   }
 #endif
 
-  // Pre-configure Public channel (same PSK as companion_radio)
+  // Pre-configure Public channel (same PSK as companion_radio).
+  // PSK "izOH6cXN6mrJ5e26oRXNcg==" pre-decoded, so repeaters don't need the base64 library.
   {
-    #include <base64.hpp>
-    #define PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
+    static const uint8_t public_psk[16] = {
+      0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72
+    };
     auto dest = &_channels[_num_channels];
     memset(dest->channel.secret, 0, sizeof(dest->channel.secret));
-    int len = decode_base64((unsigned char *)PUBLIC_GROUP_PSK, strlen(PUBLIC_GROUP_PSK), dest->channel.secret);
-    mesh::Utils::sha256(dest->channel.hash, sizeof(dest->channel.hash), dest->channel.secret, len);
+    memcpy(dest->channel.secret, public_psk, sizeof(public_psk));
+    mesh::Utils::sha256(dest->channel.hash, sizeof(dest->channel.hash), public_psk, sizeof(public_psk));
     StrHelper::strncpy(dest->name, "Public", sizeof(dest->name));
     _num_channels++;
   }
@@ -1342,7 +1352,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       float temp = board.getMCUTemperature();
       _collector.sendDiagnostics(
         temp,
-        ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(),
+        COLLECTOR_HEAP_STATS,
         (int16_t)_radio->getNoiseFloor(), (int16_t)_radio->getLastRSSI(),
         (int16_t)(_radio->getLastSNR() * 4),
         (uint32_t)getTotalAirTime(), (uint32_t)getReceiveAirTime(),
@@ -1547,7 +1557,7 @@ void MyMesh::loop() {
     float temp = board.getMCUTemperature();
     _collector.sendDiagnostics(
       temp,
-      ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(),
+      COLLECTOR_HEAP_STATS,
       (int16_t)_radio->getNoiseFloor(), (int16_t)_radio->getLastRSSI(),
       (int16_t)(_radio->getLastSNR() * 4),
       (uint32_t)getTotalAirTime(), (uint32_t)getReceiveAirTime(),
