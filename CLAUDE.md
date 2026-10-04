@@ -266,15 +266,26 @@ CLI command, enabling full chat participation from the TUI.
 `examples/simple_repeater/CollectorWifi.*`):
 - Credentials are set once over USB: `wifi ssid <name>`, `wifi pass <password>`, `wifi on`; check with `wifi status`.
   They're stored in `/collector_wifi` on SPIFFS. Hostname is the node name slugified, as `<name>.local`.
-- TCP port 5005 carries the same bytes as USB serial (CLI text plus collector frames). A client must send
-  `auth <admin password>` first. One client at a time; a new connection replaces the old one.
-- Network firmware updates use ArduinoOTA, with the admin password as it was at boot:
-  `PLATFORMIO_UPLOAD_FLAGS="--auth=<admin password>" pio run -e Heltec_v3_collector_wifi -t upload --upload-port <ip>`
-  (an IP or hostname as the upload port makes PlatformIO use espota).
+- Two network links carry the same bytes as USB serial (CLI text plus collector frames), so the serial-only
+  commands work over them too. A client must send `auth <admin password>` first. One client per link; a new
+  connection replaces the old one.
+  - TCP port 5005, for the Python collector.
+  - WebSocket `ws://<host>/ws` (binary messages), for the browser config page. Its input is filled on the async
+    TCP task and read in `loop()`; output is flushed once per loop.
+  - Collector output goes to the first logged-in link (TCP, then WebSocket), else USB.
+- Firmware updates over the network, with the admin password as it was at boot:
+  - espota: `PLATFORMIO_UPLOAD_FLAGS="--auth=<admin password>" pio run -e Heltec_v3_collector_wifi -t upload --upload-port <ip>`
+    (an IP or hostname as the upload port makes PlatformIO use espota).
+  - Browser: `http://<host>/update`, HTTP basic auth with user `admin`. `start ota` points there instead of starting
+    the stock softAP server, which would collide on port 80.
 - Host: `python -m collector --port socket://<host>.local:5005 --password <admin password>`
   (or set `MESHCORE_PASSWORD`). The same `--port`/`--password` work for `collector.api` and `collector.server`.
-- No PSRAM on the Heltec V3, so this env caps the ring buffer at 64KB (`COLLECTOR_RING_FALLBACK`) to leave
-  heap for WiFi. `wifi status` reports free heap.
+  On Windows, Python can stall resolving `.local` names (IPv6 first); use the IP if it does.
+- Config page: the fork at `../config.meshcore.io` (branch `collector-wifi`) adds Connect WiFi (a `WebSocketPort`
+  that SerialCLI uses like a serial port) and a WiFi settings card. Serve it locally:
+  `python -m http.server 8000 --directory ../config.meshcore.io`.
+- No PSRAM on the Heltec V3, so this env caps the ring buffer at 128KB (`COLLECTOR_RING_FALLBACK`). With WiFi and
+  the web server up that leaves about 76KB of heap; `wifi status` reports it.
 
 ### Running
 
