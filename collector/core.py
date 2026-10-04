@@ -450,6 +450,7 @@ class CollectorCore:
         seq = frame.get("seq")
 
         # v2 seq tracking
+        is_replay = False
         if seq is not None:
             # Seq reset detection: if incoming seq is much lower than last seen
             if self._highest_seq_seen > 0 and seq < self._highest_seq_seen and seq < 100:
@@ -461,19 +462,26 @@ class CollectorCore:
             if seq > self._highest_seq_seen:
                 self._highest_seq_seen = seq
 
-            # Replay dedup: skip storage for frames already committed
+            # Replay dedup: frames at/below the watermark were already committed.
             if self._replay_above_seq > 0 and seq <= self._replay_above_seq:
-                # Still fire callback (for live display) but don't store
-                if self.on_frame:
-                    self.on_frame(frame)
-                return
-
-            # Clear replay watermark once we see a frame above it
+                is_replay = True
+            # Clear the watermark once we see a frame above it.
             if self._replay_above_seq > 0 and seq > self._replay_above_seq:
                 self._replay_above_seq = 0
 
+        # BOOT_INFO is a forensic control frame, not packet data: handle it even on
+        # replay (a reboot resets the device's seq low, so its BOOT_INFO can land
+        # under the watermark). store_device_boot dedups, so re-seeing it is cheap.
+        # seq tracking above still ran, so the ACK advances and the firmware stops
+        # replaying it.
         if frame["type"] == FRAME_TYPE_BOOT_INFO:
             self._handle_boot_info(frame)
+            if self.on_frame:
+                self.on_frame(frame)
+            return
+
+        if is_replay:
+            # Already stored; fire the callback for live display but don't re-store.
             if self.on_frame:
                 self.on_frame(frame)
             return

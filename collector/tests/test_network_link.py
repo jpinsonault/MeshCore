@@ -9,8 +9,10 @@ import pytest
 
 from collector.core import CollectorCore, is_network_port
 from collector.protocol import (
-    FRAME_START, FRAME_TYPE_HANDSHAKE, FRAME_TYPE_HEARTBEAT, FRAME_TYPE_BOOT_INFO, crc16_ccitt,
+    FRAME_START, FRAME_TYPE_HANDSHAKE, FRAME_TYPE_HEARTBEAT, FRAME_TYPE_BOOT_INFO,
+    crc16_ccitt, parse_boot_info,
 )
+from collector.store import CollectorStore
 from collector.tests.packet_helpers import temp_file
 
 PASSWORD = "s3cret"
@@ -249,6 +251,25 @@ class TestConnectionLog:
             core.store.close()
             tmp.__exit__(None, None, None)
             dev.close()
+
+    def test_boot_info_bypasses_replay_dedup(self):
+        # After a device reboot the seq counter resets low, so a BOOT_INFO can land
+        # under the resume watermark. It must still be recorded (it's forensic data,
+        # not a duplicate packet) — regression for the empty device_boots on reflash.
+        with temp_file(".db") as f:
+            store = CollectorStore(f.name)
+            store.open()
+            try:
+                core = CollectorCore(port="socket://x:1", db_path=f.name)
+                core._store = store
+                core._highest_seq_seen = 5000
+                core._replay_above_seq = 5000   # simulate a resume watermark
+                frame = {"type": FRAME_TYPE_BOOT_INFO, "seq": 2,
+                         "parsed": parse_boot_info(_boot_payload())}
+                core._process_frame(frame)
+                assert store.get_device_boots(), "BOOT_INFO dropped under replay watermark"
+            finally:
+                store.close()
 
     def test_idle_watchdog_disconnects(self, monkeypatch):
         # A device that connects then goes silent must be detected: read() keeps
