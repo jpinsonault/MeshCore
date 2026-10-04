@@ -7,6 +7,7 @@ append-heavy with periodic reads from the dashboard/API.
 
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -174,21 +175,45 @@ class CollectorStore:
 
     def __init__(self, db_path="collector.db"):
         self.db_path = Path(db_path)
-        self._conn = None
+        # One SQLite connection per thread for file DBs: a single connection
+        # can't be used concurrently from the webapp's worker + HTTP threads
+        # (corrupts cursors), but WAL allows one connection per thread with
+        # concurrent reads and a serialized writer. In-memory DBs can't be
+        # shared across connections, so they keep one shared connection.
+        self._is_memory = (str(self.db_path) == ":memory:")
+        self._local = threading.local()
+        self._shared = None
+
+    def _new_conn(self):
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")  # wait out a concurrent writer
+        return conn
+
+    @property
+    def _conn(self):
+        if self._is_memory:
+            if self._shared is None:
+                self._shared = self._new_conn()
+            return self._shared
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._new_conn()
+            self._local.conn = conn
+        return conn
 
     def open(self):
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(SCHEMA_SQL)
+        conn = self._conn  # create this thread's connection
+        conn.executescript(SCHEMA_SQL)
         # Insert base version (1) for fresh DBs; existing DBs keep their value
-        self._conn.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", "1"),
         )
         self._migrate()
-        self._conn.commit()
+        conn.commit()
 
     def _migrate(self):
         """Run schema migrations if needed."""
@@ -254,9 +279,15 @@ class CollectorStore:
             current = 8
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        if self._is_memory:
+            if self._shared is not None:
+                self._shared.close()
+                self._shared = None
+            return
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     @contextmanager
     def _tx(self):
