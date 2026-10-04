@@ -19,7 +19,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -141,6 +141,16 @@ CREATE TABLE IF NOT EXISTS cracked_channels (
 CREATE INDEX IF NOT EXISTS idx_cracked_hash ON cracked_channels(channel_hash);
 """
 
+SCHEMA_V6_SQL = """
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,          -- JSON-encoded value
+    updated_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_id_channel
+    ON channel_messages(channel_name, id);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -200,6 +210,15 @@ class CollectorStore:
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 (str(5),),
             )
+            current = 5
+
+        if current < 6:
+            self._conn.executescript(SCHEMA_V6_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(6),),
+            )
+            current = 6
 
     def close(self):
         if self._conn:
@@ -563,3 +582,106 @@ class CollectorStore:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Paginated / cursor message queries (scale to thousands of rows) ---
+
+    def _message_filter(self, channel_name, search):
+        """Build the shared WHERE clause + params for message queries."""
+        sql = ""
+        params = []
+        if channel_name:
+            sql += " AND channel_name = ?"
+            params.append(channel_name)
+        if search:
+            escaped = (search.replace("\\", "\\\\")
+                       .replace("%", "\\%").replace("_", "\\_"))
+            sql += " AND (text LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')"
+            pattern = f"%{escaped}%"
+            params.extend([pattern, pattern])
+        return sql, params
+
+    def count_channel_messages(self, channel_name=None, search=None):
+        """Count decoded messages matching an optional channel + text/sender search."""
+        where, params = self._message_filter(channel_name, search)
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM channel_messages WHERE 1=1" + where,
+            params,
+        ).fetchone()
+        return row["cnt"]
+
+    def page_channel_messages(self, channel_name=None, search=None,
+                              before_id=None, after_id=None, limit=50):
+        """Return a page of messages ordered newest-first, with id cursors.
+
+        - ``before_id``: only rows with id < before_id (scroll back to older).
+        - ``after_id``: only rows with id > after_id (fetch newer than a cursor);
+          still returned newest-first.
+        Use either cursor, not both. ``limit`` is clamped to [1, 500].
+        """
+        limit = max(1, min(int(limit), 500))
+        where, params = self._message_filter(channel_name, search)
+        if before_id is not None:
+            where += " AND id < ?"
+            params.append(int(before_id))
+        if after_id is not None:
+            where += " AND id > ?"
+            params.append(int(after_id))
+        sql = ("SELECT * FROM channel_messages WHERE 1=1" + where
+               + " ORDER BY id DESC LIMIT ?")
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_cracked_channel_summaries(self):
+        """Cracked channels joined with their live message counts + last activity.
+
+        Uses a GROUP BY aggregate rather than loading message bodies, so it stays
+        cheap with thousands of messages per channel.
+        """
+        rows = self._conn.execute(
+            "SELECT c.channel_name, c.channel_hash, c.discovered_at, "
+            "       c.decoded_count, "
+            "       COUNT(m.id) AS msg_count, "
+            "       MAX(m.timestamp) AS last_activity, "
+            "       COUNT(DISTINCT m.sender) AS unique_senders "
+            "FROM cracked_channels c "
+            "LEFT JOIN channel_messages m ON m.channel_name = c.channel_name "
+            "GROUP BY c.channel_name "
+            "ORDER BY c.discovered_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Settings persistence (durable UI / cracker config) ---
+
+    def get_setting(self, key, default=None):
+        """Return a JSON-decoded setting value, or ``default`` if absent."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (ValueError, TypeError):
+            return default
+
+    def set_setting(self, key, value):
+        """Upsert a JSON-encodable setting value."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, json.dumps(value), time.time()),
+            )
+
+    def get_all_settings(self):
+        """Return all settings as a {key: decoded_value} dict."""
+        rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+        out = {}
+        for r in rows:
+            try:
+                out[r["key"]] = json.loads(r["value"])
+            except (ValueError, TypeError):
+                continue
+        return out

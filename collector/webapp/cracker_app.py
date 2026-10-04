@@ -1,0 +1,870 @@
+"""MeshCore Collector — cracker web-app logic (mode-agnostic, no HTTP).
+
+CrackerApp holds a CollectorStore (and, in live mode, the CollectorCore it
+belongs to) and exposes the query + crack + config operations the HTTP layer
+calls. It is deliberately framework-free so it can be driven directly from tests.
+
+The crack flow reuses the existing pipeline:
+  pick a stored GRP_TXT packet for the target hash -> get its mac_and_data ->
+  dictionary/catalog match -> GPU brute-force (CPU fallback) ->
+  Channel.from_hashtag(name) -> add to live channels ->
+  ChannelCracker.retroactive_decrypt -> persist via store.store_cracked_channel.
+
+Settings (engine preference, charset, max length, catalog toggle, auto-crack,
+custom wordlists) are persisted in the store's `settings` table so they survive
+restarts. Cracked channels + decoded messages already persist in SQLite.
+"""
+
+import threading
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Optional
+
+from .. import brute_force, brute_force_gpu
+from ..config import DEFAULT_CONFIG_DIR
+from ..cracker import BUILTIN_WORDLIST, ChannelCracker, load_catalog
+from ..crypto import (
+    Channel,
+    default_public_channel,
+    extract_group_payload,
+)
+from ..store import CollectorStore
+
+# Persisted under this key in store.settings (one JSON blob).
+SETTINGS_KEY = "cracker"
+
+# Defaults merged under any persisted settings.
+CRACKER_DEFAULTS = {
+    "engine": "auto",        # auto | gpu | cpu  (UI preference; "auto" = GPU if present)
+    "charset": brute_force.DEFAULT_CHARSET,
+    "max_length": 6,
+    "use_catalog": True,      # include the bundled ~2.7K-name catalog
+    "auto_crack": False,      # auto-crack pending channels (dictionary, then queue brute-force)
+    "auto_dict_only": False,  # restrict auto-crack to dictionary (skip brute-force) for low-power hosts
+    "custom_wordlists": [],   # durable paths added via add_wordlist
+}
+
+# A charset x max_length search bigger than this (candidate count) is flagged as
+# slow/infeasible in the config UI.
+SEARCH_SIZE_WARN = 5_000_000_000
+
+
+class CrackerApp:
+    """Cracker operations over a store, optionally attached to a live core.
+
+    Args:
+        store: an open CollectorStore (required).
+        core: an optional running CollectorCore. When present, cracked
+            channels are added to its live decode list and its passive
+            ChannelCracker (if any) supplies extra pending hashes.
+        use_gpu: hard engine override. ``False`` forces CPU regardless of the
+            persisted engine setting (tests and ``--cpu`` use this); ``True``
+            prefers GPU when present; ``None`` follows the persisted setting.
+    """
+
+    def __init__(self, store: CollectorStore, core=None, use_gpu=None):
+        self.store = store
+        self.core = core
+        self._use_gpu = use_gpu
+
+        # A ChannelCracker bound to the store gives us retroactive_decrypt and
+        # the store_cracked_channel persistence. In live mode we prefer the
+        # core's own cracker so its known-channel set stays in sync.
+        self._cracker = None
+        if core is not None and getattr(core, "_cracker", None) is not None:
+            self._cracker = core._cracker
+        if self._cracker is None:
+            self._cracker = ChannelCracker(store)
+
+        # Load persisted settings (merged over defaults).
+        self._settings = dict(CRACKER_DEFAULTS)
+        try:
+            saved = self.store.get_setting(SETTINGS_KEY, None)
+            if isinstance(saved, dict):
+                self._settings.update(
+                    {k: saved[k] for k in CRACKER_DEFAULTS if k in saved}
+                )
+        except Exception:
+            pass
+
+        # Apply wordlist choices (catalog toggle / custom lists) on startup only
+        # when they differ from the already-built default table.
+        if not self._settings["use_catalog"] or self._settings["custom_wordlists"]:
+            self._apply_wordlist()
+
+        self._lock = threading.Lock()
+
+        # Crack queue: a single worker thread drains a FIFO of crack jobs, each
+        # cancelable. Manual, pasted-packet, and auto-crack requests all enqueue
+        # here, so only one grind runs at a time and every job can be canceled.
+        self._queue = []          # pending jobs (FIFO)
+        self._current = None      # the job the worker is running, or None
+        self._history = []        # recently finished jobs (capped)
+        self._job_seq = 0
+        self._worker = None
+        self._worker_stop = threading.Event()
+        self._queue_cv = threading.Condition(self._lock)
+
+        # Auto-crack background loop.
+        self._auto_thread = None
+        self._auto_stop = threading.Event()
+
+        self._status = {
+            "running": False,
+            "engine": self.engine(),
+            "target_hash": None,
+            "charset": None,
+            "max_length": None,
+            "length": 0,
+            "total": 0,
+            "elapsed": 0.0,
+            "result": None,
+            "error": None,
+            "started_at": None,
+        }
+
+        if self._settings["auto_crack"]:
+            self._start_auto()
+
+    # --- engine / GPU status -------------------------------------------------
+
+    def gpu_available(self) -> bool:
+        """Physical GPU availability, honouring the hard CPU override."""
+        if self._use_gpu is False:
+            return False
+        return brute_force_gpu.is_available()
+
+    def engine(self) -> str:
+        """The engine a crack will actually use, given override + preference."""
+        if self._use_gpu is False:
+            return "cpu"
+        pref = self._settings.get("engine", "auto")
+        if pref == "cpu":
+            return "cpu"
+        # "gpu" or "auto": use the GPU when one is present, else fall back.
+        return "gpu" if brute_force_gpu.is_available() else "cpu"
+
+    def gpu_status(self) -> dict:
+        available = self.gpu_available()
+        return {
+            "available": available,
+            "name": brute_force_gpu.gpu_name() if available else None,
+            "engine": self.engine(),
+            "forced_cpu": self._use_gpu is False,
+        }
+
+    # --- settings / config ---------------------------------------------------
+
+    def get_settings(self) -> dict:
+        return dict(self._settings)
+
+    def _persist_settings(self):
+        try:
+            self.store.set_setting(SETTINGS_KEY, self._settings)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _clean_charset(charset: str) -> str:
+        """De-duplicate while preserving order; drop whitespace."""
+        seen = []
+        for c in charset:
+            if c in (" ", "\t", "\n", "\r"):
+                continue
+            if c not in seen:
+                seen.append(c)
+        return "".join(seen)
+
+    def update_settings(self, patch: dict) -> dict:
+        """Validate and apply a partial settings update; persist; return config()."""
+        s = dict(self._settings)
+        rebuild = False
+
+        if "engine" in patch and patch["engine"] in ("auto", "gpu", "cpu"):
+            s["engine"] = patch["engine"]
+        if "charset" in patch and isinstance(patch["charset"], str):
+            cleaned = self._clean_charset(patch["charset"])
+            if cleaned:
+                s["charset"] = cleaned
+        if "max_length" in patch:
+            try:
+                s["max_length"] = max(1, min(int(patch["max_length"]), 12))
+            except (TypeError, ValueError):
+                pass
+        if "use_catalog" in patch:
+            new_val = bool(patch["use_catalog"])
+            rebuild = rebuild or (new_val != s["use_catalog"])
+            s["use_catalog"] = new_val
+        if "auto_crack" in patch:
+            s["auto_crack"] = bool(patch["auto_crack"])
+        if "auto_dict_only" in patch:
+            s["auto_dict_only"] = bool(patch["auto_dict_only"])
+
+        self._settings = s
+        self._persist_settings()
+        if rebuild:
+            self._apply_wordlist()
+
+        # Start/stop the auto loop to match the new setting.
+        if s["auto_crack"]:
+            self._start_auto()
+        else:
+            self._stop_auto()
+
+        return self.config()
+
+    def estimate_search_size(self, charset: str, max_length: int) -> int:
+        """Total brute-force candidate count for lengths 1..max_length."""
+        base = len(set(charset)) if charset else 0
+        if base == 0:
+            return 0
+        return sum(base ** length for length in range(1, int(max_length) + 1))
+
+    def wordlist_info(self) -> dict:
+        """Counts for the dictionary/catalog panel."""
+        return {
+            "total": self._cracker.wordlist_size,
+            "builtin": len(BUILTIN_WORDLIST),
+            "catalog": len(load_catalog()),
+            "catalog_enabled": bool(self._settings["use_catalog"]),
+            "custom_files": list(self._settings["custom_wordlists"]),
+        }
+
+    def config(self) -> dict:
+        """Everything the config UI needs in one shot."""
+        s = self._settings
+        size = self.estimate_search_size(s["charset"], s["max_length"])
+        return {
+            "settings": self.get_settings(),
+            "gpu": self.gpu_status(),
+            "engine": self.engine(),
+            "wordlist": self.wordlist_info(),
+            "db_path": str(getattr(self.store, "db_path", "")),
+            "search_size": size,
+            "search_warn": size > SEARCH_SIZE_WARN,
+            "search_warn_threshold": SEARCH_SIZE_WARN,
+            "defaults": {
+                "charset": brute_force.DEFAULT_CHARSET,
+                "max_length": CRACKER_DEFAULTS["max_length"],
+            },
+            "live": self.core is not None,
+            "auto_running": self._auto_thread is not None and self._auto_thread.is_alive(),
+        }
+
+    # --- wordlist management -------------------------------------------------
+
+    def _apply_wordlist(self):
+        """Rebuild the cracker's candidate table from current settings."""
+        try:
+            self._cracker.rebuild_wordlist(
+                use_catalog=bool(self._settings["use_catalog"]),
+                extra_paths=list(self._settings["custom_wordlists"]),
+            )
+        except Exception:
+            pass
+
+    def add_custom_wordlist(self, text=None, path=None) -> dict:
+        """Add a custom wordlist, either uploaded text or a path on disk.
+
+        Uploaded text is written to a durable file under the config dir so it
+        survives restarts; the path is recorded in settings and re-applied on
+        startup. Returns the updated wordlist_info plus the resolved path.
+        """
+        resolved = None
+        if path:
+            resolved = str(Path(path))
+            if not Path(resolved).is_file():
+                return {"ok": False, "error": f"no such file: {resolved}"}
+        elif text and text.strip():
+            dest_dir = Path(DEFAULT_CONFIG_DIR) / "cracker_wordlists"
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                resolved = str(dest_dir / f"custom-{int(time.time()*1000)}.txt")
+                Path(resolved).write_text(text, encoding="utf-8")
+            except OSError as e:
+                return {"ok": False, "error": f"could not save wordlist: {e}"}
+        else:
+            return {"ok": False, "error": "provide 'text' or 'path'"}
+
+        lists = list(self._settings["custom_wordlists"])
+        if resolved not in lists:
+            lists.append(resolved)
+        self._settings["custom_wordlists"] = lists
+        self._persist_settings()
+
+        before = self._cracker.wordlist_size
+        self._cracker.add_wordlist(resolved)
+        added = self._cracker.wordlist_size - before
+
+        info = self.wordlist_info()
+        info.update({"ok": True, "path": resolved, "added": added})
+        return info
+
+    # --- known channels ------------------------------------------------------
+
+    def _known_channels(self):
+        """Channels we can already decode: the default public channel, any live
+        channels on the core, and previously cracked channels from the DB."""
+        channels = [default_public_channel()]
+        if self.core is not None:
+            channels.extend(getattr(self.core, "_channels", []))
+        try:
+            for row in self.store.get_cracked_channels():
+                try:
+                    channels.append(Channel.from_hashtag(row["channel_name"]))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return channels
+
+    # --- pending unknown channels -------------------------------------------
+
+    def pending_channels(self) -> list:
+        """Hashes seen in stored GRP_TXT packets that still have undecoded
+        packets, each with its packet counts. Unioned with the live cracker's
+        pending set so freshly-seen hashes show up before they hit the DB."""
+        by_hash = defaultdict(lambda: {"total": 0, "undecoded": 0})
+
+        packets = self.store.get_grp_txt_packets()
+        for pkt in packets:
+            raw_hex = pkt.get("raw_hex", "")
+            if not raw_hex:
+                continue
+            try:
+                raw = bytes.fromhex(raw_hex)
+            except ValueError:
+                continue
+            extracted = extract_group_payload(raw)
+            if not extracted:
+                continue
+            h = extracted["channel_hash"]
+            by_hash[h]["total"] += 1
+            if not self.store.has_channel_message_for_packet(pkt["id"]):
+                by_hash[h]["undecoded"] += 1
+
+        pending = []
+        for h, counts in by_hash.items():
+            if counts["undecoded"] > 0:
+                pending.append({
+                    "hash": h,
+                    "packet_count": counts["total"],
+                    "undecoded_count": counts["undecoded"],
+                })
+
+        # Union with the live cracker's pending set (may include hashes whose
+        # packets haven't been committed to the store yet).
+        seen = {p["hash"] for p in pending}
+        if self._cracker is not None:
+            for h in self._cracker.pending_hashes:
+                if h not in seen:
+                    pending.append({"hash": h, "packet_count": 0, "undecoded_count": 0})
+                    seen.add(h)
+
+        pending.sort(key=lambda p: (-p["undecoded_count"], p["hash"]))
+        return pending
+
+    def _find_mac_and_data(self, target_hash: int) -> Optional[bytes]:
+        """Return mac_and_data from the first stored GRP_TXT packet whose
+        channel_hash matches, or None if none is stored."""
+        blobs = self._mac_and_data_for_hash(target_hash, limit=1)
+        return blobs[0] if blobs else None
+
+    def _mac_and_data_for_hash(self, target_hash: int, limit: int = 4) -> list:
+        """Up to `limit` distinct mac_and_data blobs from stored GRP_TXT packets
+        whose channel_hash matches. Siblings serve as brute-force cross-checks:
+        a true key decrypts them all, a MAC collision will not."""
+        blobs = []
+        for pkt in self.store.get_grp_txt_packets():
+            raw_hex = pkt.get("raw_hex", "")
+            if not raw_hex:
+                continue
+            try:
+                raw = bytes.fromhex(raw_hex)
+            except ValueError:
+                continue
+            extracted = extract_group_payload(raw)
+            if extracted and extracted["channel_hash"] == target_hash:
+                blob = extracted["mac_and_data"]
+                if blob not in blobs:
+                    blobs.append(blob)
+                    if len(blobs) >= limit:
+                        break
+        return blobs
+
+    # --- cracking ------------------------------------------------------------
+
+    def crack(
+        self,
+        target_hash: int,
+        mac_and_data: Optional[bytes] = None,
+        charset: Optional[str] = None,
+        max_length: Optional[int] = None,
+        cancel_event=None,
+        allow_bruteforce: bool = True,
+    ) -> dict:
+        """Synchronously crack the channel name for target_hash.
+
+        Dictionary/catalog match first (instant, reaches long real-world names),
+        then GPU brute-force (CPU fallback) unless ``allow_bruteforce`` is False.
+        charset/max_length default to the persisted settings when not supplied.
+        ``cancel_event`` (a threading.Event) aborts an in-flight brute-force.
+        On success the channel is added to the live decode list, all stored
+        packets are retroactively decoded, and the result is persisted.
+
+        Returns a result dict (also stored in self._status["result"]).
+        """
+        if charset is None:
+            charset = self._settings["charset"]
+        if max_length is None:
+            max_length = self._settings["max_length"]
+        should_stop = (lambda: cancel_event.is_set()) if cancel_event is not None else None
+        engine = self.engine()
+        with self._lock:
+            self._status.update({
+                "running": True,
+                "engine": engine,
+                "target_hash": target_hash,
+                "charset": charset,
+                "max_length": max_length,
+                "length": 0,
+                "total": 0,
+                "elapsed": 0.0,
+                "result": None,
+                "error": None,
+                "started_at": time.time(),
+            })
+
+        try:
+            # Gather sibling packets for the same hash as collision cross-checks.
+            siblings = self._mac_and_data_for_hash(target_hash, limit=4)
+            if mac_and_data is None:
+                mac_and_data = siblings[0] if siblings else None
+                extras = siblings[1:]
+            else:
+                extras = [b for b in siblings if b != mac_and_data][:3]
+            if not mac_and_data:
+                result = {
+                    "cracked": False,
+                    "channel_hash": target_hash,
+                    "error": "no stored packet for that channel hash",
+                }
+                return self._finish(result)
+
+            # Dictionary/catalog first: instant, and reaches long real-world
+            # names (e.g. #wardriving) that charset brute-force at this
+            # max_length never would.
+            dict_ch = self._cracker.match_dictionary(target_hash, mac_and_data)
+            if dict_ch is not None:
+                decoded_count = self._on_cracked(dict_ch.name, target_hash)
+                result = {
+                    "cracked": True,
+                    "channel_name": dict_ch.name,
+                    "channel_hash": target_hash,
+                    "decoded_count": decoded_count,
+                    "method": "dictionary",
+                }
+                return self._finish(result)
+
+            if not allow_bruteforce:
+                return self._finish({
+                    "cracked": False, "channel_hash": target_hash,
+                    "method": "dictionary", "dictionary_only": True,
+                })
+            if should_stop is not None and should_stop():
+                return self._finish({"cracked": False, "channel_hash": target_hash,
+                                     "canceled": True})
+
+            def on_progress(length, total, elapsed):
+                with self._lock:
+                    self._status["length"] = length
+                    self._status["total"] = total
+                    self._status["elapsed"] = elapsed
+
+            if engine == "gpu":
+                name = brute_force_gpu.brute_force_channel_gpu(
+                    target_hash, mac_and_data, charset=charset,
+                    max_length=max_length, on_progress=on_progress,
+                    extra_mac_and_data=extras, should_stop=should_stop,
+                )
+            else:
+                name = brute_force.brute_force_channel(
+                    target_hash, mac_and_data, charset=charset,
+                    max_length=max_length, on_progress=on_progress,
+                    extra_mac_and_data=extras, should_stop=should_stop,
+                )
+
+            if name is None:
+                canceled = should_stop is not None and should_stop()
+                result = {"cracked": False, "channel_hash": target_hash}
+                if canceled:
+                    result["canceled"] = True
+                return self._finish(result)
+
+            decoded_count = self._on_cracked(name, target_hash)
+            result = {
+                "cracked": True,
+                "channel_name": name,
+                "channel_hash": target_hash,
+                "decoded_count": decoded_count,
+                "method": "bruteforce",
+            }
+            return self._finish(result)
+        except Exception as e:  # keep the server alive on unexpected failures
+            result = {"cracked": False, "channel_hash": target_hash, "error": str(e)}
+            return self._finish(result)
+
+    def _on_cracked(self, name: str, target_hash: int) -> int:
+        """Wire a newly cracked channel into the live/decode pipeline and
+        persist it. Returns the number of retroactively decoded messages."""
+        channel = Channel.from_hashtag(name)
+
+        # Add to the live decode list so future packets decode too.
+        if self.core is not None:
+            try:
+                existing = {ch.name for ch in getattr(self.core, "_channels", [])}
+                if channel.name not in existing:
+                    self.core.add_channel(channel)
+            except Exception:
+                pass
+
+        decoded_count = self._cracker.retroactive_decrypt(channel)
+        try:
+            self.store.store_cracked_channel(channel.name, target_hash, decoded_count)
+        except Exception:
+            pass
+        return decoded_count
+
+    def _finish(self, result: dict) -> dict:
+        with self._lock:
+            self._status["running"] = False
+            self._status["result"] = result
+        return result
+
+    # --- crack queue ---------------------------------------------------------
+
+    @staticmethod
+    def _job_public(job) -> dict:
+        """Serializable view of a job (no internal Event / mac bytes)."""
+        return {
+            "id": job["id"],
+            "target_hash": job["target_hash"],
+            "label": job["label"],
+            "source": job["source"],
+            "status": job["status"],
+            "result": job["result"],
+            "enqueued_at": job["enqueued_at"],
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
+        }
+
+    def enqueue(self, target_hash, mac_and_data=None, charset=None, max_length=None,
+                source="manual", allow_bruteforce=True, dedupe=True) -> dict:
+        """Add a crack job to the queue; the worker drains it FIFO.
+
+        dedupe skips a hash that is already queued or currently running (used by
+        auto-crack so a pending hash isn't enqueued every pass). Pasted-packet
+        jobs carry their own mac_and_data and are never deduped.
+
+        Returns {"queued": bool, "job_id": int, "position": int, "reason"?}.
+        """
+        target_hash = int(target_hash)
+        with self._lock:
+            if dedupe and mac_and_data is None:
+                if self._current and self._current["target_hash"] == target_hash:
+                    return {"queued": False, "reason": "already running",
+                            "job_id": self._current["id"]}
+                for j in self._queue:
+                    if j["target_hash"] == target_hash and j["mac_and_data"] is None:
+                        return {"queued": False, "reason": "already queued",
+                                "job_id": j["id"]}
+            self._job_seq += 1
+            job = {
+                "id": self._job_seq,
+                "target_hash": target_hash,
+                "mac_and_data": mac_and_data,
+                "charset": charset,
+                "max_length": max_length,
+                "source": source,
+                "allow_bruteforce": allow_bruteforce,
+                "label": f"hash 0x{target_hash:02x}",
+                "status": "queued",
+                "result": None,
+                "enqueued_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+                "cancel": threading.Event(),
+            }
+            self._queue.append(job)
+            position = len(self._queue)
+            self._ensure_worker()
+            self._queue_cv.notify_all()
+        return {"queued": True, "job_id": job["id"], "position": position}
+
+    def start_crack(self, target_hash, mac_and_data=None,
+                    charset=None, max_length=None) -> dict:
+        """Enqueue a manual crack (dictionary-first, then brute-force).
+
+        Kept for the /api/crack endpoint; returns the enqueue result plus a
+        legacy ``started`` flag.
+        """
+        r = self.enqueue(
+            target_hash, mac_and_data=mac_and_data,
+            charset=charset, max_length=max_length,
+            source=("packet" if mac_and_data is not None else "manual"),
+            allow_bruteforce=True, dedupe=(mac_and_data is None),
+        )
+        return {"started": bool(r.get("queued")), "engine": self.engine(), **r}
+
+    def cancel(self, job_id) -> dict:
+        """Cancel a queued job (drop it) or the running job (signal it to stop)."""
+        job_id = int(job_id)
+        with self._lock:
+            if self._current is not None and self._current["id"] == job_id:
+                self._current["cancel"].set()
+                return {"ok": True, "canceled": "running", "job_id": job_id}
+            for j in list(self._queue):
+                if j["id"] == job_id:
+                    j["cancel"].set()
+                    j["status"] = "canceled"
+                    j["finished_at"] = time.time()
+                    self._queue.remove(j)
+                    self._history.append(j)
+                    self._history = self._history[-50:]
+                    return {"ok": True, "canceled": "queued", "job_id": job_id}
+        return {"ok": False, "error": "no such job"}
+
+    def cancel_all(self) -> dict:
+        """Drop every queued job and signal the running one to stop."""
+        with self._lock:
+            n = len(self._queue)
+            for j in self._queue:
+                j["cancel"].set()
+                j["status"] = "canceled"
+                j["finished_at"] = time.time()
+                self._history.append(j)
+            self._queue.clear()
+            self._history = self._history[-50:]
+            canceling = self._current is not None
+            if self._current is not None:
+                self._current["cancel"].set()
+        return {"ok": True, "canceled_queued": n, "canceling_current": canceling}
+
+    def _ensure_worker(self):
+        """Start the queue worker if it isn't running. Call under self._lock."""
+        if self._worker is None or not self._worker.is_alive():
+            self._worker_stop.clear()
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker.start()
+
+    def _worker_loop(self):
+        while not self._worker_stop.is_set():
+            with self._queue_cv:
+                while not self._queue and not self._worker_stop.is_set():
+                    self._queue_cv.wait(timeout=1.0)
+                if self._worker_stop.is_set():
+                    return
+                job = self._queue.pop(0)
+                self._current = job
+                job["status"] = "running"
+                job["started_at"] = time.time()
+
+            if job["cancel"].is_set():
+                res = {"cracked": False, "canceled": True,
+                       "channel_hash": job["target_hash"]}
+            else:
+                res = self.crack(
+                    job["target_hash"], mac_and_data=job["mac_and_data"],
+                    charset=job["charset"], max_length=job["max_length"],
+                    cancel_event=job["cancel"],
+                    allow_bruteforce=job["allow_bruteforce"],
+                )
+
+            with self._lock:
+                job["result"] = res
+                job["finished_at"] = time.time()
+                if res.get("canceled"):
+                    job["status"] = "canceled"
+                elif res.get("error"):
+                    job["status"] = "failed"
+                else:
+                    job["status"] = "done"
+                self._history.append(job)
+                self._history = self._history[-50:]
+                self._current = None
+
+    def crack_status(self) -> dict:
+        """Current crack progress (legacy keys) plus the live queue."""
+        with self._lock:
+            st = dict(self._status)
+            st["active"] = self._job_public(self._current) if self._current else None
+            st["queued"] = [self._job_public(j) for j in self._queue]
+            st["recent"] = [self._job_public(j) for j in reversed(self._history[-20:])]
+            st["queue_len"] = len(self._queue)
+        return st
+
+    def _crack_running(self) -> bool:
+        with self._lock:
+            return self._current is not None
+
+    # --- auto-crack ----------------------------------------------------------
+
+    def auto_crack_once(self) -> list:
+        """One auto-crack pass: dictionary-match every pending hash immediately;
+        for misses (unless ``auto_dict_only``) enqueue a brute-force job so the
+        queue worker grinds them without blocking this loop. Dedup keeps a hash
+        from being re-enqueued every pass. Returns the dictionary cracks found
+        this pass. Safe to call directly from tests."""
+        cracked = []
+        # Auto brute-force only when the GPU engine is active: a CPU grind at
+        # the default charset/length takes minutes, far too slow to run per
+        # pending channel automatically. CPU hosts stay dictionary-only.
+        auto_brute = not bool(self._settings.get("auto_dict_only")) and self.engine() == "gpu"
+        for p in self.pending_channels():
+            h = p["hash"]
+            blobs = self._mac_and_data_for_hash(h, limit=1)
+            if not blobs:
+                continue
+            dict_ch = self._cracker.match_dictionary(h, blobs[0])
+            if dict_ch is not None:
+                decoded = self._on_cracked(dict_ch.name, h)
+                cracked.append({
+                    "cracked": True, "channel_name": dict_ch.name,
+                    "channel_hash": h, "decoded_count": decoded,
+                    "method": "dictionary",
+                })
+                continue
+            if auto_brute:
+                self.enqueue(h, source="auto", allow_bruteforce=True, dedupe=True)
+        return cracked
+
+    def _auto_loop(self):
+        idle_delay = 1.0
+        while not self._auto_stop.is_set() and self._settings["auto_crack"]:
+            try:
+                got = self.auto_crack_once()
+            except Exception:
+                got = []
+            # Tight after progress, back off (capped) while idle.
+            if got:
+                idle_delay = 1.0
+            else:
+                idle_delay = min(idle_delay * 1.5, 15.0)
+            self._auto_stop.wait(timeout=idle_delay)
+
+    def _start_auto(self):
+        if self._auto_thread is not None and self._auto_thread.is_alive():
+            return
+        self._auto_stop.clear()
+        self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
+        self._auto_thread.start()
+
+    def _stop_auto(self):
+        self._auto_stop.set()
+        t = self._auto_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=2)
+        self._auto_thread = None
+
+    def shutdown(self):
+        """Stop background threads (auto-crack loop + queue worker). The store is
+        owned by the caller."""
+        self._stop_auto()
+        self._worker_stop.set()
+        with self._lock:
+            if self._current is not None:
+                self._current["cancel"].set()
+            self._queue_cv.notify_all()
+        w = self._worker
+        if w is not None and w.is_alive():
+            w.join(timeout=3)
+
+    # --- results -------------------------------------------------------------
+
+    def channels(self) -> list:
+        """Cracked channels with message counts only (no bodies) — cheap at scale."""
+        try:
+            rows = self.store.get_cracked_channel_summaries()
+        except Exception:
+            rows = []
+        out = []
+        for row in rows:
+            out.append({
+                "channel_name": row["channel_name"],
+                "channel_hash": row.get("channel_hash"),
+                "decoded_count": row.get("decoded_count"),
+                "discovered_at": row.get("discovered_at"),
+                "msg_count": row.get("msg_count") or 0,
+                "last_activity": row.get("last_activity"),
+                "unique_senders": row.get("unique_senders") or 0,
+            })
+        return out
+
+    def channel_messages(self, channel_name, limit=50, before_id=None,
+                         after_id=None, search=None) -> dict:
+        """A page of a channel's messages, newest-first, with id cursors + total.
+
+        - ``before_id``: page back to older rows (infinite scroll).
+        - ``after_id``: fetch only rows newer than a cursor (incremental live).
+        """
+        try:
+            rows = self.store.page_channel_messages(
+                channel_name=channel_name, search=search,
+                before_id=before_id, after_id=after_id, limit=limit,
+            )
+            total = self.store.count_channel_messages(
+                channel_name=channel_name, search=search,
+            )
+        except Exception:
+            rows, total = [], 0
+        messages = [{
+            "id": m.get("id"),
+            "sender": m.get("sender"),
+            "text": m.get("text"),
+            "timestamp": m.get("timestamp"),
+            "msg_timestamp": m.get("msg_timestamp"),
+        } for m in rows]
+        ids = [m["id"] for m in messages if m["id"] is not None]
+        return {
+            "channel_name": channel_name,
+            "total": total,
+            "count": len(messages),
+            "messages": messages,
+            "newest_id": max(ids) if ids else None,
+            "oldest_id": min(ids) if ids else None,
+            "has_more": len(messages) >= max(1, min(int(limit), 500)),
+        }
+
+    def results(self) -> list:
+        """Cracked channels with their decoded messages (sender + text).
+
+        Retained for backward compatibility with the original /api/results
+        endpoint. Scalable clients should use channels() + channel_messages().
+        """
+        out = []
+        try:
+            rows = self.store.get_cracked_channels()
+        except Exception:
+            rows = []
+        for row in rows:
+            name = row["channel_name"]
+            messages = []
+            try:
+                for m in self.store.get_channel_messages(channel_name=name, limit=200):
+                    messages.append({
+                        "sender": m.get("sender"),
+                        "text": m.get("text"),
+                        "timestamp": m.get("timestamp"),
+                        "msg_timestamp": m.get("msg_timestamp"),
+                    })
+            except Exception:
+                pass
+            out.append({
+                "channel_name": name,
+                "channel_hash": row.get("channel_hash"),
+                "decoded_count": row.get("decoded_count"),
+                "discovered_at": row.get("discovered_at"),
+                "messages": messages,
+            })
+        return out

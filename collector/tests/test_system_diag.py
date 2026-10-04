@@ -206,10 +206,11 @@ class TestSchemaMigration:
             # Open with CollectorStore — should migrate to v3
             s = CollectorStore(f.name)
             s.open()
+            from collector.store import SCHEMA_VERSION
             row = s._conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
-            assert row["value"] == "5"
+            assert int(row["value"]) == SCHEMA_VERSION
 
             # diagnostics table should exist
             s._conn.execute("SELECT COUNT(*) FROM diagnostics")

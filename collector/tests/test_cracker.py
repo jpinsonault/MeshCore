@@ -586,10 +586,11 @@ class TestStoreSchemaV5:
         assert all(p.get("raw_hex") for p in packets)
         store.close()
 
-    def test_schema_version_is_5(self):
+    def test_schema_version_is_current(self):
+        from collector.store import SCHEMA_VERSION
         store, _ = _make_store()
         row = store._conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert int(row["value"]) == 5
+        assert int(row["value"]) == SCHEMA_VERSION
         store.close()
