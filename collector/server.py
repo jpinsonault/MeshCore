@@ -290,6 +290,7 @@ def main():
     )
     parser.add_argument("--port", default=None, help="Serial port")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
+    parser.add_argument("--password", default=None, help="Admin password, for socket:// ports (or set MESHCORE_PASSWORD)")
     parser.add_argument("--http-port", type=int, default=8080, help="HTTP API port")
     parser.add_argument("--ws-port", type=int, default=8081, help="WebSocket port")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
@@ -313,7 +314,7 @@ def main():
     print(f"  WebSocket: ws://{args.host}:{args.ws_port}")
     print()
 
-    core = CollectorCore(port=serial_port, baud=args.baud, db_path=db_path)
+    core = CollectorCore(port=serial_port, baud=args.baud, db_path=db_path, password=args.password)
     core.on_connected = lambda: print("  [collector] Connected")
     core.on_disconnected = lambda r: print(f"  [collector] Disconnected: {r}")
     core.on_error = lambda m: print(f"  [collector] Error: {m}")

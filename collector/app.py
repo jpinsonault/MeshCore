@@ -49,9 +49,12 @@ def main():
     parser = argparse.ArgumentParser(description="MeshCore Collector TUI")
     parser.add_argument("--port", default=None, help="Serial port (skip port selection)")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
+    parser.add_argument("--password", default=None, help="Admin password, for socket:// ports (or set MESHCORE_PASSWORD)")
     parser.add_argument("--serve", type=int, default=None, metavar="WS_PORT",
                         help="Start WebSocket server on this port (e.g., 8081)")
     args = parser.parse_args()
+    if args.password:
+        os.environ["MESHCORE_PASSWORD"] = args.password   # read by CollectorCore
 
     def curses_main(stdscr):
         app = CollectorApp(stdscr, port=args.port, baud=args.baud, serve=args.serve)

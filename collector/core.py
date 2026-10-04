@@ -7,6 +7,7 @@ be used without any TUI — perfect for headless Raspberry Pi deployments.
 
 Usage (standalone):
     core = CollectorCore(port="/dev/ttyUSB0")
+    core = CollectorCore(port="socket://heltec-repeater.local:5005", password="...")  # WiFi build
     core.start()       # blocks on its own thread
     ...
     core.stop()
@@ -16,6 +17,7 @@ Usage (with pyos Service wrapper):
     events into the pyos event system.
 """
 
+import os
 import threading
 import time
 from typing import Callable
@@ -52,6 +54,17 @@ def list_serial_ports():
     ]
 
 
+def is_network_port(port):
+    """True for pyserial URLs that reach the device over the network (WiFi build)."""
+    return bool(port) and port.startswith(("socket://", "rfc2217://"))
+
+
+def open_link(port, baud):
+    """Open the device link: a serial port (COM3, /dev/ttyUSB0) or a pyserial URL
+    such as socket://heltec-repeater.local:5005 for the WiFi collector build."""
+    return serial.serial_for_url(port, baudrate=baud, timeout=0.1)
+
+
 class CollectorCore:
     """Manages serial connection and frame collection.
 
@@ -63,10 +76,12 @@ class CollectorCore:
         on_error(msg)       — called on non-fatal errors
     """
 
-    def __init__(self, port=None, baud=115200, db_path="collector.db"):
+    def __init__(self, port=None, baud=115200, db_path="collector.db", password=None):
         self.port = port
         self.baud = baud
         self.db_path = db_path
+        # Admin password for network links (the WiFi build wants "auth <password>" first)
+        self.password = password if password is not None else os.environ.get("MESHCORE_PASSWORD")
 
         # Callbacks (set by the caller or Service wrapper)
         self.on_frame: Callable = None
@@ -174,13 +189,19 @@ class CollectorCore:
     def _connect_and_collect(self):
         """Connect to serial port, enable collector mode, and read frames."""
         try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
-        except serial.SerialException as e:
+            self._ser = open_link(self.port, self.baud)
+        except (serial.SerialException, OSError, ValueError) as e:
             self._fire_disconnected(f"Cannot open {self.port}: {e}")
             return
 
         time.sleep(0.5)
         self._ser.reset_input_buffer()
+
+        if is_network_port(self.port):
+            error = self._authenticate()
+            if error:
+                self._fire_disconnected(error)
+                return
         self._reader = FrameReader()
 
         # Reset reliable delivery state
@@ -255,6 +276,25 @@ class CollectorCore:
 
         self._connected = False
         self._fire_disconnected("Stopped by user")
+
+    def _authenticate(self):
+        """Log in to a network link. Returns an error message, or None on success.
+
+        The exchange is read raw, not through the FrameReader, so the echoed
+        password never reaches the debug log.
+        """
+        if not self.password:
+            return "Network link needs the admin password (--password or MESHCORE_PASSWORD)"
+        self._ser.write(f"auth {self.password}\r".encode())
+        buf = b""
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not self._stop_event.is_set():
+            buf += self._ser.read(256)
+            if b"OK - authenticated" in buf:
+                return None
+            if b"Err - auth" in buf:
+                return "Authentication failed (wrong admin password)"
+        return "No reply to auth"
 
     def _handle_handshake(self, parsed):
         """Process handshake result — set up v2 reliable delivery if supported."""
