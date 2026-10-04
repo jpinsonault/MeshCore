@@ -93,6 +93,14 @@ collector/.venv/Scripts/python -m collector.server --port socket://<host>:5005
 The node keeps buffering while no collector is connected (128KB ring, roughly 1,000–2,500 packets) and replays
 from where the host left off when it reconnects.
 
+**Monitoring the link.** The cracker web app's **Device & link** view (and the topbar badge: *fresh* / *stale Nm* /
+*LINK DOWN*) shows how fresh the capture is, so a dropped device is obvious instead of surfacing as hours-old
+messages. If the device vanishes off WiFi, the host notices within ~45s (`core.LINK_IDLE_TIMEOUT`) and reconnects
+on its own once the node is back — no service restart needed. Link up/down events are logged to `connection_events`,
+and each reboot the device reports (reset cause + last-alive heap/RSSI, recovered from its RTC RAM) lands in
+`device_boots`; both survive a collector restart. Note the reboot log needs the firmware built after this change —
+reflash with the **Flash over WiFi** step above.
+
 ## CLI additions
 
 | Command | Notes |

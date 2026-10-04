@@ -237,11 +237,14 @@ CLI command, enabling full chat participation from the TUI.
 - [x] Thread-local SQLite connections (store.py): per-thread connections (WAL) so the webapp's worker + HTTP threads don't corrupt a shared cursor; `:memory:` keeps one shared connection
 - [x] Relay-duplicate collapse: the same message floods in on multiple paths (many raw packets); channel reads dedup by (channel, msg_timestamp, sender, text) so each logical message shows once (retroactive decode stored one row per packet; live decode dedups at store)
 - [x] Decryptability-based decoded/undecoded counts: a packet is "decoded" if a known channel's key decrypts it (not row-based, which miscounts since the two decode paths store differently); drives the packets-vs-messages + hash-collision display and which packets a crack targets
+- [x] Resilient link: idle-link watchdog (`core.LINK_IDLE_TIMEOUT`, 45s) forces a reconnect when a `socket://` peer vanishes off WiFi without a FIN (read() would otherwise return empty forever — this was a real silent 3.5h stall); TCP keepalive on network links; backoff resets on any *established* session drop. Durable `connection_events` log (schema v9) so link up/down history survives a host/service restart
+- [x] Durable device boot/crash log: firmware BOOT_INFO frame (0xD5) sent each (re)connect reports the reset cause (`esp_reset_reason()` → power-on/panic/task+int watchdog/brownout/…) plus the last-known-alive stats (uptime, min heap, WiFi RSSI) kept in RTC RAM (`RTC_NOINIT_ATTR`, survives watchdog/panic/SW-reset, zero flash wear). Host stores them deduped in `device_boots` (schema v10). "Device & link" webapp view + a topbar freshness badge (fresh / stale Nm / LINK DOWN) make a dropped device obvious at a glance
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
 
-- `examples/simple_repeater/CollectorSerial.h` — Binary frame protocol, ring buffer, CRC-16, reliable delivery
+- `examples/simple_repeater/CollectorSerial.h` — Binary frame protocol, ring buffer, CRC-16, reliable delivery, BOOT_INFO frame + reset-cause codes
+- `examples/simple_repeater/MyMesh.cpp` — boot/crash forensics (`collectorBootInfoBegin/Alive`, RTC-RAM last-alive snapshot, `esp_reset_reason()` mapping) sent via BOOT_INFO on `collector start`
 - `examples/simple_repeater/MyMesh.cpp` — Firmware hooks, drain() loop, handleCollectorFrame()
 - `collector/protocol.py` — Frame constants, parsers, FrameReader state machine
 - `collector/store.py` — SQLite schema and query methods
