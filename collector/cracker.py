@@ -2,8 +2,9 @@
 MeshCore Collector — Channel Cracker.
 
 Passive dictionary attack on hashtag channels. MeshCore's hashtag channels
-derive their AES-128 key from SHA-256("#name")[:16], so a short wordlist
-cracks nearly all of them instantly.
+derive their AES-128 key from SHA-256("#name")[:16], so a wordlist cracks nearly
+all of them instantly. The wordlist is the built-in common-names list plus the
+bundled real-world catalog (data/meshcore_channels.txt, ~2.7K community channels).
 
 Algorithm:
   1. Pre-compute Channel.from_hashtag(word) for every candidate, index by hash byte
@@ -16,6 +17,7 @@ The retroactive_decrypt() pipeline is shared with manual /join — both paths
 funnel into: "new key → scan stored packets → decode → notify UI."
 """
 
+import os
 import threading
 import time
 from collections import defaultdict
@@ -25,6 +27,7 @@ from .crypto import (
     Channel,
     GroupMessage,
     extract_group_payload,
+    grp_txt_plaintext_ok,
     mac_then_decrypt,
     try_decode_group_message,
     PAYLOAD_TYPE_GRP_TXT,
@@ -96,6 +99,30 @@ BUILTIN_WORDLIST = [
     "mc-general", "mc-test", "mc-chat",
 ]
 
+# Bundled real-world catalog of community hashtag channels (CC0), loaded in
+# addition to BUILTIN_WORDLIST so the passive cracker decodes most observed
+# channels on sight. See data/meshcore_channels.txt for source/license.
+CATALOG_PATH = os.path.join(os.path.dirname(__file__), "data", "meshcore_channels.txt")
+
+
+def load_catalog(path=CATALOG_PATH):
+    """Read the bundled channel catalog. Returns a list of names (with '#').
+
+    Lines starting with ';' are comments; blank lines are skipped. Missing or
+    unreadable file yields an empty list (the built-in wordlist still applies).
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            names = []
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(";"):
+                    continue
+                names.append(line)
+            return names
+    except OSError:
+        return []
+
 
 class ChannelCracker:
     """Passive dictionary attacker for hashtag channels.
@@ -109,6 +136,7 @@ class ChannelCracker:
         self._known_names = set()
         self._pending_hashes = set()
         self._word_by_hash = defaultdict(list)  # hash_byte -> [(word, Channel)]
+        self._wordlist_names = set()  # derived channel names already in the table
         self._thread = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -124,8 +152,9 @@ class ChannelCracker:
                 self._known_hashes.add(ch.hash)
                 self._known_names.add(ch.name)
 
-        # Build hash table from built-in wordlist
+        # Build hash table from built-in wordlist plus the bundled catalog
         self._build_hash_table(BUILTIN_WORDLIST)
+        self._build_hash_table(load_catalog())
 
     def _build_hash_table(self, words):
         """Pre-compute Channel.from_hashtag for each word, index by hash byte."""
@@ -134,9 +163,29 @@ class ChannelCracker:
                 ch = Channel.from_hashtag(word)
             except Exception:
                 continue
-            # Only add if not already known
-            if ch.name not in self._known_names:
-                self._word_by_hash[ch.hash].append((word, ch))
+            # Skip already-configured channels and duplicate derivations
+            # (e.g. built-in "test" and catalog "#test" both derive "#test").
+            if ch.name in self._known_names or ch.name in self._wordlist_names:
+                continue
+            self._wordlist_names.add(ch.name)
+            self._word_by_hash[ch.hash].append((word, ch))
+
+    def candidate_channels(self, hash_byte):
+        """Return wordlist/catalog Channel objects whose derived hash matches."""
+        return [ch for (_word, ch) in self._word_by_hash.get(hash_byte, [])]
+
+    def match_dictionary(self, hash_byte, mac_and_data):
+        """Try wordlist/catalog candidates against a packet's mac_and_data.
+
+        Pure lookup with no store side effects: returns the matching Channel
+        (MAC verified) or None. Callers wire the result into the decode
+        pipeline themselves (see ChannelCracker._try_crack / CrackerApp).
+        """
+        for ch in self.candidate_channels(hash_byte):
+            plaintext = mac_then_decrypt(ch.secret, mac_and_data)
+            if plaintext is not None and grp_txt_plaintext_ok(plaintext):
+                return ch
+        return None
 
     def load_cache(self):
         """Load previously cracked channels from SQLite and return them as Channel objects."""
@@ -226,11 +275,40 @@ class ChannelCracker:
     def add_wordlist(self, path):
         """Add words from a file (one per line) to the hash table."""
         try:
-            with open(path) as f:
+            # UTF-8 for our own saved lists; tolerant of other encodings so an
+            # arbitrary user file never crashes the cracker.
+            with open(path, encoding="utf-8", errors="replace") as f:
                 words = [line.strip() for line in f if line.strip()]
             self._build_hash_table(words)
         except OSError:
             pass
+
+    def add_words(self, words):
+        """Add an iterable of candidate words directly to the hash table."""
+        self._build_hash_table([w.strip() for w in words if w and w.strip()])
+
+    def rebuild_wordlist(self, use_catalog=True, extra_paths=None):
+        """Rebuild the candidate hash table from scratch.
+
+        Keeps the known/cracked sets intact (they gate duplicates), but lets the
+        bundled catalog be toggled off and custom wordlists be (re)applied. The
+        new table is built locally and swapped in atomically so a concurrent
+        passive-scan thread never sees a half-built table.
+        """
+        saved_wordlist_names = self._wordlist_names
+        saved_table = self._word_by_hash
+        self._wordlist_names = set()
+        self._word_by_hash = defaultdict(list)
+        try:
+            self._build_hash_table(BUILTIN_WORDLIST)
+            if use_catalog:
+                self._build_hash_table(load_catalog())
+            for p in (extra_paths or []):
+                self.add_wordlist(p)
+        except Exception:
+            # Restore the previous table if anything went wrong.
+            self._wordlist_names = saved_wordlist_names
+            self._word_by_hash = saved_table
 
     def retroactive_decrypt(self, channel):
         """Scan stored GRP_TXT packets and try to decrypt with the given channel.
