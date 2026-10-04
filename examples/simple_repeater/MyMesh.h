@@ -25,6 +25,7 @@
 
 #include <helpers/AdvertDataHelpers.h>
 #include <helpers/ArduinoHelpers.h>
+#include <helpers/ChannelDetails.h>
 #include <helpers/ClientACL.h>
 #include <helpers/CommonCLI.h>
 #include <helpers/IdentityStore.h>
@@ -33,6 +34,7 @@
 #include <helpers/StatsFormatHelper.h>
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/RegionMap.h>
+#include "CollectorSerial.h"
 #include "RateLimiter.h"
 
 #ifdef WITH_BRIDGE
@@ -102,6 +104,13 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #if MAX_NEIGHBOURS
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
+#define MAX_COLLECTOR_CHANNELS 4
+  ChannelDetails _channels[MAX_COLLECTOR_CHANNELS];
+  int _num_channels;
+  CollectorSerial _collector;
+  bool _collector_enabled;
+  unsigned long _next_heartbeat;
+  unsigned long _next_diagnostics;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;
@@ -115,6 +124,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   ESPNowBridge bridge;
 #endif
 
+  const ChannelDetails* findChannelByName(const char* name) const;
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -231,6 +241,8 @@ public:
     bridge.begin();
   }
 #endif
+
+  void handleCollectorFrame();
 
   // To check if there is pending work
   bool hasPendingWork() const;

@@ -409,6 +409,9 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   mesh::Utils::printHex(Serial, raw, len);
   Serial.println();
 #endif
+  if (_collector_enabled) {
+    _collector.sendRxRaw(snr, rssi, raw, len);
+  }
 }
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
@@ -459,6 +462,11 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
       }
       f.close();
     }
+  }
+  if (_collector_enabled) {
+    uint8_t raw[MAX_TRANS_UNIT];
+    uint8_t raw_len = pkt->writeTo(raw);
+    _collector.sendTxRaw(raw, raw_len);
   }
 }
 
@@ -582,6 +590,9 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
     if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) { // just keep neigbouring Repeaters
       putNeighbour(id, timestamp, packet->getSNR());
     }
+  }
+  if (_collector_enabled) {
+    _collector.sendAdvertisement(timestamp, packet->_snr, id.pub_key, app_data, app_data_len);
   }
 }
 
@@ -760,6 +771,11 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   dirty_contacts_expiry = 0;
   set_radio_at = revert_radio_at = 0;
   _logging = false;
+  _collector_enabled = false;
+  _next_heartbeat = 0;
+  _next_diagnostics = 0;
+  _num_channels = 0;
+  memset(_channels, 0, sizeof(_channels));
   region_load_active = false;
 
 #if MAX_NEIGHBOURS
@@ -806,6 +822,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+  _collector.begin(Serial);
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -817,6 +834,18 @@ void MyMesh::begin(FILESYSTEM *fs) {
     bridge.begin();
   }
 #endif
+
+  // Pre-configure Public channel (same PSK as companion_radio)
+  {
+    #include <base64.hpp>
+    #define PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
+    auto dest = &_channels[_num_channels];
+    memset(dest->channel.secret, 0, sizeof(dest->channel.secret));
+    int len = decode_base64((unsigned char *)PUBLIC_GROUP_PSK, strlen(PUBLIC_GROUP_PSK), dest->channel.secret);
+    mesh::Utils::sha256(dest->channel.hash, sizeof(dest->channel.hash), dest->channel.secret, len);
+    StrHelper::strncpy(dest->name, "Public", sizeof(dest->name));
+    _num_channels++;
+  }
 
   radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_set_tx_power(_prefs.tx_power_dbm);
@@ -988,6 +1017,13 @@ void MyMesh::clearStats() {
   radio_driver.resetStats();
   resetStats();
   ((SimpleMeshTables *)getTables())->resetStats();
+}
+
+const ChannelDetails* MyMesh::findChannelByName(const char* name) const {
+  for (int i = 0; i < _num_channels; i++) {
+    if (strcmp(_channels[i].name, name) == 0) return &_channels[i];
+  }
+  return nullptr;
 }
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
@@ -1168,6 +1204,175 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else {
       strcpy(reply, "Err - ??");
     }
+  } else if (sender_timestamp == 0 && memcmp(command, "collector", 9) == 0) {
+    const char *sub = command + 9;
+    while (*sub == ' ') sub++;
+    if (strcmp(sub, "start") == 0) {
+      _collector_enabled = true;
+      _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
+      _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
+      _collector.sendHandshake();
+      strcpy(reply, "OK");
+    } else if (strcmp(sub, "stop") == 0) {
+      _collector_enabled = false;
+      strcpy(reply, "OK");
+    } else if (strcmp(sub, "status") == 0) {
+      _collector.sendHeartbeat(
+        getRTCClock()->getCurrentTime(),
+        board.getBattMilliVolts(),
+        getNumRecvFlood(), getNumRecvDirect(),
+        getNumSentFlood(), getNumSentDirect(),
+        _mgr->getFreeCount(),
+        (uint32_t)(uptime_millis / 1000)
+      );
+      sprintf(reply, "collector %s", _collector_enabled ? "running" : "stopped");
+    } else if (strcmp(sub, "diag") == 0) {
+      SimpleMeshTables *tables = (SimpleMeshTables *)getTables();
+      float temp = board.getMCUTemperature();
+      _collector.sendDiagnostics(
+        temp,
+        ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(),
+        (int16_t)_radio->getNoiseFloor(), (int16_t)_radio->getLastRSSI(),
+        (int16_t)(_radio->getLastSNR() * 4),
+        (uint32_t)getTotalAirTime(), (uint32_t)getReceiveAirTime(),
+        radio_driver.getPacketsRecvErrors(), _err_flags,
+        (uint16_t)_mgr->getOutboundCount(millis()),
+        (uint16_t)tables->getNumDirectDups(), (uint16_t)tables->getNumFloodDups(),
+        radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
+      );
+      strcpy(reply, "OK");
+    } else if (strncmp(sub, "inject ", 7) == 0 || strncmp(sub, "send ", 5) == 0) {
+      // inject: feed a synthetic group message into the collector pipeline (local only).
+      // send:   encrypt, transmit over LoRa via sendFlood(), AND echo into collector pipeline.
+      // Usage: collector inject|send #channel sender message text here
+      bool do_send = (sub[0] == 's');
+      const char *args = sub + (do_send ? 5 : 7);
+      while (*args == ' ') args++;
+
+      if (!*args) {
+        strcpy(reply, do_send ? "Err - use: collector send <channel> sender message"
+                              : "Err - use: collector inject <channel> sender message");
+        return;
+      }
+
+      // Parse channel name (may or may not start with #)
+      const char *chan_start = args;
+      const char *p = args;
+      while (*p && *p != ' ') p++;
+      if (!*p) { strcpy(reply, "Err - need sender and message"); return; }
+
+      char chan_name[32];
+      int chan_len = p - chan_start;
+      if (chan_len >= (int)sizeof(chan_name)) chan_len = sizeof(chan_name) - 1;
+      memcpy(chan_name, chan_start, chan_len);
+      chan_name[chan_len] = 0;
+
+      // Parse sender name
+      while (*p == ' ') p++;
+      const char *sender_start = p;
+      while (*p && *p != ' ') p++;
+      if (!*p) { strcpy(reply, "Err - need message text"); return; }
+
+      char sender_name[32];
+      int sender_len = p - sender_start;
+      if (sender_len >= (int)sizeof(sender_name)) sender_len = sizeof(sender_name) - 1;
+      memcpy(sender_name, sender_start, sender_len);
+      sender_name[sender_len] = 0;
+
+      // Rest is message text
+      while (*p == ' ') p++;
+      const char *message = p;
+
+      // Look up channel: try registered PSK channels first, then hashtag derivation
+      uint8_t secret[PUB_KEY_SIZE];
+      uint8_t channel_hash;
+      const ChannelDetails *registered = findChannelByName(chan_name);
+      if (registered) {
+        // Use pre-configured secret/hash from channel registry
+        memcpy(secret, registered->channel.secret, PUB_KEY_SIZE);
+        channel_hash = registered->channel.hash[0];
+      } else if (chan_name[0] == '#') {
+        // Hashtag channel: derive key via SHA-256
+        uint8_t psk[CIPHER_KEY_SIZE];
+        mesh::Utils::sha256(psk, CIPHER_KEY_SIZE, (const uint8_t *)chan_name, strlen(chan_name));
+        memcpy(secret, psk, CIPHER_KEY_SIZE);
+        memset(secret + CIPHER_KEY_SIZE, 0, PUB_KEY_SIZE - CIPHER_KEY_SIZE);
+        uint8_t hash_buf[32];
+        mesh::Utils::sha256(hash_buf, sizeof(hash_buf), psk, CIPHER_KEY_SIZE);
+        channel_hash = hash_buf[0];
+      } else {
+        sprintf(reply, "Err - unknown channel '%s' (use #name for hashtag channels)", chan_name);
+        return;
+      }
+
+      // Build plaintext: [timestamp(4 LE)][flags=0(1)][sender: message\0]
+      uint8_t plaintext[MAX_PACKET_PAYLOAD];
+      uint32_t ts = getRTCClock()->getCurrentTime();
+      int pt_len = 0;
+      memcpy(plaintext, &ts, 4); pt_len += 4;
+      plaintext[pt_len++] = 0;  // flags = TXT_TYPE_PLAIN
+      pt_len += snprintf((char *)&plaintext[pt_len], sizeof(plaintext) - pt_len, "%s: %s", sender_name, message);
+      pt_len++;  // include null terminator
+
+      // Build raw wire bytes for collector echo: [header(1)] [path_len=0(1)] [payload...]
+      uint8_t payload[MAX_PACKET_PAYLOAD];
+      payload[0] = channel_hash;
+      int enc_len = mesh::Utils::encryptThenMAC(secret, &payload[1], plaintext, pt_len);
+      int payload_len = 1 + enc_len;
+
+      uint8_t raw[MAX_TRANS_UNIT + 1];
+      raw[0] = (PAYLOAD_TYPE_GRP_TXT << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD;
+      raw[1] = 0;  // path_len = 0 (no hops)
+      memcpy(&raw[2], payload, payload_len);
+      int raw_len = 2 + payload_len;
+
+      if (do_send) {
+        // Transmit over LoRa
+        mesh::GroupChannel channel;
+        memcpy(channel.hash, &channel_hash, PATH_HASH_SIZE);
+        memcpy(channel.secret, secret, PUB_KEY_SIZE);
+
+        mesh::Packet *pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, plaintext, pt_len);
+        if (pkt) {
+          sendFlood(pkt);
+          // Echo into collector pipeline so the host sees it
+          logRxRaw(-50.0f, -90.0f, raw, raw_len);
+          sprintf(reply, "OK - sent %d bytes on %s", raw_len, chan_name);
+        } else {
+          strcpy(reply, "Err - packet pool empty");
+        }
+      } else {
+        // Inject only — feed into collector pipeline, NOT transmitted over radio
+        logRxRaw(-50.0f, -90.0f, raw, raw_len);
+        sprintf(reply, "OK - injected %d bytes on %s", raw_len, chan_name);
+      }
+    } else if (strncmp(sub, "screen ", 7) == 0) {
+      // Show arbitrary text on the OLED display.
+      // Usage: collector screen Hello World
+      const char *text = sub + 7;
+      while (*text == ' ') text++;
+#ifdef DISPLAY_CLASS
+      display.turnOn();
+      display.startFrame();
+      display.setTextSize(2);
+      display.setCursor(0, 10);
+      display.print(text);
+      display.endFrame();
+      sprintf(reply, "OK - screen: %s", text);
+#else
+      strcpy(reply, "Err - no display on this board");
+#endif
+    } else if (strcmp(sub, "screen") == 0) {
+      // Clear the display
+#ifdef DISPLAY_CLASS
+      display.clear();
+      strcpy(reply, "OK - screen cleared");
+#else
+      strcpy(reply, "Err - no display on this board");
+#endif
+    } else {
+      strcpy(reply, "Err - use: collector start|stop|status|diag|inject|send|screen");
+    }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1211,10 +1416,55 @@ void MyMesh::loop() {
     dirty_contacts_expiry = 0;
   }
 
+  // collector heartbeat
+  if (_collector_enabled && _next_heartbeat && millisHasNowPassed(_next_heartbeat)) {
+    _collector.sendHeartbeat(
+      getRTCClock()->getCurrentTime(),
+      board.getBattMilliVolts(),
+      getNumRecvFlood(), getNumRecvDirect(),
+      getNumSentFlood(), getNumSentDirect(),
+      _mgr->getFreeCount(),
+      (uint32_t)(uptime_millis / 1000)
+    );
+    _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
+  }
+
+  // collector diagnostics
+  if (_collector_enabled && _next_diagnostics && millisHasNowPassed(_next_diagnostics)) {
+    SimpleMeshTables *tables = (SimpleMeshTables *)getTables();
+    float temp = board.getMCUTemperature();
+    _collector.sendDiagnostics(
+      temp,
+      ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(),
+      (int16_t)_radio->getNoiseFloor(), (int16_t)_radio->getLastRSSI(),
+      (int16_t)(_radio->getLastSNR() * 4),
+      (uint32_t)getTotalAirTime(), (uint32_t)getReceiveAirTime(),
+      radio_driver.getPacketsRecvErrors(), _err_flags,
+      (uint16_t)_mgr->getOutboundCount(millis()),
+      (uint16_t)tables->getNumDirectDups(), (uint16_t)tables->getNumFloodDups(),
+      radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
+    );
+    _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
+  }
+
+  // drain collector ring buffer — 1 frame normally, up to 4 during replay catch-up
+  if (_collector_enabled) {
+    int count = _collector.hasBacklog() ? 4 : 1;
+    for (int i = 0; i < count; i++) {
+      if (!_collector.drain()) break;
+    }
+  }
+
   // update uptime
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
+}
+
+void MyMesh::handleCollectorFrame() {
+  if (_collector_enabled) {
+    _collector.processIncoming(Serial);
+  }
 }
 
 // To check if there is pending work

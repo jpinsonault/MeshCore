@@ -43,23 +43,12 @@ void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* fi
 void UITask::renderCurrScreen() {
   char tmp[80];
   if (millis() < BOOT_SCREEN_MILLIS) { // boot screen
-    // meshcore logo
-    _display->setColor(DisplayDriver::BLUE);
-    int logoWidth = 128;
-    _display->drawXbm((_display->width() - logoWidth) / 2, 3, meshcore_logo, logoWidth, 13);
-
-    // version info
     _display->setColor(DisplayDriver::LIGHT);
-    _display->setTextSize(1);
-    uint16_t versionWidth = _display->getTextWidth(_version_info);
-    _display->setCursor((_display->width() - versionWidth) / 2, 22);
-    _display->print(_version_info);
-
-    // node type
-    const char* node_type = "< Repeater >";
-    uint16_t typeWidth = _display->getTextWidth(node_type);
-    _display->setCursor((_display->width() - typeWidth) / 2, 35);
-    _display->print(node_type);
+    _display->setTextSize(3);
+    const char* beagle = "beagle";
+    uint16_t tw = _display->getTextWidth(beagle);
+    _display->setCursor((_display->width() - tw) / 2, 20);
+    _display->print(beagle);
   } else {  // home screen
     // node name
     _display->setCursor(0, 0);
