@@ -30,6 +30,7 @@ from ..crypto import (
     DEFAULT_PUBLIC_CHANNEL_NAME,
     default_public_channel,
     extract_group_payload,
+    mac_then_decrypt,
 )
 from ..store import CollectorStore
 
@@ -380,13 +381,23 @@ class CrackerApp:
         st = self._hash_packet_stats().get(int(target_hash))
         return st["total"] if st else 0
 
+    def _known_by_hash(self) -> dict:
+        """{hash_byte: [Channel]} for every channel we can currently decrypt."""
+        idx = defaultdict(list)
+        for ch in self._known_channels():
+            idx[ch.hash].append(ch)
+        return idx
+
     def _hash_packet_stats(self) -> dict:
         """One scan: {channel_hash: {"total": n, "undecoded": m}}.
 
-        `undecoded` counts packets with no decoded message row — the real
-        still-encrypted count. (packets - distinct messages would wrongly
-        include relay duplicates, which ARE decoded.)
+        `undecoded` = packets no known channel can decrypt (the real
+        still-encrypted count). This is decryptability-based, not row-based:
+        the live path stores one row per *logical* message (relay copies share
+        it) while retroactive decode stores one per packet, so counting rows
+        would miscount. Relay duplicates decrypt fine, so they're not undecoded.
         """
+        known = self._known_by_hash()
         stats = defaultdict(lambda: {"total": 0, "undecoded": 0})
         for pkt in self.store.get_grp_txt_packets():
             raw_hex = pkt.get("raw_hex", "")
@@ -399,9 +410,12 @@ class CrackerApp:
             extracted = extract_group_payload(raw)
             if not extracted:
                 continue
-            st = stats[extracted["channel_hash"]]
+            h = extracted["channel_hash"]
+            st = stats[h]
             st["total"] += 1
-            if not self.store.has_channel_message_for_packet(pkt["id"]):
+            mad = extracted["mac_and_data"]
+            if not any(mac_then_decrypt(ch.secret, mad) is not None
+                       for ch in known.get(h, ())):
                 st["undecoded"] += 1
         return stats
 
@@ -430,13 +444,12 @@ class CrackerApp:
         the foreign-channel siblings simply won't decrypt, so they don't help
         or harm (see the verify step).
         """
+        known = self._known_by_hash().get(int(target_hash), [])
         blobs = []
         for pkt in self.store.get_grp_txt_packets():
             raw_hex = pkt.get("raw_hex", "")
             if not raw_hex:
                 continue
-            if self.store.has_channel_message_for_packet(pkt["id"]):
-                continue  # already decoded (this or another channel on the hash)
             try:
                 raw = bytes.fromhex(raw_hex)
             except ValueError:
@@ -444,6 +457,10 @@ class CrackerApp:
             extracted = extract_group_payload(raw)
             if extracted and extracted["channel_hash"] == target_hash:
                 blob = extracted["mac_and_data"]
+                # Skip packets a known channel already decrypts (this or another
+                # channel sharing the hash byte) so we target the unrecovered one.
+                if any(mac_then_decrypt(ch.secret, blob) is not None for ch in known):
+                    continue
                 if blob not in blobs:
                     blobs.append(blob)
                     if len(blobs) >= limit:
