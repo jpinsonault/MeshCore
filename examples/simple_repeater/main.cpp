@@ -24,7 +24,7 @@ void halt() {
 
 static char command[160];
 #if defined(ESP32) && defined(COLLECTOR_WIFI)
-static char tcp_command[160];
+static char remote_command[COLLECTOR_WIFI_LINKS][160];
 #endif
 
 // Reads CLI input from one source into buf; returns true once buf holds a complete line ('\r' stripped).
@@ -177,23 +177,25 @@ void loop() {
   }
 
 #if defined(ESP32) && defined(COLLECTOR_WIFI)
-  // Same CLI + collector stream over TCP; nothing but "auth <password>" until the client logs in
-  static uint32_t tcp_session = 0;
-  if (collector_wifi.sessionId() != tcp_session) {
-    tcp_session = collector_wifi.sessionId();
-    tcp_command[0] = 0;
-  }
-  Stream* tcp = collector_wifi.rawClient();
-  if (tcp && readCliLine(*tcp, tcp_command, sizeof(tcp_command), collector_wifi.isAuthed())) {
-    char reply[160];
-    reply[0] = 0;
-    if (!collector_wifi.handleAuth(tcp_command, reply)) {
-      the_mesh.handleCommand(0, tcp_command, reply);
+  // Same CLI + collector stream over TCP and WebSocket; nothing but "auth <password>" until a client logs in
+  static uint32_t remote_session[COLLECTOR_WIFI_LINKS];
+  for (int i = 0; i < COLLECTOR_WIFI_LINKS; i++) {
+    if (collector_wifi.linkSession(i) != remote_session[i]) {
+      remote_session[i] = collector_wifi.linkSession(i);
+      remote_command[i][0] = 0;
     }
-    if (reply[0]) {
-      tcp->print("  -> "); tcp->println(reply);
+    Stream* link = collector_wifi.linkInput(i);
+    if (link && readCliLine(*link, remote_command[i], sizeof(remote_command[i]), collector_wifi.linkAuthed(i))) {
+      char reply[160];
+      reply[0] = 0;
+      if (!collector_wifi.handleAuth(i, remote_command[i], reply)) {
+        the_mesh.handleCommand(0, remote_command[i], reply);
+      }
+      if (reply[0]) {
+        link->print("  -> "); link->println(reply);
+      }
+      remote_command[i][0] = 0;
     }
-    tcp_command[0] = 0;
   }
 #endif
 

@@ -4,12 +4,89 @@
 
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
 #include <helpers/TxtDataHelpers.h>
 
 #define WIFI_CONFIG_FILE  "/collector_wifi"
+#define LOGIN_BANNER      "MeshCore collector - send: auth <admin password>\r\n"
 
 CollectorWifi collector_wifi;
 CollectorLinkStream collector_link(collector_wifi, Serial);
+
+// ------------------------------------------------------------------ WsStream
+
+WsStream::WsStream() : _rx_head(0), _rx_tail(0), _tx_len(0), ws(NULL), client_id(0) {
+  _mux = portMUX_INITIALIZER_UNLOCKED;
+}
+
+void WsStream::reset() {
+  portENTER_CRITICAL(&_mux);
+  _rx_head = _rx_tail = 0;
+  portEXIT_CRITICAL(&_mux);
+}
+
+void WsStream::push(const uint8_t* data, size_t len) {
+  portENTER_CRITICAL(&_mux);
+  for (size_t i = 0; i < len; i++) {
+    uint16_t next = (_rx_head + 1) % sizeof(_rx);
+    if (next == _rx_tail) break;   // full: drop the rest (the browser sends one short line at a time)
+    _rx[_rx_head] = data[i];
+    _rx_head = next;
+  }
+  portEXIT_CRITICAL(&_mux);
+}
+
+int WsStream::available() {
+  portENTER_CRITICAL(&_mux);
+  int n = (_rx_head - _rx_tail + sizeof(_rx)) % sizeof(_rx);
+  portEXIT_CRITICAL(&_mux);
+  return n;
+}
+
+int WsStream::peek() {
+  portENTER_CRITICAL(&_mux);
+  int b = (_rx_head == _rx_tail) ? -1 : _rx[_rx_tail];
+  portEXIT_CRITICAL(&_mux);
+  return b;
+}
+
+int WsStream::read() {
+  portENTER_CRITICAL(&_mux);
+  int b = -1;
+  if (_rx_head != _rx_tail) {
+    b = _rx[_rx_tail];
+    _rx_tail = (_rx_tail + 1) % sizeof(_rx);
+  }
+  portEXIT_CRITICAL(&_mux);
+  return b;
+}
+
+size_t WsStream::write(const uint8_t* buf, size_t len) {
+  if (client_id == 0) return len;   // nobody listening
+  size_t done = 0;
+  while (done < len) {
+    if (_tx_len == sizeof(_tx)) {
+      flush();
+      if (_tx_len == sizeof(_tx)) break;   // client's queue is full: drop (collector RESUME recovers frames)
+    }
+    size_t n = min(len - done, sizeof(_tx) - _tx_len);
+    memcpy(&_tx[_tx_len], &buf[done], n);
+    _tx_len += n;
+    done += n;
+  }
+  return done;
+}
+
+void WsStream::flush() {
+  uint32_t id = client_id;
+  if (_tx_len == 0 || id == 0 || ws == NULL) return;
+  if (!ws->availableForWrite(id)) return;   // keep buffering until the client drains
+  ws->binary(id, _tx, _tx_len);
+  _tx_len = 0;
+}
+
+// ------------------------------------------------------------------ CollectorWifi
 
 CollectorWifi::CollectorWifi() {
   memset(&_cfg, 0, sizeof(_cfg));
@@ -17,10 +94,13 @@ CollectorWifi::CollectorWifi() {
   _fs = NULL;
   _admin_pass = "";
   _server = NULL;
-  _authed = false;
+  _http = NULL;
+  for (int i = 0; i < COLLECTOR_WIFI_LINKS; i++) {
+    _authed[i] = false;
+    _session[i] = 0;
+  }
   _services_started = false;
   _ota_active = false;
-  _session = 0;
   _host[0] = 0;
   _ota_pass[0] = 0;
 }
@@ -77,6 +157,51 @@ void CollectorWifi::connect() {
   WiFi.begin(_cfg.ssid, _cfg.pass);
 }
 
+void CollectorWifi::startWeb() {
+  _http = new AsyncWebServer(80);
+  AsyncWebSocket* ws = new AsyncWebSocket("/ws");
+  _ws.ws = ws;
+
+  // Runs on the async TCP task: only touch the stream buffers and the volatile link state here.
+  ws->onEvent([this](AsyncWebSocket* server, AsyncWebSocketClient* client, AwsEventType type, void* arg,
+                     uint8_t* data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+      uint32_t old = _ws.client_id;
+      _ws.reset();
+      _authed[WIFI_LINK_WS] = false;
+      _ws.client_id = client->id();
+      _session[WIFI_LINK_WS]++;
+      if (old) server->close(old);   // a new connection replaces the old one
+      client->setCloseClientOnQueueFull(false);
+      client->binary(LOGIN_BANNER);
+    } else if (type == WS_EVT_DISCONNECT) {
+      if (client->id() == _ws.client_id) {
+        _ws.client_id = 0;
+        _authed[WIFI_LINK_WS] = false;
+      }
+    } else if (type == WS_EVT_DATA) {
+      if (client->id() == _ws.client_id) _ws.push(data, len);
+    }
+  });
+  _http->addHandler(ws);
+
+  _http->on("/", HTTP_GET, [this](AsyncWebServerRequest* request) {
+    char page[200];
+    snprintf(page, sizeof(page),
+             "MeshCore collector repeater (%s)\n\nws://%s.local/ws  - CLI + collector stream\n"
+             "/update           - firmware upload\n", _host, _host);
+    request->send(200, "text/plain", page);
+  });
+
+  // browser firmware upload; HTTP basic auth, user "admin"
+  static char ota_id[48];
+  snprintf(ota_id, sizeof(ota_id), "%s (collector)", _host);
+  AsyncElegantOTA.setID(ota_id);
+  AsyncElegantOTA.begin(_http, "admin", _ota_pass);
+
+  _http->begin();
+}
+
 void CollectorWifi::startServices() {
   _server = new WiFiServer(_cfg.port);
   _server->begin();
@@ -87,7 +212,7 @@ void CollectorWifi::startServices() {
   ArduinoOTA.onStart([this]() {
     _ota_active = true;
     if (_client) _client.stop();   // the transfer blocks the loop; drop the stream cleanly first
-    _authed = false;
+    _authed[WIFI_LINK_TCP] = false;
     Serial.println("OTA: update started");
   });
   ArduinoOTA.onEnd([]() { Serial.println("OTA: done, rebooting"); });
@@ -97,9 +222,13 @@ void CollectorWifi::startServices() {
   });
   ArduinoOTA.begin();   // also starts mDNS as <host>.local
   MDNS.addService("meshcore", "tcp", _cfg.port);
+  MDNS.addService("http", "tcp", 80);
+
+  startWeb();
 
   _services_started = true;
-  Serial.printf("WiFi: %s  ip=%s  tcp port %u\n", _host, WiFi.localIP().toString().c_str(), _cfg.port);
+  Serial.printf("WiFi: %s  ip=%s  tcp port %u, http/ws port 80\n", _host, WiFi.localIP().toString().c_str(),
+                _cfg.port);
 }
 
 void CollectorWifi::loop() {
@@ -117,28 +246,39 @@ void CollectorWifi::loop() {
     if (_client) _client.stop();
     _client = incoming;
     _client.setNoDelay(true);
-    _authed = false;
-    _session++;
-    _client.print("MeshCore collector - send: auth <admin password>\r\n");
+    _authed[WIFI_LINK_TCP] = false;
+    _session[WIFI_LINK_TCP]++;
+    _client.print(LOGIN_BANNER);
   }
   if (_client && !_client.connected()) {
     _client.stop();
-    _authed = false;
+    _authed[WIFI_LINK_TCP] = false;
+  }
+
+  _ws.flush();
+  static unsigned long next_cleanup = 0;
+  if (millis() > next_cleanup) {
+    _ws.ws->cleanupClients(2);
+    next_cleanup = millis() + 1000;
   }
 }
 
 Stream* CollectorWifi::client() {
-  return (_authed && _client.connected()) ? &_client : NULL;
+  if (_authed[WIFI_LINK_TCP] && _client.connected()) return &_client;
+  if (_authed[WIFI_LINK_WS] && _ws.client_id) return &_ws;
+  return NULL;
 }
 
-Stream* CollectorWifi::rawClient() {
-  return _client.connected() ? &_client : NULL;
+Stream* CollectorWifi::linkInput(int link) {
+  if (link == WIFI_LINK_TCP) return _client.connected() ? &_client : NULL;
+  if (link == WIFI_LINK_WS) return _ws.client_id ? &_ws : NULL;
+  return NULL;
 }
 
-bool CollectorWifi::handleAuth(const char* line, char* reply) {
-  if (_authed) return false;
+bool CollectorWifi::handleAuth(int link, const char* line, char* reply) {
+  if (_authed[link]) return false;
   if (memcmp(line, "auth ", 5) == 0 && _admin_pass[0] && strcmp(&line[5], _admin_pass) == 0) {
-    _authed = true;
+    _authed[link] = true;
     strcpy(reply, "OK - authenticated");
   } else {
     strcpy(reply, "Err - auth required: auth <admin password>");
@@ -147,6 +287,11 @@ bool CollectorWifi::handleAuth(const char* line, char* reply) {
 }
 
 bool CollectorWifi::handleCommand(const char* command, bool is_local, char* reply) {
+  if (_services_started && strcmp(command, "start ota") == 0) {
+    // the stock OTA server would collide with ours on port 80
+    snprintf(reply, 160, "OK - WiFi is up: open http://%s.local/update (user admin, admin password)", _host);
+    return true;
+  }
   if (memcmp(command, "wifi", 4) != 0 || (command[4] != 0 && command[4] != ' ')) return false;
   const char* sub = command + 4;
   while (*sub == ' ') sub++;
@@ -155,15 +300,17 @@ bool CollectorWifi::handleCommand(const char* command, bool is_local, char* repl
     if (!isRunning()) {
       sprintf(reply, "wifi off%s", _cfg.ssid[0] ? "" : " (no ssid set)");
     } else if (WiFi.status() == WL_CONNECTED) {
-      snprintf(reply, 160, "wifi connected ssid=%s ip=%s rssi=%d host=%s.local port=%u client=%s heap=%u",
-               _cfg.ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), _host, _cfg.port,
-               client() ? "yes" : (rawClient() ? "unauthed" : "no"), (unsigned)ESP.getFreeHeap());
+      snprintf(reply, 160, "wifi connected ssid=%s ip=%s rssi=%d host=%s.local tcp=%s ws=%s heap=%u",
+               _cfg.ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), _host,
+               _authed[WIFI_LINK_TCP] ? "yes" : (linkInput(WIFI_LINK_TCP) ? "unauthed" : "no"),
+               _authed[WIFI_LINK_WS] ? "yes" : (linkInput(WIFI_LINK_WS) ? "unauthed" : "no"),
+               (unsigned)ESP.getFreeHeap());
     } else {
       snprintf(reply, 160, "wifi connecting ssid=%s (status %d)", _cfg.ssid, (int)WiFi.status());
     }
     return true;
   }
-  if (!is_local) {   // credentials and on/off only from USB serial or an authenticated TCP session
+  if (!is_local) {   // credentials and on/off only from USB serial or a logged-in network link
     strcpy(reply, "Err - wifi settings are local only");
     return true;
   }
@@ -189,7 +336,7 @@ bool CollectorWifi::handleCommand(const char* command, bool is_local, char* repl
     _cfg.enabled = 0;
     saveConfig();
     if (_client) _client.stop();
-    _authed = false;
+    _authed[WIFI_LINK_TCP] = _authed[WIFI_LINK_WS] = false;
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     strcpy(reply, "OK - wifi off");
