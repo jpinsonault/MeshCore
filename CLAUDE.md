@@ -223,6 +223,13 @@ CLI command, enabling full chat participation from the TUI.
 - [x] Node list activity: filterable by type (repeaters, rooms, all nodes)
 - [x] Restructured sidebar: channels + network nav + status sections
 - [x] Type-specific node detail sections (repeater/room server info)
+- [x] GPU brute-force cracker: CUDA SHA-256 kernel via CuPy (`brute_force_gpu.py`), ~2.2G candidates/s on an RTX 5060 Ti (~240x the CPU path); auto-detects, CPU fallback
+- [x] Collision guard: strict GRP_TXT plaintext validation + multi-packet cross-check so brute-force returns None instead of a 2-byte-MAC false positive when the name is outside the search space
+- [x] Catalog wordlist: `data/meshcore_channels.txt` (~2.7K community hashtag channels, CC0) auto-loaded by the passive cracker on top of its built-in list
+- [x] Cracker web app (`collector/webapp/`): stdlib HTTP server + vanilla-JS page; GPU status, pending unknown channels, per-hash crack (dictionary-first, then GPU brute-force), raw-packet paste, live progress, decoded results. Offline mode cracks a stored DB without hardware; `--live`/Portico mode collects + serves
+- [x] Crack queue: FIFO worker processing manual/pasted/auto jobs one at a time, each cancelable (`/api/crack/cancel`); brute-forcers take a `should_stop` callback so a running grind aborts
+- [x] Auto-crack: when on, pending channels are cracked automatically — dictionary first, then queued for GPU brute-force on a miss (CPU hosts stay dictionary-only; `auto_dict_only` to force it)
+- [x] Core auto-reconnect: `core._run` reconnects with backoff after a dropped/failed link (firmware ring buffer replays the gap); `reconnect=False` for one-shot use
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -248,9 +255,13 @@ CLI command, enabling full chat participation from the TUI.
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/brute_force.py` — Multicore brute-force channel cracker (ProcessPoolExecutor, SHA-256 + HMAC + AES)
+- `collector/brute_force.py` — Multicore CPU brute-force channel cracker (ProcessPoolExecutor, SHA-256 + HMAC + AES); strict GRP_TXT validation + optional sibling-packet cross-check
+- `collector/brute_force_gpu.py` — GPU brute-force cracker: custom CUDA SHA-256 RawKernel via CuPy, on-GPU hash + 2-byte-MAC filter, CPU verify of survivors; same signature as the CPU path, `is_available()`/`gpu_name()` gate it. Needs `cupy-cuda12x` (installed in `collector/.venv`)
+- `collector/data/meshcore_channels.txt` — bundled hashtag-channel catalog (~2.7K names, CC0, from github.com/marcelverdult/meshcore-channels); auto-loaded by `cracker.py`
+- `collector/webapp/` — cracker web app: `cracker_app.py` (mode-agnostic logic), `server.py` (stdlib HTTP), `static/index.html` (vanilla-JS UI), `__main__.py` (`python -m collector.webapp --db <path>` offline, or `--port COMx` live; `--cpu` forces CPU). `--http-port` defaults to `$PORT` when set (Portico) else 8090
+- `collector/cracker.portico.toml` — Portico manifest: registers the web app as `http://cracker.localhost/` (autostart on logon, never idle-stops), offline mode against the durable DB `~/.config/meshcore-collector/collector.db`. Runs via the GPU venv (`collector\.venv\Scripts\python.exe`). The porticod daemon (repos/portico) is already a logon task, so the service comes back on Windows start. Dev loop: edit code, then `curl -X POST -H "Content-Type: application/json" -d '{}' http://portico.localhost/api/apps/cracker/restart` (static-asset edits just need a browser refresh)
 - `collector/activities/node_list.py` — Scrollable node list filtered by adv_type (repeaters, rooms, all)
-- `collector/tests/` — 740 automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker, send, brute force, public channel, undecryptable, node list)
+- `collector/tests/` — automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker, send, brute force [CPU + GPU], webapp, public channel, undecryptable, node list)
 - `collector/tests/system/` — 14 hardware-in-the-loop system tests (require MESHCORE_PORT env var)
 - `collector/tests/system/test_radio.py` — 7 tests: single-board send echo, single-board send+crack, two-board dictionary intercept+crack, two-board brute-force crack (no wordlist), two-board RX_RAW capture, two-board decrypt, two-board advertisement (two-board tests require MESHCORE_SENDER_PORT)
 - `collector/collector_test.py` — Device-to-PC API validation test
