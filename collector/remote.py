@@ -169,6 +169,7 @@ def flash_main(firmware):
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     espota = load_espota()
     espota.PROGRESS = True
+    espota.TIMEOUT = 10   # normally set by espota.main(), which we bypass
     rc = espota.serve(ip, "0.0.0.0", 3232, random.randint(10000, 60000), password, str(firmware), espota.FLASH)
     if rc != 0:
         raise RemoteError("Network update failed (is the firewall allowing Python?)")
