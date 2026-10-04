@@ -8,7 +8,9 @@ import time
 import pytest
 
 from collector.core import CollectorCore, is_network_port
-from collector.protocol import FRAME_START, FRAME_TYPE_HANDSHAKE, FRAME_TYPE_HEARTBEAT, crc16_ccitt
+from collector.protocol import (
+    FRAME_START, FRAME_TYPE_HANDSHAKE, FRAME_TYPE_HEARTBEAT, FRAME_TYPE_BOOT_INFO, crc16_ccitt,
+)
 from collector.tests.packet_helpers import temp_file
 
 PASSWORD = "s3cret"
@@ -26,6 +28,12 @@ def _v2_frame(frame_type, seq, payload):
 
 def _hb_payload():
     return struct.pack("<IHIIIIBI", 1700000000, 3700, 0, 0, 0, 0, 10, 100)
+
+
+def _boot_payload(reset_reason=5, flags=0x01, boot_count=2, prev_uptime=1800,
+                  prev_heap_min=38000, prev_rssi=-72, prev_err=0):
+    return struct.pack("<BBHIIhH", reset_reason, flags, boot_count, prev_uptime,
+                       prev_heap_min, prev_rssi, prev_err)
 
 
 class FakeWifiDevice:
@@ -86,7 +94,8 @@ class FakeWifiDevice:
                         payload = b"COLLECTOR" + bytes([2]) + struct.pack("<II", 0, 0)
                         conn.sendall(_v1_frame(FRAME_TYPE_HANDSHAKE, payload))
                         self._reply(conn, "OK")
-                        conn.sendall(_v2_frame(FRAME_TYPE_HEARTBEAT, 1, _hb_payload()))
+                        conn.sendall(_v2_frame(FRAME_TYPE_BOOT_INFO, 1, _boot_payload()))
+                        conn.sendall(_v2_frame(FRAME_TYPE_HEARTBEAT, 2, _hb_payload()))
 
     def close(self):
         self._srv.close()
@@ -198,6 +207,17 @@ def _wait_for_event(store, event, timeout=3.0):
     return []
 
 
+def _wait_for_boot(store, timeout=3.0):
+    """Poll the durable device-boot log until a row appears."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = store.get_device_boots()
+        if rows:
+            return rows
+        time.sleep(0.05)
+    return []
+
+
 class TestConnectionLog:
     """The durable link up/down log and the idle watchdog (core.py)."""
 
@@ -210,6 +230,23 @@ class TestConnectionLog:
         finally:
             core.stop()
             core.store.close()   # close this thread's connection before temp cleanup (Windows)
+            tmp.__exit__(None, None, None)
+            dev.close()
+
+    def test_boot_info_recorded(self):
+        dev = FakeWifiDevice()
+        core, ev, tmp = _run_core(f"socket://127.0.0.1:{dev.port}", PASSWORD, "heartbeat")
+        try:
+            boots = _wait_for_boot(core.store)
+            assert boots, "BOOT_INFO was not recorded"
+            assert boots[0]["reset_name"] == "task watchdog"
+            assert boots[0]["boot_count"] == 2
+            assert boots[0]["prev_rssi"] == -72
+            # a human-readable boot line is surfaced to the log
+            assert any("device boot" in t for t in ev["text"])
+        finally:
+            core.stop()
+            core.store.close()
             tmp.__exit__(None, None, None)
             dev.close()
 

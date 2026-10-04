@@ -18,7 +18,23 @@ FRAME_TYPE_TX_RAW = 0xD1
 FRAME_TYPE_ADVERTISEMENT = 0xD2
 FRAME_TYPE_HEARTBEAT = 0xD3
 FRAME_TYPE_DIAGNOSTICS = 0xD4
+FRAME_TYPE_BOOT_INFO = 0xD5
 FRAME_TYPE_HANDSHAKE = 0xDF
+
+# BOOT_INFO reset causes (must match CollectorSerial.h).
+RESET_REASONS = {
+    0: "unknown",
+    1: "power-on",
+    2: "software",
+    3: "panic/crash",
+    4: "interrupt watchdog",
+    5: "task watchdog",
+    6: "watchdog",
+    7: "brownout",
+    8: "deep-sleep wake",
+    9: "external reset",
+}
+BOOT_FLAG_PREV_ALIVE = 0x01
 
 # Host -> Device frame types
 FRAME_TYPE_HOST_ACK = 0xA0
@@ -30,6 +46,7 @@ FRAME_TYPE_NAMES = {
     FRAME_TYPE_ADVERTISEMENT: "ADVERTISEMENT",
     FRAME_TYPE_HEARTBEAT: "HEARTBEAT",
     FRAME_TYPE_DIAGNOSTICS: "DIAGNOSTICS",
+    FRAME_TYPE_BOOT_INFO: "BOOT_INFO",
     FRAME_TYPE_HANDSHAKE: "HANDSHAKE",
 }
 
@@ -254,6 +271,33 @@ def parse_diagnostics(payload):
     }
 
 
+def parse_boot_info(payload):
+    """Parse a BOOT_INFO frame payload (16 bytes).
+
+    Durable boot/crash forensics: why the device last reset, plus the last stats
+    that survived in RTC RAM from the previous run (valid only if PREV_ALIVE set).
+    """
+    if len(payload) < 16:
+        return {"error": f"too short ({len(payload)} bytes, need 16)"}
+    (
+        reset_reason, flags, boot_count,
+        prev_uptime_secs, prev_heap_min,
+        prev_rssi, prev_err_flags,
+    ) = struct.unpack("<BBHIIhH", payload[:16])
+
+    return {
+        "reset_reason": reset_reason,
+        "reset_reason_name": RESET_REASONS.get(reset_reason, f"code {reset_reason}"),
+        "flags": flags,
+        "prev_alive": bool(flags & BOOT_FLAG_PREV_ALIVE),
+        "boot_count": boot_count,
+        "prev_uptime_secs": prev_uptime_secs,
+        "prev_heap_min": prev_heap_min,
+        "prev_rssi": prev_rssi,
+        "prev_err_flags": prev_err_flags,
+    }
+
+
 def parse_handshake(payload):
     """Parse a HANDSHAKE frame payload.
 
@@ -281,6 +325,7 @@ FRAME_PARSERS = {
     FRAME_TYPE_ADVERTISEMENT: parse_advertisement,
     FRAME_TYPE_HEARTBEAT: parse_heartbeat,
     FRAME_TYPE_DIAGNOSTICS: parse_diagnostics,
+    FRAME_TYPE_BOOT_INFO: parse_boot_info,
     FRAME_TYPE_HANDSHAKE: parse_handshake,
 }
 

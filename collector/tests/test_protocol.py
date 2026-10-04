@@ -23,6 +23,7 @@ from collector.protocol import (
     parse_rx_raw,
     parse_tx_raw,
     parse_advertisement,
+    parse_boot_info,
 )
 
 
@@ -119,6 +120,31 @@ class TestParseHeartbeat:
     def test_too_short(self):
         result = parse_heartbeat(b"\x00" * 10)
         assert "error" in result
+
+
+class TestParseBootInfo:
+    def _payload(self, reset_reason=5, flags=0x01, boot_count=7,
+                 prev_uptime=3600, prev_heap_min=42000, prev_rssi=-67, prev_err=0):
+        return struct.pack("<BBHIIhH", reset_reason, flags, boot_count,
+                           prev_uptime, prev_heap_min, prev_rssi, prev_err)
+
+    def test_valid_crash(self):
+        result = parse_boot_info(self._payload())
+        assert result["reset_reason"] == 5
+        assert result["reset_reason_name"] == "task watchdog"
+        assert result["prev_alive"] is True
+        assert result["boot_count"] == 7
+        assert result["prev_uptime_secs"] == 3600
+        assert result["prev_heap_min"] == 42000
+        assert result["prev_rssi"] == -67
+
+    def test_cold_boot_no_prior(self):
+        result = parse_boot_info(self._payload(reset_reason=1, flags=0x00))
+        assert result["reset_reason_name"] == "power-on"
+        assert result["prev_alive"] is False
+
+    def test_too_short(self):
+        assert "error" in parse_boot_info(b"\x00" * 8)
 
 
 class TestParseRxRaw:

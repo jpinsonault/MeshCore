@@ -351,3 +351,44 @@ class TestGetAdvertisementSnrHistory:
         result_b = store.get_advertisement_snr_history("bb" * 32)
         assert len(result_a) == 1
         assert len(result_b) == 1
+
+
+class TestConnectionEvents:
+    def test_record_and_read(self, store):
+        store.record_connection_event("connected", detail="protocol v2", gap_secs=None, now=100.0)
+        store.record_connection_event("disconnected", detail="link idle", gap_secs=12.5, now=200.0)
+        events = store.get_connection_events()
+        assert len(events) == 2
+        assert events[0]["event"] == "disconnected"   # newest first
+        assert events[0]["gap_secs"] == 12.5
+        assert events[1]["event"] == "connected"
+
+
+class TestDeviceBoots:
+    def _boot(self, boot_count=3, reset_reason=5, prev_uptime=3600):
+        return {
+            "reset_reason": reset_reason, "reset_reason_name": "task watchdog",
+            "boot_count": boot_count, "prev_alive": True, "prev_uptime_secs": prev_uptime,
+            "prev_heap_min": 40000, "prev_rssi": -70, "prev_err_flags": 0,
+        }
+
+    def test_store_new_boot(self, store):
+        assert store.store_device_boot(self._boot(), now=1.0) is True
+        boots = store.get_device_boots()
+        assert len(boots) == 1
+        assert boots[0]["reset_name"] == "task watchdog"
+        assert boots[0]["boot_count"] == 3
+        assert boots[0]["prev_alive"] == 1
+
+    def test_dedup_same_boot(self, store):
+        # The device re-reports the same boot on each reconnect; the ring can replay it.
+        assert store.store_device_boot(self._boot(), now=1.0) is True
+        assert store.store_device_boot(self._boot(), now=2.0) is False
+        assert store.store_device_boot(self._boot(), now=3.0) is False
+        assert len(store.get_device_boots()) == 1
+
+    def test_new_boot_after_reboot(self, store):
+        assert store.store_device_boot(self._boot(boot_count=3), now=1.0) is True
+        # a real reboot -> higher boot_count -> new row
+        assert store.store_device_boot(self._boot(boot_count=4, prev_uptime=10), now=2.0) is True
+        assert len(store.get_device_boots()) == 2

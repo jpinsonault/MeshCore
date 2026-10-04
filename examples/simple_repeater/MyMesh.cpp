@@ -1,6 +1,10 @@
 #include "MyMesh.h"
 #include <algorithm>
 
+#if defined(ESP32)
+  #include "esp_system.h"   // esp_reset_reason()
+#endif
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -40,6 +44,98 @@
 #else
   #define COLLECTOR_HEAP_STATS  0, 0, 0
 #endif
+
+/* --------------------- Collector boot/crash forensics -----------------------
+   Durable device logging that survives a reboot. The "last alive" snapshot lives
+   in RTC RAM: it survives a watchdog, panic, or software reset (wiped only by a
+   full power loss / brownout), and costs zero flash wear to update every loop.
+   The reset cause comes from esp_reset_reason(). Reported once per (re)connect in
+   a BOOT_INFO frame so the host records *why* the device last went down even
+   though its RAM is gone. Non-ESP32 platforms report UNKNOWN / zeros. */
+
+#define COLLECTOR_BOOTINFO_MAGIC 0x4D43424FUL  // 'MCBO'
+
+#if defined(ESP32)
+RTC_NOINIT_ATTR static struct {
+  uint32_t magic;
+  uint16_t boot_count;
+  uint32_t uptime_secs;
+  uint32_t heap_min;
+  int16_t  rssi;
+  uint16_t err_flags;
+} _rtc_boot;
+#endif
+
+// Snapshot captured once at begin() and sent on every (re)connect.
+static struct {
+  uint8_t  reset_reason;
+  uint8_t  flags;              // COLLECTOR_BOOT_PREV_ALIVE
+  uint16_t boot_count;         // reboots since the last power-on (RTC-backed)
+  uint32_t prev_uptime_secs;   // how long the previous run lasted before it died
+  uint32_t prev_heap_min;      // min free heap seen in the previous run
+  int16_t  prev_rssi;          // last WiFi RSSI in the previous run
+  uint16_t prev_err_flags;     // last error flags in the previous run
+} _boot_info;
+
+static uint8_t collectorMapResetReason() {
+#if defined(ESP32)
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return COLLECTOR_RESET_POWERON;
+    case ESP_RST_SW:        return COLLECTOR_RESET_SW;
+    case ESP_RST_PANIC:     return COLLECTOR_RESET_PANIC;
+    case ESP_RST_INT_WDT:   return COLLECTOR_RESET_WDT_INT;
+    case ESP_RST_TASK_WDT:  return COLLECTOR_RESET_WDT_TASK;
+    case ESP_RST_WDT:       return COLLECTOR_RESET_WDT_OTHER;
+    case ESP_RST_BROWNOUT:  return COLLECTOR_RESET_BROWNOUT;
+    case ESP_RST_DEEPSLEEP: return COLLECTOR_RESET_DEEPSLEEP;
+    case ESP_RST_EXT:       return COLLECTOR_RESET_EXT;
+    default:                return COLLECTOR_RESET_UNKNOWN;
+  }
+#else
+  return COLLECTOR_RESET_UNKNOWN;
+#endif
+}
+
+static void collectorBootInfoBegin() {
+  memset(&_boot_info, 0, sizeof(_boot_info));
+  _boot_info.reset_reason = collectorMapResetReason();
+#if defined(ESP32)
+  bool prev_valid = (_rtc_boot.magic == COLLECTOR_BOOTINFO_MAGIC);
+  // A cold boot (power-on / brownout) wipes RTC RAM; start the counter fresh and
+  // report that no prior-run stats survived.
+  if (!prev_valid || _boot_info.reset_reason == COLLECTOR_RESET_POWERON
+                  || _boot_info.reset_reason == COLLECTOR_RESET_BROWNOUT) {
+    _rtc_boot.magic = COLLECTOR_BOOTINFO_MAGIC;
+    _rtc_boot.boot_count = 0;
+  } else {
+    _boot_info.flags |= COLLECTOR_BOOT_PREV_ALIVE;
+    _boot_info.prev_uptime_secs = _rtc_boot.uptime_secs;
+    _boot_info.prev_heap_min = _rtc_boot.heap_min;
+    _boot_info.prev_rssi = _rtc_boot.rssi;
+    _boot_info.prev_err_flags = _rtc_boot.err_flags;
+  }
+  _rtc_boot.boot_count++;
+  _boot_info.boot_count = _rtc_boot.boot_count;
+  // Reset the live snapshot for this run.
+  _rtc_boot.uptime_secs = 0;
+  _rtc_boot.heap_min = 0;
+  _rtc_boot.rssi = 0;
+  _rtc_boot.err_flags = 0;
+#endif
+}
+
+// Refresh the RTC "last alive" snapshot (cheap RAM write, no flash wear).
+static void collectorBootInfoAlive(uint32_t uptime_secs, uint32_t heap_min,
+                                   int16_t rssi, uint16_t err_flags) {
+#if defined(ESP32)
+  _rtc_boot.uptime_secs = uptime_secs;
+  _rtc_boot.heap_min = heap_min;
+  _rtc_boot.rssi = rssi;
+  _rtc_boot.err_flags = err_flags;
+#else
+  (void)uptime_secs; (void)heap_min; (void)rssi; (void)err_flags;
+#endif
+}
 
 #ifndef SERVER_RESPONSE_DELAY
   #define SERVER_RESPONSE_DELAY 300
@@ -966,6 +1062,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
+  collectorBootInfoBegin();   // capture reset cause + prior-run snapshot before anything else can reset
   _fs = fs;
 #if defined(ESP32) && defined(COLLECTOR_WIFI)
   _collector.begin(collector_link);   // TCP client when logged in, else USB serial
@@ -1344,6 +1441,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       _next_heartbeat = futureMillis(COLLECTOR_HEARTBEAT_INTERVAL);
       _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
       _collector.sendHandshake();
+      // Durable boot/crash report: why the device last went down, from RTC RAM.
+      _collector.sendBootInfo(_boot_info.reset_reason, _boot_info.flags, _boot_info.boot_count,
+                              _boot_info.prev_uptime_secs, _boot_info.prev_heap_min,
+                              _boot_info.prev_rssi, _boot_info.prev_err_flags);
       strcpy(reply, "OK");
     } else if (strcmp(sub, "stop") == 0) {
       _collector_enabled = false;
@@ -1581,6 +1682,17 @@ void MyMesh::loop() {
       radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
     );
     _next_diagnostics = futureMillis(COLLECTOR_DIAG_INTERVAL);
+    // Refresh the RTC "last alive" snapshot so a later hard hang / reset leaves a
+    // forensic trail (zero flash wear — it's RTC RAM).
+#if defined(ESP32)
+  #if defined(COLLECTOR_WIFI)
+    int16_t wifi_rssi = (int16_t)(collector_wifi.isRunning() ? WiFi.RSSI() : 0);
+  #else
+    int16_t wifi_rssi = 0;
+  #endif
+    collectorBootInfoAlive((uint32_t)(uptime_millis / 1000), ESP.getMinFreeHeap(),
+                           wifi_rssi, _err_flags);
+#endif
   }
 
   // drain collector ring buffer — 1 frame normally, up to 4 during replay catch-up

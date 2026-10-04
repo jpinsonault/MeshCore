@@ -20,7 +20,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -183,6 +183,26 @@ CREATE TABLE IF NOT EXISTS connection_events (
 CREATE INDEX IF NOT EXISTS idx_connection_events_ts ON connection_events(timestamp);
 """
 
+# Durable device boot/crash log. Each row is one device reboot as reported in a
+# BOOT_INFO frame: the reset cause plus the last stats that survived in the
+# device's RTC RAM from the run that died. This is the forensic trail that
+# survives the device losing all its RAM on reboot.
+SCHEMA_V10_SQL = """
+CREATE TABLE IF NOT EXISTS device_boots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp        REAL NOT NULL,   -- when the host first saw this boot
+    reset_reason     INTEGER,
+    reset_name       TEXT,
+    boot_count       INTEGER,
+    prev_alive       INTEGER,         -- 1 if prior-run stats survived (not a cold boot)
+    prev_uptime_secs INTEGER,         -- how long the previous run lasted before it died
+    prev_heap_min    INTEGER,
+    prev_rssi        INTEGER,
+    prev_err_flags   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_device_boots_ts ON device_boots(timestamp);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -299,6 +319,14 @@ class CollectorStore:
                 (str(9),),
             )
             current = 9
+
+        if current < 10:
+            self._conn.executescript(SCHEMA_V10_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(10),),
+            )
+            current = 10
 
     def close(self):
         if self._is_memory:
@@ -652,6 +680,43 @@ class CollectorStore:
         """Return recent connection events, newest first."""
         rows = self._conn.execute(
             "SELECT * FROM connection_events ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Device boot/crash log ---
+
+    def store_device_boot(self, parsed, now=None):
+        """Record a device reboot from a parsed BOOT_INFO frame. Dedups against the
+        most recent row — the device re-sends the same report on every reconnect and
+        the ring may replay it — so only a genuinely new boot is inserted. Returns
+        True if a new boot was recorded, False if it was a duplicate."""
+        sig = (parsed.get("boot_count"), parsed.get("reset_reason"),
+               parsed.get("prev_uptime_secs"))
+        last = self._conn.execute(
+            "SELECT boot_count, reset_reason, prev_uptime_secs FROM device_boots "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if last is not None and (last["boot_count"], last["reset_reason"],
+                                 last["prev_uptime_secs"]) == sig:
+            return False
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO device_boots (timestamp, reset_reason, reset_name, "
+                "boot_count, prev_alive, prev_uptime_secs, prev_heap_min, prev_rssi, "
+                "prev_err_flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now if now is not None else time.time(),
+                 parsed.get("reset_reason"), parsed.get("reset_reason_name"),
+                 parsed.get("boot_count"), 1 if parsed.get("prev_alive") else 0,
+                 parsed.get("prev_uptime_secs"), parsed.get("prev_heap_min"),
+                 parsed.get("prev_rssi"), parsed.get("prev_err_flags")),
+            )
+        return True
+
+    def get_device_boots(self, limit=100):
+        """Return recent device boot/crash records, newest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM device_boots ORDER BY timestamp DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

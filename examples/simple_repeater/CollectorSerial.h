@@ -12,7 +12,23 @@
 #define COLLECTOR_ADVERTISEMENT 0xD2
 #define COLLECTOR_HEARTBEAT     0xD3
 #define COLLECTOR_DIAGNOSTICS   0xD4
+#define COLLECTOR_BOOT_INFO     0xD5
 #define COLLECTOR_HANDSHAKE     0xDF
+
+// Reset causes reported in BOOT_INFO (stable wire values, mapped from the
+// platform's reset-reason API so the host doesn't depend on IDF enum numbering).
+#define COLLECTOR_RESET_UNKNOWN   0
+#define COLLECTOR_RESET_POWERON   1
+#define COLLECTOR_RESET_SW        2
+#define COLLECTOR_RESET_PANIC     3
+#define COLLECTOR_RESET_WDT_INT   4
+#define COLLECTOR_RESET_WDT_TASK  5
+#define COLLECTOR_RESET_WDT_OTHER 6
+#define COLLECTOR_RESET_BROWNOUT  7
+#define COLLECTOR_RESET_DEEPSLEEP 8
+#define COLLECTOR_RESET_EXT       9
+// BOOT_INFO flags bitfield
+#define COLLECTOR_BOOT_PREV_ALIVE 0x01   // a prior-run snapshot survived (not a cold boot)
 
 // Host -> Device frame types
 #define HOST_ACK                0xA0
@@ -384,6 +400,24 @@ public:
     memcpy(buf + pos, &n_recv, 4); pos += 4;
     memcpy(buf + pos, &n_sent, 4); pos += 4;
     ringWrite(COLLECTOR_DIAGNOSTICS, buf, pos);
+  }
+
+  // Durable boot/crash forensics, sent once per (re)connect. Tells the host why
+  // the device last went down even though its RAM is gone — the reset cause plus
+  // the last-known-alive stats that survived in RTC RAM across the reboot.
+  void sendBootInfo(uint8_t reset_reason, uint8_t flags, uint16_t boot_count,
+                    uint32_t prev_uptime_secs, uint32_t prev_heap_min,
+                    int16_t prev_rssi, uint16_t prev_err_flags) {
+    uint8_t buf[16];
+    int pos = 0;
+    buf[pos++] = reset_reason;
+    buf[pos++] = flags;
+    memcpy(buf + pos, &boot_count, 2); pos += 2;
+    memcpy(buf + pos, &prev_uptime_secs, 4); pos += 4;
+    memcpy(buf + pos, &prev_heap_min, 4); pos += 4;
+    memcpy(buf + pos, &prev_rssi, 2); pos += 2;
+    memcpy(buf + pos, &prev_err_flags, 2); pos += 2;
+    ringWrite(COLLECTOR_BOOT_INFO, buf, pos);
   }
 
   void sendHandshake() {

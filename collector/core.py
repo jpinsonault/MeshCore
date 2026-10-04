@@ -28,6 +28,7 @@ from serial.tools import list_ports
 from .envfile import load_env
 
 from .protocol import (
+    FRAME_TYPE_BOOT_INFO,
     FRAME_TYPE_HANDSHAKE,
     FRAME_TYPE_HEARTBEAT,
     FRAME_TYPE_RX_RAW,
@@ -422,6 +423,28 @@ class CollectorCore:
                 pass
             self._last_ack_time = time.monotonic()
 
+    def _handle_boot_info(self, frame):
+        """Record a BOOT_INFO frame and surface a human-readable line for a new boot.
+
+        The device re-sends this on every reconnect and the ring can replay it, so
+        the store dedups; only a genuinely new boot gets logged.
+        """
+        parsed = frame.get("parsed")
+        if not parsed or "error" in parsed:
+            return
+        try:
+            is_new = self._store.store_device_boot(parsed)
+        except Exception:
+            is_new = False
+        if is_new:
+            reason = parsed.get("reset_reason_name", "?")
+            msg = f"[collector] device boot #{parsed.get('boot_count')}: reset={reason}"
+            if parsed.get("prev_alive"):
+                msg += (f" (prev run {parsed.get('prev_uptime_secs')}s,"
+                        f" heap_min {parsed.get('prev_heap_min')},"
+                        f" rssi {parsed.get('prev_rssi')}dBm)")
+            self._fire_text(msg)
+
     def _process_frame(self, frame):
         """Store frame, attempt channel decode, and fire callbacks."""
         seq = frame.get("seq")
@@ -448,6 +471,12 @@ class CollectorCore:
             # Clear replay watermark once we see a frame above it
             if self._replay_above_seq > 0 and seq > self._replay_above_seq:
                 self._replay_above_seq = 0
+
+        if frame["type"] == FRAME_TYPE_BOOT_INFO:
+            self._handle_boot_info(frame)
+            if self.on_frame:
+                self.on_frame(frame)
+            return
 
         raw_packet_id = self._store.store_frame(frame)
         if self.on_frame:
