@@ -39,11 +39,6 @@ int Mesh::searchChannelsByHash(const uint8_t* hash, GroupChannel channels[], int
 }
 
 DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
-  if (pkt->getPayloadVer() > PAYLOAD_VER_1) {  // not supported in this firmware version
-    MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): unsupported packet version", getLogDateTime());
-    return ACTION_RELEASE;
-  }
-
   if (pkt->isRouteDirect() && pkt->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     if (pkt->path_len < MAX_PATH_SIZE) {
       uint8_t i = 0;
@@ -55,10 +50,13 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       uint8_t path_sz = flags & 0x03;  // NEW v1.11+: lower 2 bits is path hash size
 
       uint8_t len = pkt->payload_len - i;
-      uint8_t offset = pkt->path_len << path_sz;
+      // path_len*entry_size can exceed 255 (path_len up to 63, entry_size up to 8);
+      // a uint8_t offset would wrap and steer the isHashMatch() read to the wrong place.
+      uint16_t offset = (uint16_t)pkt->path_len << path_sz;
       if (offset >= len) {   // TRACE has reached end of given path
         onTraceRecv(pkt, trace_tag, auth_code, flags, pkt->path, &pkt->payload[i], len);
-      } else if (self_id.isHashMatch(&pkt->payload[i + offset], 1 << path_sz) && allowPacketForward(pkt) && !_tables->hasSeen(pkt)) {
+      } else if (self_id.isHashMatch(&pkt->payload[i + offset], 1 << path_sz) && allowPacketForward(pkt) && !_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         // append SNR (Not hash!)
         pkt->path[pkt->path_len++] = (int8_t) (pkt->getSNR()*4);
 
@@ -70,14 +68,14 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
   }
 
   if (pkt->isRouteDirect() && pkt->getPayloadType() == PAYLOAD_TYPE_CONTROL && (pkt->payload[0] & 0x80) != 0) {
-    if (pkt->path_len == 0) {
+    if (pkt->getPathHashCount() == 0) {
       onControlDataRecv(pkt);
     }
     // just zero-hop control packets allowed (for this subset of payloads)
     return ACTION_RELEASE;
   }
 
-  if (pkt->isRouteDirect() && pkt->path_len >= PATH_HASH_SIZE) {
+  if (pkt->isRouteDirect() && pkt->getPathHashCount() > 0) {
     // check for 'early received' ACK
     if (pkt->getPayloadType() == PAYLOAD_TYPE_ACK) {
       int i = 0;
@@ -88,18 +86,20 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       }
     }
 
-    if (self_id.isHashMatch(pkt->path) && allowPacketForward(pkt)) {
+    if (self_id.isHashMatch(pkt->path, pkt->getPathHashSize()) && allowPacketForward(pkt)) {
       if (pkt->getPayloadType() == PAYLOAD_TYPE_MULTIPART) {
         return forwardMultipartDirect(pkt);
       } else if (pkt->getPayloadType() == PAYLOAD_TYPE_ACK) {
-        if (!_tables->hasSeen(pkt)) {  // don't retransmit!
+        if (!_tables->wasSeen(pkt)) {  // don't retransmit!
+          _tables->markSeen(pkt);
           removeSelfFromPath(pkt);
           routeDirectRecvAcks(pkt, 0);
         }
         return ACTION_RELEASE;
       }
 
-      if (!_tables->hasSeen(pkt)) {
+      if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         removeSelfFromPath(pkt);
 
         uint32_t d = getDirectRetransmitDelay(pkt);
@@ -120,7 +120,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       memcpy(&ack_crc, &pkt->payload[i], 4); i += 4;
       if (i > pkt->payload_len) {
         MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): incomplete ACK packet", getLogDateTime());
-      } else if (!_tables->hasSeen(pkt)) {
+      } else if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         onAckRecv(pkt, ack_crc);
         action = routeRecvPacket(pkt);
       }
@@ -137,7 +138,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       uint8_t* macAndData = &pkt->payload[i];   // MAC + encrypted data 
       if (i + CIPHER_MAC_SIZE >= pkt->payload_len) {
         MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): incomplete data packet", getLogDateTime());
-      } else if (!_tables->hasSeen(pkt)) {
+      } else if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         // NOTE: this is a 'first packet wins' impl. When receiving from multiple paths, the first to arrive wins.
         //       For flood mode, the path may not be the 'best' in terms of hops.
         // FUTURE: could send back multiple paths, using createPathReturn(), and let sender choose which to use(?)
@@ -158,7 +160,13 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
               if (pkt->getPayloadType() == PAYLOAD_TYPE_PATH) {
                 int k = 0;
                 uint8_t path_len = data[k++];
-                uint8_t* path = &data[k]; k += path_len;
+                if (!Packet::isValidPathLen(path_len)) {
+                  MESH_DEBUG_PRINTLN("%s PAYLOAD_TYPE_PATH, bad path_len: %u", getLogDateTime(), (uint32_t)path_len);
+                  break;   // reject bad encoding
+                }
+                uint8_t hash_size = (path_len >> 6) + 1;
+                uint8_t hash_count = path_len & 63;
+                uint8_t* path = &data[k]; k += hash_size*hash_count;
                 uint8_t extra_type = data[k++] & 0x0F;   // upper 4 bits reserved for future use
                 uint8_t* extra = &data[k];
                 uint8_t extra_len = len - k;   // remainder of packet (may be padded with zeroes!)
@@ -194,7 +202,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       uint8_t* macAndData = &pkt->payload[i];   // MAC + encrypted data 
       if (i + 2 >= pkt->payload_len) {
         MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): incomplete data packet", getLogDateTime());
-      } else if (!_tables->hasSeen(pkt)) {
+      } else if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         if (self_id.isHashMatch(&dest_hash)) {
           Identity sender(sender_pub_key);
 
@@ -221,7 +230,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       uint8_t* macAndData = &pkt->payload[i];   // MAC + encrypted data 
       if (i + 2 >= pkt->payload_len) {
         MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): incomplete data packet", getLogDateTime());
-      } else if (!_tables->hasSeen(pkt)) {
+      } else if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         // scan channels DB, for all matching hashes of 'channel_hash' (max 4 matches supported ATM)
         GroupChannel channels[4];
         int num = searchChannelsByHash(&channel_hash, channels, 4);
@@ -252,7 +262,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
         MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): incomplete advertisement packet", getLogDateTime());
       } else if (self_id.matches(id.pub_key)) {
         MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): receiving SELF advert packet", getLogDateTime());
-      } else if (!_tables->hasSeen(pkt)) {
+      } else if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         uint8_t* app_data = &pkt->payload[i];
         int app_data_len = pkt->payload_len - i;
         if (app_data_len > MAX_ADVERT_DATA_SIZE) { app_data_len = MAX_ADVERT_DATA_SIZE; }
@@ -279,7 +290,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       break;
     }
     case PAYLOAD_TYPE_RAW_CUSTOM: {
-      if (pkt->isRouteDirect() && !_tables->hasSeen(pkt)) {
+      if (pkt->isRouteDirect() && !_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
         onRawDataRecv(pkt);
         //action = routeRecvPacket(pkt);    don't flood route these (yet)
       }
@@ -293,12 +305,12 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
         if (type == PAYLOAD_TYPE_ACK && pkt->payload_len >= 5) {    // a multipart ACK
           Packet tmp;
           tmp.header = pkt->header;
-          tmp.path_len = pkt->path_len;
-          memcpy(tmp.path, pkt->path, pkt->path_len);
+          tmp.path_len = Packet::copyPath(tmp.path, pkt->path, pkt->path_len);
           tmp.payload_len = pkt->payload_len - 1;
           memcpy(tmp.payload, &pkt->payload[1], tmp.payload_len);
 
-          if (!_tables->hasSeen(&tmp)) {
+          if (!_tables->wasSeen(&tmp)) {
+            _tables->markSeen(&tmp);
             uint32_t ack_crc;
             memcpy(&ack_crc, tmp.payload, 4);
 
@@ -321,27 +333,25 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 
 void Mesh::removeSelfFromPath(Packet* pkt) {
   // remove our hash from 'path'
-  pkt->path_len -= PATH_HASH_SIZE;
-#if 0
-  memcpy(pkt->path, &pkt->path[PATH_HASH_SIZE], pkt->path_len);
-#elif PATH_HASH_SIZE == 1
-  for (int k = 0; k < pkt->path_len; k++) {  // shuffle bytes by 1
-    pkt->path[k] = pkt->path[k + 1];
+  pkt->setPathHashCount(pkt->getPathHashCount() - 1);  // decrement the count
+
+  uint8_t sz = pkt->getPathHashSize();
+  for (int k = 0; k < pkt->getPathHashCount()*sz; k += sz) {  // shuffle path by 1 'entry'
+    memcpy(&pkt->path[k], &pkt->path[k + sz], sz);
   }
-#else
-  #error "need path remove impl"
-#endif
 }
 
 DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
+  uint8_t n = packet->getPathHashCount();
   if (packet->isRouteFlood() && !packet->isMarkedDoNotRetransmit()
-    && packet->path_len + PATH_HASH_SIZE <= MAX_PATH_SIZE && allowPacketForward(packet)) {
+    && (n + 1)*packet->getPathHashSize() <= MAX_PATH_SIZE && allowPacketForward(packet)) {
     // append this node's hash to 'path'
-    packet->path_len += self_id.copyHashTo(&packet->path[packet->path_len]);
+    self_id.copyHashTo(&packet->path[n * packet->getPathHashSize()], packet->getPathHashSize());
+    packet->setPathHashCount(n + 1);
 
     uint32_t d = getRetransmitDelay(packet);
     // as this propagates outwards, give it lower and lower priority
-    return ACTION_RETRANSMIT_DELAYED(packet->path_len, d);   // give priority to closer sources, than ones further away
+    return ACTION_RETRANSMIT_DELAYED(packet->getPathHashCount(), d);   // give priority to closer sources, than ones further away
   }
   return ACTION_RELEASE;
 }
@@ -353,12 +363,12 @@ DispatcherAction Mesh::forwardMultipartDirect(Packet* pkt) {
   if (type == PAYLOAD_TYPE_ACK && pkt->payload_len >= 5) {    // a multipart ACK
     Packet tmp;
     tmp.header = pkt->header;
-    tmp.path_len = pkt->path_len;
-    memcpy(tmp.path, pkt->path, pkt->path_len);
+    tmp.path_len = Packet::copyPath(tmp.path, pkt->path, pkt->path_len);
     tmp.payload_len = pkt->payload_len - 1;
     memcpy(tmp.payload, &pkt->payload[1], tmp.payload_len);
 
-    if (!_tables->hasSeen(&tmp)) {   // don't retransmit!
+    if (!_tables->wasSeen(&tmp)) {   // don't retransmit!
+      _tables->markSeen(&tmp);
       removeSelfFromPath(&tmp);
       routeDirectRecvAcks(&tmp, ((uint32_t)remaining + 1) * 300);  // expect multipart ACKs 300ms apart (x2)
     }
@@ -368,15 +378,12 @@ DispatcherAction Mesh::forwardMultipartDirect(Packet* pkt) {
 
 void Mesh::routeDirectRecvAcks(Packet* packet, uint32_t delay_millis) {
   if (!packet->isMarkedDoNotRetransmit()) {
-    uint32_t crc;
-    memcpy(&crc, packet->payload, 4);
-
     uint8_t extra = getExtraAckTransmitCount();
     while (extra > 0) {
       delay_millis += getDirectRetransmitDelay(packet) + 300;
-      auto a1 = createMultiAck(crc, extra);
+      auto a1 = createMultiAck(packet->payload, packet->payload_len, extra);
       if (a1) {
-        memcpy(a1->path, packet->path, a1->path_len = packet->path_len);
+        a1->path_len = Packet::copyPath(a1->path, packet->path, packet->path_len);
         a1->header &= ~PH_ROUTE_MASK;
         a1->header |= ROUTE_TYPE_DIRECT;
         sendPacket(a1, 0, delay_millis);
@@ -384,9 +391,9 @@ void Mesh::routeDirectRecvAcks(Packet* packet, uint32_t delay_millis) {
       extra--;
     }
 
-    auto a2 = createAck(crc);
+    auto a2 = createAck(packet->payload, packet->payload_len);
     if (a2) {
-      memcpy(a2->path, packet->path, a2->path_len = packet->path_len);
+      a2->path_len = Packet::copyPath(a2->path, packet->path, packet->path_len);
       a2->header &= ~PH_ROUTE_MASK;
       a2->header |= ROUTE_TYPE_DIRECT;
       sendPacket(a2, 0, delay_millis);
@@ -439,7 +446,10 @@ Packet* Mesh::createPathReturn(const Identity& dest, const uint8_t* secret, cons
 }
 
 Packet* Mesh::createPathReturn(const uint8_t* dest_hash, const uint8_t* secret, const uint8_t* path, uint8_t path_len, uint8_t extra_type, const uint8_t*extra, size_t extra_len) {
-  if (path_len + extra_len + 5 > MAX_COMBINED_PATH) return NULL;  // too long!!
+  uint8_t path_hash_size = (path_len >> 6) + 1;
+  uint8_t path_hash_count = path_len & 63;
+
+  if (path_hash_count*path_hash_size + extra_len + 5 > MAX_COMBINED_PATH) return NULL;  // too long!!
 
   Packet* packet = obtainNewPacket();
   if (packet == NULL) {
@@ -457,7 +467,7 @@ Packet* Mesh::createPathReturn(const uint8_t* dest_hash, const uint8_t* secret, 
     uint8_t data[MAX_PACKET_PAYLOAD];
 
     data[data_len++] = path_len;
-    memcpy(&data[data_len], path, path_len); data_len += path_len;
+    memcpy(&data[data_len], path, path_hash_count*path_hash_size); data_len += path_hash_count*path_hash_size;
     if (extra_len > 0) {
       data[data_len++] = extra_type;
       memcpy(&data[data_len], extra, extra_len); data_len += extra_len;
@@ -547,7 +557,7 @@ Packet* Mesh::createGroupDatagram(uint8_t type, const GroupChannel& channel, con
   return packet;
 }
 
-Packet* Mesh::createAck(uint32_t ack_crc) {
+Packet* Mesh::createAck(const uint8_t* ack, uint8_t len) {
   Packet* packet = obtainNewPacket();
   if (packet == NULL) {
     MESH_DEBUG_PRINTLN("%s Mesh::createAck(): error, packet pool empty", getLogDateTime());
@@ -555,13 +565,13 @@ Packet* Mesh::createAck(uint32_t ack_crc) {
   }
   packet->header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);  // ROUTE_TYPE_* set later
 
-  memcpy(packet->payload, &ack_crc, 4);
-  packet->payload_len = 4;
+  memcpy(packet->payload, ack, len);
+  packet->payload_len = len;
 
   return packet;
 }
 
-Packet* Mesh::createMultiAck(uint32_t ack_crc, uint8_t remaining) {
+Packet* Mesh::createMultiAck(const uint8_t* ack, uint8_t len, uint8_t remaining) {
   Packet* packet = obtainNewPacket();
   if (packet == NULL) {
     MESH_DEBUG_PRINTLN("%s Mesh::createMultiAck(): error, packet pool empty", getLogDateTime());
@@ -570,8 +580,8 @@ Packet* Mesh::createMultiAck(uint32_t ack_crc, uint8_t remaining) {
   packet->header = (PAYLOAD_TYPE_MULTIPART << PH_TYPE_SHIFT);  // ROUTE_TYPE_* set later
 
   packet->payload[0] = (remaining << 4) | PAYLOAD_TYPE_ACK;
-  memcpy(&packet->payload[1], &ack_crc, 4);
-  packet->payload_len = 5;
+  memcpy(&packet->payload[1], ack, len);
+  packet->payload_len = 1 + len;
 
   return packet;
 }
@@ -624,17 +634,21 @@ Packet* Mesh::createControlData(const uint8_t* data, size_t len) {
   return packet;
 }
 
-void Mesh::sendFlood(Packet* packet, uint32_t delay_millis) {
+void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): TRACE type not suspported", getLogDateTime());
+    return;
+  }
+  if (path_hash_size == 0 || path_hash_size > 3) {
+    MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): invalid path_hash_size", getLogDateTime());
     return;
   }
 
   packet->header &= ~PH_ROUTE_MASK;
   packet->header |= ROUTE_TYPE_FLOOD;
-  packet->path_len = 0;
+  packet->setPathHashSizeAndCount(path_hash_size, 0);
 
-  _tables->hasSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
+  _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
   uint8_t pri;
   if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
@@ -647,9 +661,13 @@ void Mesh::sendFlood(Packet* packet, uint32_t delay_millis) {
   sendPacket(packet, pri, delay_millis);
 }
 
-void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis) {
+void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): TRACE type not suspported", getLogDateTime());
+    return;
+  }
+  if (path_hash_size == 0 || path_hash_size > 3) {
+    MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): invalid path_hash_size", getLogDateTime());
     return;
   }
 
@@ -657,9 +675,9 @@ void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_m
   packet->header |= ROUTE_TYPE_TRANSPORT_FLOOD;
   packet->transport_codes[0] = transport_codes[0];
   packet->transport_codes[1] = transport_codes[1];
-  packet->path_len = 0;
+  packet->setPathHashSizeAndCount(path_hash_size, 0);
 
-  _tables->hasSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
+  _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
   uint8_t pri;
   if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
@@ -679,20 +697,20 @@ void Mesh::sendDirect(Packet* packet, const uint8_t* path, uint8_t path_len, uin
   uint8_t pri;
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {   // TRACE packets are different
     // for TRACE packets, path is appended to end of PAYLOAD. (path is used for SNR's)
-    memcpy(&packet->payload[packet->payload_len], path, path_len);
+    memcpy(&packet->payload[packet->payload_len], path, path_len);  // NOTE: path_len here can be > 64, and NOT in the new scheme
     packet->payload_len += path_len;
 
     packet->path_len = 0;
     pri = 5;   // maybe make this configurable
   } else {
-    memcpy(packet->path, path, packet->path_len = path_len);
+    packet->path_len = Packet::copyPath(packet->path, path, path_len);
     if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
       pri = 1;   // slightly less priority
     } else {
       pri = 0;
     }
   }
-  _tables->hasSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
+  _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
   sendPacket(packet, pri, delay_millis);
 }
 
@@ -702,7 +720,7 @@ void Mesh::sendZeroHop(Packet* packet, uint32_t delay_millis) {
 
   packet->path_len = 0;  // path_len of zero means Zero Hop
 
-  _tables->hasSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
+  _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
   sendPacket(packet, 0, delay_millis);
 }
@@ -715,7 +733,7 @@ void Mesh::sendZeroHop(Packet* packet, uint16_t* transport_codes, uint32_t delay
 
   packet->path_len = 0;  // path_len of zero means Zero Hop
 
-  _tables->hasSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
+  _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
   sendPacket(packet, 0, delay_millis);
 }

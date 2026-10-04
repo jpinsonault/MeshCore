@@ -1,6 +1,6 @@
 # Companion Protocol
 
-- **Last Updated**: 2026-01-03
+- **Last Updated**: 2026-03-08
 - **Protocol Version**: Companion Firmware v1.12.0+
 
 > NOTE: This document is still in development. Some information may be inaccurate.
@@ -73,7 +73,7 @@ MeshCore Companion devices expose a BLE service with the following UUIDs:
 
 5. **Send Initial Commands**
     - Send `CMD_APP_START` to identify your app to firmware and get radio settings
-    - Send `CMD_DEVICE_QEURY` to fetch device info and negotiate supported protocol versions
+    - Send `CMD_DEVICE_QUERY` to fetch device info and negotiate supported protocol versions
     - Send `CMD_SET_DEVICE_TIME` to set the firmware clock
     - Send `CMD_GET_CONTACTS` to fetch all contacts
     - Send `CMD_GET_CHANNEL` multiple times to fetch all channel slots
@@ -100,7 +100,7 @@ When writing commands to the RX characteristic, specify the write type:
 
 ### MTU (Maximum Transmission Unit)
 
-The default BLE MTU is 23 bytes (20 bytes payload). For larger commands like `SET_CHANNEL` (66 bytes), you may need to:
+The default BLE MTU is 23 bytes (20 bytes payload). For larger commands like `SET_CHANNEL` (50 bytes), you may need to:
 
 1. **Request Larger MTU**: Request MTU of 512 bytes if supported
     - Android: `gatt.requestMtu(512)`
@@ -167,16 +167,16 @@ The first byte indicates the packet type (see [Response Parsing](#response-parsi
 **Command Format**:
 ```
 Byte 0: 0x01
-Byte 1: 0x03
-Bytes 2-10: "mccli" (ASCII, null-padded to 9 bytes)
+Bytes 1-7: Reserved (currently ignored by firmware)
+Bytes 8+: Application name (UTF-8, optional)
 ```
 
 **Example** (hex):
 ```
-01 03 6d 63 63 6c 69 00 00 00 00
+01 00 00 00 00 00 00 00 6d 63 63 6c 69
 ```
 
-**Response**: `PACKET_OK` (0x00)
+**Response**: `PACKET_SELF_INFO` (0x05)
 
 ---
 
@@ -216,8 +216,6 @@ Byte 1: Channel Index (0-7)
 
 **Response**: `PACKET_CHANNEL_INFO` (0x12) with channel details
 
-**Note**: The device does not return channel secrets for security reasons. Store secrets locally when creating channels.
-
 ---
 
 ### 4. Set Channel
@@ -229,10 +227,10 @@ Byte 1: Channel Index (0-7)
 Byte 0: 0x20
 Byte 1: Channel Index (0-7)
 Bytes 2-33: Channel Name (32 bytes, UTF-8, null-padded)
-Bytes 34-65: Secret (32 bytes)
+Bytes 34-49: Secret (16 bytes)
 ```
 
-**Total Length**: 66 bytes
+**Total Length**: 50 bytes
 
 **Channel Index**:
 - Index 0: Reserved for public channels (no secret)
@@ -243,15 +241,17 @@ Bytes 34-65: Secret (32 bytes)
 - Maximum 32 bytes
 - Padded with null bytes (0x00) if shorter
 
-**Secret Field** (32 bytes):
-- For **private channels**: 32-byte secret
+**Secret Field** (16 bytes):
+- For **private channels**: 16-byte secret
 - For **public channels**: All zeros (0x00)
 
 **Example** (create channel "YourChannelName" at index 1 with secret):
 ```
 20 01 53 4D 53 00 00 ... (name padded to 32 bytes)
-    [32 bytes of secret]
+    [16 bytes of secret]
 ```
+
+**Note**: The 32-byte secret variant is unsupported and returns `PACKET_ERROR`.
 
 **Response**: `PACKET_OK` (0x00) on success, `PACKET_ERROR` (0x01) on failure
 
@@ -281,7 +281,112 @@ Bytes 7+: Message Text (UTF-8, variable length)
 
 ---
 
-### 6. Get Message
+### 6. Send Channel Data Datagram
+
+**Purpose**: Send a binary datagram to a channel. Unlike channel text messages, datagrams carry no built-in sender identity and no timestamp — applications needing either must encode them inside the binary payload.
+
+**Command Format**:
+```
+Byte 0:                         0x3E
+Byte 1:                         Channel Index (0-7)
+Byte 2:                         Path Length (0xFF = flood, otherwise actual path length)
+Bytes 3 .. 2+path_len:          Path (omitted when path_len == 0xFF)
+Next 2 bytes (little-endian):   Data Type (`data_type`, uint16)
+Remaining bytes:                Binary payload (variable length)
+```
+
+**Example** (flood, `DATA_TYPE_DEV`, payload `A1 B2 C3`, channel 1):
+```
+3E 01 FF FF FF A1 B2 C3
+```
+
+**Data Type / Transport Mapping**:
+- `0x0000` (`DATA_TYPE_RESERVED`) is invalid and rejected with `PACKET_ERROR`.
+- `0xFFFF` (`DATA_TYPE_DEV`) is the developer namespace for experimenting and developing apps.
+- Values `0x0001`–`0xFFFE` are available for registered application/community namespaces. See the [Registered data_type values](#registered-data_type-values) table below.
+
+**Limits**:
+- Maximum payload length is `MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9 = 163` bytes.
+- Larger payloads are rejected with `PACKET_ERROR` (`ERR_CODE_ILLEGAL_ARG`).
+
+**Response**: `PACKET_OK` (0x00) on success, or `PACKET_ERROR` (0x01) with one of:
+- `ERR_CODE_NOT_FOUND` (2) — unknown `channel_idx`
+- `ERR_CODE_ILLEGAL_ARG` (6) — invalid `path_len`, reserved `data_type` (`0x0000`), or payload larger than `MAX_CHANNEL_DATA_LENGTH`
+- `ERR_CODE_TABLE_FULL` (3) — outbound send queue is full; retry later
+
+**Inbound datagrams** are delivered to the host via `RESP_CODE_CHANNEL_DATA_RECV` (0x1B); see [Receive Channel Data Datagram](#receive-channel-data-datagram).
+
+#### Registered `data_type` values
+
+`data_type` is an **application identifier**, not a payload-format identifier. Each registered value identifies an application that owns its own internal payload schemas. The firmware does not inspect payload contents — `data_type` is transported opaquely.
+
+| Value           | Constant             | Purpose                                                                                |
+|-----------------|----------------------|----------------------------------------------------------------------------------------|
+| 0x0000          | `DATA_TYPE_RESERVED` | Reserved; invalid on send                                                              |
+| 0x0001 – 0x00FF | —                    | Reserved for internal use                                                              |
+| 0x0100 – 0xFEFF | —                    | Registered application namespaces (see [number_allocations.md](number_allocations.md)) |
+| 0xFF00 – 0xFFFE | —                    | Testing/development; no registration required                                          |
+| 0xFFFF          | `DATA_TYPE_DEV`      | Developer/experimental namespace                                                       |
+
+To register a new application, submit a PR adding a row to the table in [docs/number_allocations.md](number_allocations.md). Internal sub-formats within an allocated application ID are owned by that application and are not tracked in MeshCore firmware or this document.
+
+---
+
+### Receive Channel Data Datagram
+
+Inbound group datagrams (radio-level `PAYLOAD_TYPE_GRP_DATA`, 0x06) are forwarded to the host as `RESP_CODE_CHANNEL_DATA_RECV` notifications.
+
+**Frame Format** (`RESP_CODE_CHANNEL_DATA_RECV`, 0x1B):
+```
+Byte 0:                 0x1B (packet type)
+Byte 1:                 SNR (signed int8, scaled ×4 — divide by 4.0 to recover dB)
+Bytes 2-3:              Reserved (clients MUST ignore)
+Byte 4:                 Channel Index (0-7)
+Byte 5:                 Path Length (actual path length when flooded, otherwise 0xFF for direct)
+Bytes 6-7:              Data Type (uint16 little-endian)
+Byte 8:                 Data Length
+Bytes 9 .. 8+data_len:  Payload
+```
+
+**Path bytes are not forwarded**: Only `path_len` is reported in the receive frame — the path itself is not copied to the host. There are no path bytes between byte 5 and the data_type field at bytes 6–7, regardless of `path_len`.
+
+**Path Length semantics differ between send and receive**:
+
+| Direction | `path_len = 0xFF`               | `path_len ≠ 0xFF`                                                                                                                           |
+|-----------|---------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| Send      | Flood the network               | Direct route; the encoded path follows (low 6 bits = hash count, top 2 bits + 1 = hash size; on-wire byte count = `hash_count × hash_size`) |
+| Receive   | Packet arrived via direct route | Packet was flooded; this is the encoded `pkt->path_len` field as observed (no path bytes follow)                                            |
+
+In other words, the meaning of `0xFF` is inverted between the two directions, and on receive the field carries metadata only — never a routable path. `path_len` is an encoded byte (see `Packet::isValidPathLen` / `Packet::writePath` in `src/Packet.cpp`), not a raw byte count.
+
+**Note**: The device may also emit `PACKET_MESSAGES_WAITING` (0x83) to notify the host that datagrams are queued; poll with `CMD_SYNC_NEXT_MESSAGE` (0x0A) to retrieve them.
+
+**Parsing Pseudocode**:
+```python
+def parse_channel_data_recv(data):
+    if len(data) < 9:
+        return None
+    snr_byte = data[1]
+    snr = (snr_byte if snr_byte < 128 else snr_byte - 256) / 4.0
+    channel_idx = data[4]
+    path_len = data[5]
+    data_type = int.from_bytes(data[6:8], 'little')
+    data_len = data[8]
+    if 9 + data_len > len(data):
+        return None
+    payload = data[9:9 + data_len]
+    return {
+        'snr': snr,
+        'channel_idx': channel_idx,
+        'path_len': path_len,
+        'data_type': data_type,
+        'payload': bytes(payload),
+    }
+```
+
+---
+
+### 7. Get Message
 
 **Purpose**: Request the next queued message from the device.
 
@@ -298,15 +403,16 @@ Byte 0: 0x0A
 **Response**: 
 - `PACKET_CHANNEL_MSG_RECV` (0x08) or `PACKET_CHANNEL_MSG_RECV_V3` (0x11) for channel messages
 - `PACKET_CONTACT_MSG_RECV` (0x07) or `PACKET_CONTACT_MSG_RECV_V3` (0x10) for contact messages
+- `PACKET_CHANNEL_DATA_RECV` (0x1B) for channel data datagrams
 - `PACKET_NO_MORE_MSGS` (0x0A) if no messages available
 
 **Note**: Poll this command periodically to retrieve queued messages. The device may also send `PACKET_MESSAGES_WAITING` (0x83) as a notification when messages are available.
 
 ---
 
-### 7. Get Battery
+### 8. Get Battery and Storage
 
-**Purpose**: Query device battery level.
+**Purpose**: Query device battery voltage and storage usage.
 
 **Command Format**:
 ```
@@ -318,7 +424,7 @@ Byte 0: 0x14
 14
 ```
 
-**Response**: `PACKET_BATTERY` (0x0C) with battery percentage
+**Response**: `PACKET_BATTERY` (0x0C) with battery millivolts and storage information
 
 ---
 
@@ -334,6 +440,8 @@ Byte 0: 0x14
     - Uses a secret key derived from the channel name
     - It is the first 16 bytes of `sha256("#test")`
     - For example hashtag channel `#test` has the key: `9cd8fcf22a47333b591d96a2b848b73f`
+    - Traffic is encrypted on air, but anyone who knows or guesses the channel
+      name can derive the key. Hashtag channels should not be treated as private.
     - Used as a topic based public group chat, separate from the default public channel
 3. **Private Channels**
     - Uses a randomly generated 16-byte secret key
@@ -346,7 +454,7 @@ Byte 0: 0x14
 1. **Set Channel**:
     - Fetch all channel slots, and find one with empty name and all-zero secret
     - Generate or provide a 16-byte secret
-    - Send `CMD_SET_CHANNEL` with name and secret
+    - Send `CMD_SET_CHANNEL` with name and a 16-byte secret
 2. **Get Channel**:
     - Send `CMD_GET_CHANNEL` with channel index
     - Parse `RESP_CODE_CHANNEL_INFO` response
@@ -360,7 +468,7 @@ Byte 0: 0x14
 
 ### Receiving Messages
 
-Messages are received via the RX characteristic (notifications). The device sends:
+Messages are received via the TX characteristic (notifications). The device sends:
 
 1. **Channel Messages**:
    - `PACKET_CHANNEL_MSG_RECV` (0x08) - Standard format
@@ -500,6 +608,15 @@ Use the `SEND_CHANNEL_MESSAGE` command (see [Commands](#commands)).
 
 ## Response Parsing
 
+### Terminology
+
+This document uses a spec-level naming convention (`PACKET_*`) for bytes the firmware sends back to the host. In the firmware source these same values are split across two `#define` families by purpose:
+
+- `RESP_CODE_*` — direct replies to a command (e.g. `RESP_CODE_CHANNEL_DATA_RECV` = `PACKET_CHANNEL_DATA_RECV` = 0x1B).
+- `PUSH_CODE_*` — asynchronous notifications not tied to a specific command (e.g. `PUSH_CODE_MSG_WAITING` = `PACKET_MESSAGES_WAITING` = 0x83).
+
+Byte values are authoritative; names are aliases. When reading firmware source, `RESP_CODE_X` / `PUSH_CODE_X` correspond to this doc's `PACKET_X` of the same numeric value.
+
 ### Packet Types
 
 | Value | Name                       | Description                   |
@@ -520,6 +637,7 @@ Use the `SEND_CHANNEL_MESSAGE` command (see [Commands](#commands)).
 | 0x10  | PACKET_CONTACT_MSG_RECV_V3 | Contact message (V3 with SNR) |
 | 0x11  | PACKET_CHANNEL_MSG_RECV_V3 | Channel message (V3 with SNR) |
 | 0x12  | PACKET_CHANNEL_INFO        | Channel information           |
+| 0x1B  | PACKET_CHANNEL_DATA_RECV   | Channel data datagram         |
 | 0x80  | PACKET_ADVERTISEMENT       | Advertisement packet          |
 | 0x82  | PACKET_ACK                 | Acknowledgment                |
 | 0x83  | PACKET_MESSAGES_WAITING    | Messages waiting notification |
@@ -544,10 +662,10 @@ Byte 1: Error code (optional)
 Byte 0: 0x12
 Byte 1: Channel Index
 Bytes 2-33: Channel Name (32 bytes, null-terminated)
-Bytes 34-65: Secret (32 bytes, but device typically only returns 20 bytes total)
+Bytes 34-49: Secret (16 bytes)
 ```
 
-**Note**: The device may not return the full 66-byte packet. Parse what is available. The secret field is typically not returned for security reasons.
+**Note**: The device returns the 16-byte channel secret in this response.
 
 **PACKET_DEVICE_INFO** (0x0D):
 ```
@@ -562,6 +680,8 @@ Bytes 4-7: BLE PIN (32-bit little-endian)
 Bytes 8-19: Firmware Build (12 bytes, UTF-8, null-padded)
 Bytes 20-59: Model (40 bytes, UTF-8, null-padded)
 Bytes 60-79: Version (20 bytes, UTF-8, null-padded)
+Byte 80: Client repeat enabled/preferred (firmware v9+)
+Byte 81: Path hash mode (firmware v10+)
 ```
 
 **Parsing Pseudocode**:
@@ -587,9 +707,7 @@ def parse_device_info(data):
 **PACKET_BATTERY** (0x0C):
 ```
 Byte 0: 0x0C
-Bytes 1-2: Battery Level (16-bit little-endian, percentage 0-100)
-
-Optional (if data size > 3):
+Bytes 1-2: Battery Voltage (16-bit little-endian, millivolts)
 Bytes 3-6: Used Storage (32-bit little-endian, KB)
 Bytes 7-10: Total Storage (32-bit little-endian, KB)
 ```
@@ -600,14 +718,12 @@ def parse_battery(data):
     if len(data) < 3:
         return None
     
-    level = int.from_bytes(data[1:3], 'little')
-    info = {'level': level}
+    mv = int.from_bytes(data[1:3], 'little')
+    info = {'battery_mv': mv}
     
-    if len(data) > 3:
-        used_kb = int.from_bytes(data[3:7], 'little')
-        total_kb = int.from_bytes(data[7:11], 'little')
-        info['used_kb'] = used_kb
-        info['total_kb'] = total_kb
+    if len(data) >= 11:
+        info['used_kb'] = int.from_bytes(data[3:7], 'little')
+        info['total_kb'] = int.from_bytes(data[7:11], 'little')
     
     return info
 ```
@@ -629,7 +745,7 @@ Bytes 48-51: Radio Frequency (32-bit little-endian, divided by 1000.0)
 Bytes 52-55: Radio Bandwidth (32-bit little-endian, divided by 1000.0)
 Byte 56: Radio Spreading Factor
 Byte 57: Radio Coding Rate
-Bytes 58+: Device Name (UTF-8, variable length, null-terminated)
+Bytes 58+: Device Name (UTF-8, variable length, no null terminator required)
 ```
 
 **Parsing Pseudocode**:
@@ -680,9 +796,9 @@ def parse_self_info(data):
 **PACKET_MSG_SENT** (0x06):
 ```
 Byte 0: 0x06
-Byte 1: Message Type
-Bytes 2-5: Expected ACK (4 bytes, hex)
-Bytes 6-9: Suggested Timeout (32-bit little-endian, seconds)
+Byte 1: Route Flag (0 = direct, 1 = flood)
+Bytes 2-5: Tag / Expected ACK (4 bytes, little-endian)
+Bytes 6-9: Suggested Timeout (32-bit little-endian, milliseconds)
 ```
 
 **PACKET_ACK** (0x82):
@@ -693,111 +809,51 @@ Bytes 1-6: ACK Code (6 bytes, hex)
 
 ### Error Codes
 
-**PACKET_ERROR** (0x01) may include an error code in byte 1:
+`PACKET_ERROR` (0x01) carries a single-byte error code in byte 1. Values match the `ERR_CODE_*` constants defined in `examples/companion_radio/MyMesh.cpp`:
 
-| Error Code | Description |
-|------------|-------------|
-| 0x00 | Generic error (no specific code) |
-| 0x01 | Invalid command |
-| 0x02 | Invalid parameter |
-| 0x03 | Channel not found |
-| 0x04 | Channel already exists |
-| 0x05 | Channel index out of range |
-| 0x06 | Secret mismatch |
-| 0x07 | Message too long |
-| 0x08 | Device busy |
-| 0x09 | Not enough storage |
+| Code | Constant (firmware)        | Description                                                                  |
+|------|----------------------------|------------------------------------------------------------------------------|
+| 1    | `ERR_CODE_UNSUPPORTED_CMD` | Unknown or unsupported command byte / sub-command                            |
+| 2    | `ERR_CODE_NOT_FOUND`       | Target not found (channel, contact, message, etc.)                           |
+| 3    | `ERR_CODE_TABLE_FULL`      | Internal queue or table is full — retry later                                |
+| 4    | `ERR_CODE_BAD_STATE`       | Operation not valid in current device state (e.g. iterator already running)  |
+| 5    | `ERR_CODE_FILE_IO_ERROR`   | Filesystem or storage I/O failure                                            |
+| 6    | `ERR_CODE_ILLEGAL_ARG`     | Invalid argument (bad length, out-of-range value, reserved field, etc.)      |
 
-**Note**: Error codes may vary by firmware version. Always check byte 1 of `PACKET_ERROR` response.
+**Note**: Error codes may vary by firmware version. Always check byte 1 of `PACKET_ERROR` response, and treat unknown codes as generic errors.
 
-### Partial Packet Handling
+### Frame Handling
 
-BLE notifications may arrive in chunks, especially for larger packets. Implement buffering:
+BLE implementations enqueue and deliver one protocol frame per BLE write/notification at the firmware layer.
 
-**Implementation**:
-```python
-class PacketBuffer:
-    def __init__(self):
-        self.buffer = bytearray()
-        self.expected_length = None
-    
-    def add_data(self, data):
-        self.buffer.extend(data)
-        
-        # Check if we have a complete packet
-        if len(self.buffer) >= 1:
-            packet_type = self.buffer[0]
-            
-            # Determine expected length based on packet type
-            expected = self.get_expected_length(packet_type)
-            
-            if expected is not None and len(self.buffer) >= expected:
-                # Complete packet
-                packet = bytes(self.buffer[:expected])
-                self.buffer = self.buffer[expected:]
-                return packet
-            elif expected is None:
-                # Variable length packet - try to parse what we have
-                # Some packets have minimum length requirements
-                if self.can_parse_partial(packet_type):
-                    return self.try_parse_partial()
-        
-        return None  # Incomplete packet
-    
-    def get_expected_length(self, packet_type):
-        # Fixed-length packets
-        fixed_lengths = {
-            0x00: 5,  # PACKET_OK (minimum)
-            0x01: 2,  # PACKET_ERROR (minimum)
-            0x0A: 1,  # PACKET_NO_MORE_MSGS
-            0x14: 3,  # PACKET_BATTERY (minimum)
-        }
-        return fixed_lengths.get(packet_type)
-    
-    def can_parse_partial(self, packet_type):
-        # Some packets can be parsed partially
-        return packet_type in [0x12, 0x08, 0x11, 0x07, 0x10, 0x05, 0x0D]
-    
-    def try_parse_partial(self):
-        # Try to parse with available data
-        # Return packet if successfully parsed, None otherwise
-        # This is packet-type specific
-        pass
-```
-
-**Usage**:
-```python
-buffer = PacketBuffer()
-
-def on_notification_received(data):
-    packet = buffer.add_data(data)
-    if packet:
-        parse_and_handle_packet(packet)
-```
+- Apps should treat each characteristic write/notification as exactly one companion protocol frame
+- Apps should still validate frame lengths before parsing
+- Future transports or firmware revisions may differ, so avoid assuming fixed payload sizes for variable-length responses
 
 ### Response Handling
 
 1. **Command-Response Pattern**:
-   - Send command via TX characteristic
-   - Wait for response via RX characteristic (notification)
+   - Send command via RX characteristic
+   - Wait for response via TX characteristic (notification)
    - Match response to command using sequence numbers or command type
    - Handle timeout (typically 5 seconds)
    - Use command queue to prevent concurrent commands
 
 2. **Asynchronous Messages**:
-   - Device may send messages at any time via RX characteristic
+   - Device may send messages at any time via TX characteristic
    - Handle `PACKET_MESSAGES_WAITING` (0x83) by polling `GET_MESSAGE` command
    - Parse incoming messages and route to appropriate handlers
-   - Buffer partial packets until complete
+   - Validate frame length before decoding
 
 3. **Response Matching**:
    - Match responses to commands by expected packet type:
-     - `APP_START` → `PACKET_OK`
+     - `APP_START` → `PACKET_SELF_INFO`
      - `DEVICE_QUERY` → `PACKET_DEVICE_INFO`
      - `GET_CHANNEL` → `PACKET_CHANNEL_INFO`
      - `SET_CHANNEL` → `PACKET_OK` or `PACKET_ERROR`
      - `SEND_CHANNEL_MESSAGE` → `PACKET_MSG_SENT`
-     - `GET_MESSAGE` → `PACKET_CHANNEL_MSG_RECV`, `PACKET_CONTACT_MSG_RECV`, or `PACKET_NO_MORE_MSGS`
+     - `GET_MESSAGE` → `PACKET_CHANNEL_MSG_RECV`, `PACKET_CONTACT_MSG_RECV`, `PACKET_CHANNEL_DATA_RECV`, or `PACKET_NO_MORE_MSGS`
+     - `SEND_CHANNEL_DATA` → `PACKET_OK` or `PACKET_ERROR`
      - `GET_BATTERY` → `PACKET_BATTERY`
 
 4. **Timeout Handling**:
@@ -825,16 +881,16 @@ device = scan_for_device("MeshCore")
 gatt = connect_to_device(device)
 
 # 3. Discover services and characteristics
-service = discover_service(gatt, "0000ff00-0000-1000-8000-00805f9b34fb")
-rx_char = discover_characteristic(service, "0000ff01-0000-1000-8000-00805f9b34fb")
-tx_char = discover_characteristic(service, "0000ff02-0000-1000-8000-00805f9b34fb")
+service = discover_service(gatt, "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+rx_char = discover_characteristic(service, "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+tx_char = discover_characteristic(service, "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
-# 4. Enable notifications on RX characteristic
-enable_notifications(rx_char, on_notification_received)
+# 4. Enable notifications on TX characteristic
+enable_notifications(tx_char, on_notification_received)
 
 # 5. Send AppStart command
-send_command(tx_char, build_app_start())
-wait_for_response(PACKET_OK)
+send_command(rx_char, build_app_start())
+wait_for_response(PACKET_SELF_INFO)
 ```
 
 ### Creating a Private Channel
@@ -844,21 +900,16 @@ wait_for_response(PACKET_OK)
 secret_16_bytes = generate_secret(16)  # Use CSPRNG
 secret_hex = secret_16_bytes.hex()
 
-# 2. Expand secret to 32 bytes using SHA-512
-import hashlib
-sha512_hash = hashlib.sha512(secret_16_bytes).digest()
-secret_32_bytes = sha512_hash[:32]
-
-# 3. Build SET_CHANNEL command
+# 2. Build SET_CHANNEL command
 channel_name = "YourChannelName"
 channel_index = 1  # Use 1-7 for private channels
-command = build_set_channel(channel_index, channel_name, secret_32_bytes)
+command = build_set_channel(channel_index, channel_name, secret_16_bytes)
 
-# 4. Send command
-send_command(tx_char, command)
+# 3. Send command
+send_command(rx_char, command)
 response = wait_for_response(PACKET_OK)
 
-# 5. Store secret locally (device won't return it)
+# 4. Store secret locally
 store_channel_secret(channel_index, secret_hex)
 ```
 
@@ -872,7 +923,7 @@ timestamp = int(time.time())
 command = build_channel_message(channel_index, message, timestamp)
 
 # 2. Send command
-send_command(tx_char, command)
+send_command(rx_char, command)
 response = wait_for_response(PACKET_MSG_SENT)
 ```
 
@@ -887,7 +938,7 @@ def on_notification_received(data):
         handle_channel_message(message)
     elif packet_type == PACKET_MESSAGES_WAITING:
         # Poll for messages
-        send_command(tx_char, build_get_message())
+        send_command(rx_char, build_get_message())
 ```
 
 ---
@@ -906,7 +957,7 @@ def on_notification_received(data):
 
 3. **Message Handling**:
    - Send `CMD_SYNC_NEXT_MESSAGE` when `PUSH_CODE_MSG_WAITING` is received
-   - Implement message deduplication to avoid display the same message twice
+   - Implement message deduplication to avoid displaying the same message twice
 
 4. **Channel Management**:
     - Fetch all channel slots even if you encounter an empty slot
