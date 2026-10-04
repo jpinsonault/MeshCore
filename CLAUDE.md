@@ -58,6 +58,8 @@ Note `test/` (PlatformIO, C++) and `tests/` (pytest, BuzzerBoard) are different 
 ### Windows dev setup
 
 - PlatformIO is installed as a uv tool: `uv tool install platformio`, then `uv tool update-shell` so `pio` is on PATH.
+- Host C/C++ compiler for the `pio test` suites: `winget install BrechtSanders.WinLibs.POSIX.UCRT` (MinGW-w64 GCC,
+  POSIX threads, which googletest needs). Winget adds its `mingw64\bin` to the user PATH; open a new terminal after.
 - Serial ports are `COMx` (e.g. `--port COM5`), not `/dev/cu.*` as in the macOS examples below.
 - Keep the checkout at a short path. PlatformIO hits Windows' 260-character path limit when it installs
   RadioLib under a deep directory, and the build fails with `[WinError 3]`.

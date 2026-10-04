@@ -460,19 +460,18 @@ void test_drain_crc_valid() {
   TEST_ASSERT_TRUE(pf.valid_crc);
 }
 
-void test_drain_backpressure() {
+// drain() deliberately ignores availableForWrite(): on ESP32-S3 it returns 0 when no
+// UART TX ring buffer is configured, which left every frame stuck in the ring (d60bae11).
+void test_drain_ignores_available_for_write() {
   CollectorSerial cs;
   setup_cs(cs);
 
   uint8_t p[] = {0x01};
   cs.ringWrite(COLLECTOR_RX_RAW, p, 1);
 
-  ms.write_space = 2;
-  TEST_ASSERT_FALSE(cs.drain());
-  TEST_ASSERT_TRUE(cs.hasBacklog());
-
-  ms.write_space = 1024;
+  ms.write_space = 0;
   TEST_ASSERT_TRUE(cs.drain());
+  TEST_ASSERT_FALSE(cs.hasBacklog());
 }
 
 void test_drain_empty_returns_false() {
@@ -1035,7 +1034,7 @@ int main(int argc, char **argv) {
   // drain() wire format
   RUN_TEST(test_drain_wire_format);
   RUN_TEST(test_drain_crc_valid);
-  RUN_TEST(test_drain_backpressure);
+  RUN_TEST(test_drain_ignores_available_for_write);
   RUN_TEST(test_drain_empty_returns_false);
   RUN_TEST(test_drain_fifo_order);
 
