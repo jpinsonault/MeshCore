@@ -260,6 +260,22 @@ CLI command, enabling full chat participation from the TUI.
 - Collector (repeater): `/dev/cu.usbserial-0001`
 - Sender (repeater): `/dev/cu.usbserial-5`
 
+### WiFi build (Heltec V3)
+
+`Heltec_v3_collector_wifi` adds a network link (`COLLECTOR_WIFI`, ESP32 only, code in
+`examples/simple_repeater/CollectorWifi.*`):
+- Credentials are set once over USB: `wifi ssid <name>`, `wifi pass <password>`, `wifi on`; check with `wifi status`.
+  They're stored in `/collector_wifi` on SPIFFS. Hostname is the node name slugified, as `<name>.local`.
+- TCP port 5005 carries the same bytes as USB serial (CLI text plus collector frames). A client must send
+  `auth <admin password>` first. One client at a time; a new connection replaces the old one.
+- Network firmware updates use ArduinoOTA, with the admin password as it was at boot:
+  `PLATFORMIO_UPLOAD_FLAGS="--auth=<admin password>" pio run -e Heltec_v3_collector_wifi -t upload --upload-port <ip>`
+  (an IP or hostname as the upload port makes PlatformIO use espota).
+- Host: `python -m collector --port socket://<host>.local:5005 --password <admin password>`
+  (or set `MESHCORE_PASSWORD`). The same `--port`/`--password` work for `collector.api` and `collector.server`.
+- No PSRAM on the Heltec V3, so this env caps the ring buffer at 64KB (`COLLECTOR_RING_FALLBACK`) to leave
+  heap for WiFi. `wifi status` reports free heap.
+
 ### Running
 
 ```bash
