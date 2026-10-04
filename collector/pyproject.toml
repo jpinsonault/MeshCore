@@ -37,4 +37,5 @@ pythonpath = [".."]
 markers = [
   "stress: long-running performance and scaling tests",
   "system: hardware-in-the-loop tests (require MESHCORE_PORT)",
+  "radio: two-board over-the-air tests (require MESHCORE_SENDER_PORT)",
 ]
