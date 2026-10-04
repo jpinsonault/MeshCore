@@ -25,6 +25,8 @@ from typing import Callable
 import serial
 from serial.tools import list_ports
 
+from .envfile import load_env
+
 from .protocol import (
     FRAME_TYPE_HANDSHAKE,
     FRAME_TYPE_HEARTBEAT,
@@ -80,8 +82,12 @@ class CollectorCore:
         self.port = port
         self.baud = baud
         self.db_path = db_path
-        # Admin password for network links (the WiFi build wants "auth <password>" first)
-        self.password = password if password is not None else os.environ.get("MESHCORE_PASSWORD")
+        # Admin password for network links (the WiFi build wants "auth <password>" first).
+        # Falls back to MESHCORE_PASSWORD from the environment or the repo-root .env file.
+        if password is None:
+            load_env()
+            password = os.environ.get("MESHCORE_PASSWORD")
+        self.password = password
 
         # Callbacks (set by the caller or Service wrapper)
         self.on_frame: Callable = None

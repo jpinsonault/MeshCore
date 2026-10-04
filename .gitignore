@@ -19,3 +19,6 @@ venv/
 platformio.local.ini
 __pycache__/
 *.egg-info/
+
+# local device credentials (MESHCORE_HOST, MESHCORE_PASSWORD)
+.env

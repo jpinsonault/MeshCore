@@ -156,6 +156,7 @@ class TestNetworkLink:
 
     def test_missing_password(self, monkeypatch):
         monkeypatch.delenv("MESHCORE_PASSWORD", raising=False)
+        monkeypatch.setattr("collector.core.load_env", lambda: None)   # ignore a real .env
         dev = FakeWifiDevice()
         core, ev, tmp = _run_core(f"socket://127.0.0.1:{dev.port}", None, "disconnected")
         try:
