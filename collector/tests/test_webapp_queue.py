@@ -163,3 +163,36 @@ def test_pasted_packet_does_not_record_exhausted():
         app.shutdown()
     finally:
         store.close()
+
+
+# --- rules engine (mangled dictionary) -------------------------------------
+
+def test_crack_via_rules():
+    store, _ = make_temp_store()
+    try:
+        # "weather2024" is not a literal catalog entry, but rules mangle
+        # "weather" -> "weather2024"; no brute-force needed.
+        ch = Channel.from_hashtag("#weather2024")
+        store_grp_txt_packet(store, ch, "alice: hello")
+        app = CrackerApp(store, use_gpu=False)
+        res = app.crack(ch.hash, charset="ab", max_length=2)  # brute can't reach it
+        assert res["cracked"] is True
+        assert res["channel_name"] == "#weather2024"
+        assert res["method"] == "rules"
+        app.shutdown()
+    finally:
+        store.close()
+
+
+def test_rules_can_be_disabled():
+    store, _ = make_temp_store()
+    try:
+        ch = Channel.from_hashtag("#weather2024")
+        store_grp_txt_packet(store, ch, "alice: hello")
+        app = CrackerApp(store, use_gpu=False)
+        app.update_settings({"use_rules": False})
+        res = app.crack(ch.hash, charset="ab", max_length=2)
+        assert res["cracked"] is False  # neither dict nor rules nor tiny brute
+        app.shutdown()
+    finally:
+        store.close()

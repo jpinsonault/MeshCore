@@ -24,6 +24,7 @@ from typing import Optional
 from .. import brute_force, brute_force_gpu
 from ..config import DEFAULT_CONFIG_DIR
 from ..cracker import BUILTIN_WORDLIST, ChannelCracker, load_catalog
+from ..rules import RulesMatcher
 from ..crypto import (
     Channel,
     default_public_channel,
@@ -40,6 +41,7 @@ CRACKER_DEFAULTS = {
     "charset": brute_force.DEFAULT_CHARSET,
     "max_length": 6,
     "use_catalog": True,      # include the bundled ~2.7K-name catalog
+    "use_rules": True,        # rule-mangle the wordlist (word+digits/years, hyphenated connectors)
     "auto_crack": False,      # auto-crack pending channels (dictionary, then queue brute-force)
     "auto_dict_only": False,  # restrict auto-crack to dictionary (skip brute-force) for low-power hosts
     "custom_wordlists": [],   # durable paths added via add_wordlist
@@ -96,6 +98,9 @@ class CrackerApp:
         # when they differ from the already-built default table.
         if not self._settings["use_catalog"] or self._settings["custom_wordlists"]:
             self._apply_wordlist()
+
+        # Rule-based candidates, built lazily on first use (see _ensure_rules).
+        self._rules = RulesMatcher(list(load_catalog()) + list(BUILTIN_WORDLIST))
 
         self._lock = threading.Lock()
 
@@ -200,6 +205,8 @@ class CrackerApp:
             new_val = bool(patch["use_catalog"])
             rebuild = rebuild or (new_val != s["use_catalog"])
             s["use_catalog"] = new_val
+        if "use_rules" in patch:
+            s["use_rules"] = bool(patch["use_rules"])
         if "auto_crack" in patch:
             s["auto_crack"] = bool(patch["auto_crack"])
         if "auto_dict_only" in patch:
@@ -233,6 +240,9 @@ class CrackerApp:
             "catalog": len(load_catalog()),
             "catalog_enabled": bool(self._settings["use_catalog"]),
             "custom_files": list(self._settings["custom_wordlists"]),
+            "rules_enabled": bool(self._settings.get("use_rules")),
+            "rules_built": self._rules.built,
+            "rules_count": self._rules.count,
         }
 
     def config(self) -> dict:
@@ -486,18 +496,19 @@ class CrackerApp:
                 }
                 return self._finish(result)
 
-            # Dictionary/catalog first: instant, and reaches long real-world
-            # names (e.g. #wardriving) that charset brute-force at this
-            # max_length never would.
-            dict_ch = self._cracker.match_dictionary(target_hash, mac_and_data)
-            if dict_ch is not None:
-                decoded_count = self._on_cracked(dict_ch.name, target_hash)
+            # Instant recovery first — exact dictionary/catalog, then rule
+            # mangling — reaching long/structured real-world names (e.g.
+            # #wardriving, #weather2024, #bot-tacoma) that charset brute-force
+            # at this max_length never would.
+            fast_ch, method = self._fast_match(target_hash, mac_and_data)
+            if fast_ch is not None:
+                decoded_count = self._on_cracked(fast_ch.name, target_hash)
                 result = {
                     "cracked": True,
-                    "channel_name": dict_ch.name,
+                    "channel_name": fast_ch.name,
                     "channel_hash": target_hash,
                     "decoded_count": decoded_count,
-                    "method": "dictionary",
+                    "method": method,
                 }
                 return self._finish(result)
 
@@ -559,6 +570,29 @@ class CrackerApp:
         except Exception as e:  # keep the server alive on unexpected failures
             result = {"cracked": False, "channel_hash": target_hash, "error": str(e)}
             return self._finish(result)
+
+    def _ensure_rules(self) -> bool:
+        """Build the rules index on first use. Returns True if usable."""
+        if not self._settings.get("use_rules"):
+            return False
+        if not self._rules.built:
+            try:
+                self._rules.build()
+            except Exception:
+                return False
+        return self._rules.built
+
+    def _fast_match(self, target_hash, mac_and_data):
+        """Instant recovery: exact dictionary/catalog, then rule mangling.
+        Returns (Channel, method) or (None, None)."""
+        ch = self._cracker.match_dictionary(target_hash, mac_and_data)
+        if ch is not None:
+            return ch, "dictionary"
+        if self._ensure_rules():
+            ch = self._rules.match(target_hash, mac_and_data)
+            if ch is not None:
+                return ch, "rules"
+        return None, None
 
     def _on_cracked(self, name: str, target_hash: int) -> int:
         """Wire a newly cracked channel into the live/decode pipeline and
@@ -800,13 +834,13 @@ class CrackerApp:
             blobs = self._mac_and_data_for_hash(h, limit=1)
             if not blobs:
                 continue
-            dict_ch = self._cracker.match_dictionary(h, blobs[0])
-            if dict_ch is not None:
-                decoded = self._on_cracked(dict_ch.name, h)
+            fast_ch, method = self._fast_match(h, blobs[0])
+            if fast_ch is not None:
+                decoded = self._on_cracked(fast_ch.name, h)
                 cracked.append({
-                    "cracked": True, "channel_name": dict_ch.name,
+                    "cracked": True, "channel_name": fast_ch.name,
                     "channel_hash": h, "decoded_count": decoded,
-                    "method": "dictionary",
+                    "method": method,
                 })
                 continue
             # Skip hashes already swept at these params (unless new packets
