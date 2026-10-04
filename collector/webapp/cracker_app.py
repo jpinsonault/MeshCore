@@ -628,6 +628,7 @@ class CrackerApp:
         """Serializable view of a job (no internal Event / mac bytes)."""
         return {
             "id": job["id"],
+            "kind": job.get("kind", "hash"),
             "target_hash": job["target_hash"],
             "label": job["label"],
             "source": job["source"],
@@ -661,6 +662,7 @@ class CrackerApp:
             self._job_seq += 1
             job = {
                 "id": self._job_seq,
+                "kind": "hash",
                 "target_hash": target_hash,
                 "mac_and_data": mac_and_data,
                 "charset": charset,
@@ -668,6 +670,41 @@ class CrackerApp:
                 "source": source,
                 "allow_bruteforce": allow_bruteforce,
                 "label": f"hash 0x{target_hash:02x}",
+                "status": "queued",
+                "result": None,
+                "enqueued_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+                "cancel": threading.Event(),
+            }
+            self._queue.append(job)
+            position = len(self._queue)
+            self._ensure_worker()
+            self._queue_cv.notify_all()
+        return {"queued": True, "job_id": job["id"], "position": position}
+
+    def enqueue_sweep(self, charset=None, max_length=None, source="manual") -> dict:
+        """Enqueue a single batched sweep over all unsolved pending channels.
+        Deduped so only one sweep is ever queued/running at a time."""
+        with self._lock:
+            if self._current is not None and self._current.get("kind") == "sweep":
+                return {"queued": False, "reason": "sweep already running",
+                        "job_id": self._current["id"]}
+            for j in self._queue:
+                if j.get("kind") == "sweep":
+                    return {"queued": False, "reason": "sweep already queued",
+                            "job_id": j["id"]}
+            self._job_seq += 1
+            job = {
+                "id": self._job_seq,
+                "kind": "sweep",
+                "target_hash": None,
+                "mac_and_data": None,
+                "charset": charset,
+                "max_length": max_length,
+                "source": source,
+                "allow_bruteforce": True,
+                "label": "sweep all pending",
                 "status": "queued",
                 "result": None,
                 "enqueued_at": time.time(),
@@ -752,6 +789,8 @@ class CrackerApp:
             if job["cancel"].is_set():
                 res = {"cracked": False, "canceled": True,
                        "channel_hash": job["target_hash"]}
+            elif job.get("kind") == "sweep":
+                res = self._run_sweep(job)
             else:
                 res = self.crack(
                     job["target_hash"], mac_and_data=job["mac_and_data"],
@@ -774,6 +813,90 @@ class CrackerApp:
                 self._history.append(job)
                 self._history = self._history[-50:]
                 self._current = None
+
+    def _run_sweep(self, job) -> dict:
+        """Crack every unsolved pending channel in one batched GPU sweep.
+
+        Fast matches (dictionary/rules) are applied immediately; the remainder
+        (non-exhausted) go into a single brute_force_batch_gpu pass. Unsolved
+        channels are marked exhausted.
+        """
+        charset = job["charset"] or self._settings["charset"]
+        max_length = job["max_length"] or self._settings["max_length"]
+        cancel = job["cancel"]
+        engine = self.engine()
+
+        with self._lock:
+            self._status.update({
+                "running": True, "engine": engine, "target_hash": None,
+                "charset": charset, "max_length": max_length, "length": 0,
+                "total": 0, "elapsed": 0.0, "result": None, "error": None,
+                "started_at": time.time(),
+            })
+
+        solved_fast = []
+        targets = {}
+        for p in self.pending_channels():
+            if cancel.is_set():
+                break
+            h = p["hash"]
+            blobs = self._mac_and_data_for_hash(h, limit=4)
+            if not blobs:
+                continue
+            fast_ch, method = self._fast_match(h, blobs[0])
+            if fast_ch is not None:
+                self._on_cracked(fast_ch.name, h)
+                solved_fast.append(fast_ch.name)
+                continue
+            if self.is_exhausted(h, charset, max_length,
+                                 current_packets=p.get("packet_count")):
+                continue
+            targets[h] = {"mac_and_data": blobs[0], "extras": blobs[1:]}
+
+        if engine != "gpu" or not targets:
+            return self._finish({
+                "cracked": bool(solved_fast), "method": "sweep",
+                "swept": 0, "found": len(solved_fast),
+                "fast": len(solved_fast), "names": list(solved_fast),
+                "canceled": cancel.is_set(),
+            })
+
+        def on_progress(length, total, elapsed):
+            with self._lock:
+                self._status["length"] = length
+                self._status["total"] = total
+                self._status["elapsed"] = elapsed
+
+        try:
+            solved = brute_force_gpu.brute_force_batch_gpu(
+                targets, charset=charset, max_length=max_length,
+                on_progress=on_progress, should_stop=lambda: cancel.is_set(),
+            )
+        except Exception as e:
+            return self._finish({"cracked": bool(solved_fast), "method": "sweep",
+                                 "error": str(e), "names": list(solved_fast)})
+
+        names = list(solved_fast)
+        for hb, name in solved.items():
+            self._on_cracked(name, hb)
+            names.append(name)
+
+        if not cancel.is_set():
+            for hb in targets:
+                if hb not in solved:
+                    try:
+                        self.store.record_crack_attempt(
+                            hb, charset, max_length, "exhausted",
+                            self._packet_count_for_hash(hb))
+                    except Exception:
+                        pass
+
+        return self._finish({
+            "cracked": bool(names), "method": "sweep",
+            "swept": len(targets), "found": len(solved),
+            "fast": len(solved_fast), "names": names,
+            "canceled": cancel.is_set(),
+        })
 
     def crack_status(self) -> dict:
         """Current crack progress (legacy keys) plus the live queue."""
@@ -824,11 +947,12 @@ class CrackerApp:
         this pass. Safe to call directly from tests."""
         cracked = []
         # Auto brute-force only when the GPU engine is active: a CPU grind at
-        # the default charset/length takes minutes, far too slow to run per
-        # pending channel automatically. CPU hosts stay dictionary-only.
-        auto_brute = not bool(self._settings.get("auto_dict_only")) and self.engine() == "gpu"
+        # the default charset/length takes minutes, far too slow to run
+        # automatically. CPU hosts stay dictionary/rules-only.
+        use_sweep = not bool(self._settings.get("auto_dict_only")) and self.engine() == "gpu"
         charset = self._settings["charset"]
         max_length = self._settings["max_length"]
+        remaining = False
         for p in self.pending_channels():
             h = p["hash"]
             blobs = self._mac_and_data_for_hash(h, limit=1)
@@ -845,9 +969,12 @@ class CrackerApp:
                 continue
             # Skip hashes already swept at these params (unless new packets
             # suggest a different channel now shares the hash byte).
-            if auto_brute and not self.is_exhausted(
+            if use_sweep and not self.is_exhausted(
                     h, charset, max_length, current_packets=p.get("packet_count")):
-                self.enqueue(h, source="auto", allow_bruteforce=True, dedupe=True)
+                remaining = True
+        # One batched sweep handles every remaining channel at once.
+        if use_sweep and remaining:
+            self.enqueue_sweep(source="auto")
         return cracked
 
     def _auto_loop(self):

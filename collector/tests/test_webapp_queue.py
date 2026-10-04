@@ -196,3 +196,48 @@ def test_rules_can_be_disabled():
         app.shutdown()
     finally:
         store.close()
+
+
+# --- batched sweep ---------------------------------------------------------
+
+@pytest.mark.skipif(not brute_force_gpu.is_available(), reason="no CUDA GPU")
+def test_batch_sweep_cracks_many_and_marks_exhausted():
+    store, _ = make_temp_store()
+    try:
+        # short non-dictionary names (brute-forceable) + one unsolvable long name
+        solvable = ["#zq7", "#xj4", "#kk9"]
+        for nm in solvable:
+            store_grp_txt_packet(store, Channel.from_hashtag(nm), "bob: one")
+            store_grp_txt_packet(store, Channel.from_hashtag(nm), "carol: two")
+        unsolv = Channel.from_hashtag("#unsolvablelongname")
+        store_grp_txt_packet(store, unsolv, "dave: hi")
+
+        app = CrackerApp(store, use_gpu=True)
+        assert app.engine() == "gpu"
+        app.update_settings({"use_rules": False})  # force brute-force path
+        r = app.enqueue_sweep()
+        assert r["queued"] is True
+        assert _wait(lambda: {c["channel_name"] for c in app.channels()} >= set(solvable),
+                     timeout=60)
+        # the unsolvable hash is now marked exhausted (won't be re-swept)
+        cs = app.get_settings()["charset"]
+        ml = app.get_settings()["max_length"]
+        assert _wait(lambda: app.is_exhausted(unsolv.hash, cs, ml), timeout=10)
+        app.shutdown()
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(not brute_force_gpu.is_available(), reason="no CUDA GPU")
+def test_batch_host_fn_no_false_positive():
+    from collector.crypto import encrypt_then_mac
+    def blob(ch):
+        return encrypt_then_mac(ch.secret, (0).to_bytes(4, "little") + b"\x00bob: hi there\x00")
+    good = Channel.from_hashtag("#zq7")
+    bad = Channel.from_hashtag("#wardriving")  # 10 chars, outside 6-char sweep
+    targets = {good.hash: {"mac_and_data": blob(good)},
+               bad.hash: {"mac_and_data": blob(bad)}}
+    solved = brute_force_gpu.brute_force_batch_gpu(
+        targets, charset="abcdefghijklmnopqrstuvwxyz0123456789", max_length=6)
+    assert solved.get(good.hash) == "#zq7"
+    assert bad.hash not in solved

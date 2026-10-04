@@ -210,18 +210,235 @@ __global__ void crack(
   }
 }
 
+// ---- streaming SHA-256 (no large local message buffer) ----
+struct Sha { unsigned int h[8]; unsigned long long total; unsigned char buf[64]; int len; };
+
+__device__ void sha_init(Sha* s) {
+  s->h[0]=0x6a09e667; s->h[1]=0xbb67ae85; s->h[2]=0x3c6ef372; s->h[3]=0xa54ff53a;
+  s->h[4]=0x510e527f; s->h[5]=0x9b05688c; s->h[6]=0x1f83d9ab; s->h[7]=0x5be0cd19;
+  s->total = 0; s->len = 0;
+}
+__device__ void sha_update(Sha* s, const unsigned char* data, int n) {
+  s->total += (unsigned long long)n;
+  while (n > 0) {
+    int take = 64 - s->len; if (take > n) take = n;
+    for (int i = 0; i < take; i++) s->buf[s->len + i] = data[i];
+    s->len += take; data += take; n -= take;
+    if (s->len == 64) { sha256_compress(s->h, s->buf); s->len = 0; }
+  }
+}
+__device__ void sha_final(Sha* s, unsigned char out[32]) {
+  unsigned long long bits = s->total * 8ULL;
+  s->buf[s->len++] = 0x80;
+  if (s->len > 56) { while (s->len < 64) s->buf[s->len++] = 0; sha256_compress(s->h, s->buf); s->len = 0; }
+  while (s->len < 56) s->buf[s->len++] = 0;
+  for (int i = 0; i < 8; i++) s->buf[56 + i] = (unsigned char)(bits >> (56 - 8*i));
+  sha256_compress(s->h, s->buf);
+  for (int i = 0; i < 8; i++) {
+    out[i*4]   = (unsigned char)(s->h[i] >> 24);
+    out[i*4+1] = (unsigned char)(s->h[i] >> 16);
+    out[i*4+2] = (unsigned char)(s->h[i] >> 8);
+    out[i*4+3] = (unsigned char)(s->h[i]);
+  }
+}
+
+// ---- batched multi-target sweep ----
+// One pass checks each candidate against ALL wanted hash bytes at once. Each
+// thread owns a contiguous index range and ripple-carry-increments the name
+// (no per-candidate 64-bit div/mod). The double-SHA filter is shared across all
+// channels; only candidates whose hash byte is wanted pay the streaming HMAC.
+__global__ void crack_batch(
+    const unsigned char* charset, int base, int name_len,
+    unsigned long long start, unsigned long long count, unsigned long long threads_total,
+    const unsigned char* wanted,          // [256] 0/1
+    const unsigned char* macs,            // [512] 2 bytes per hash byte
+    const int* ct_off, const int* ct_len, const unsigned char* ct_blob,
+    unsigned long long* out_idx, unsigned char* out_hash,
+    unsigned int* out_cnt, unsigned int out_max)
+{
+  unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= threads_total) return;
+  unsigned long long per = (count + threads_total - 1) / threads_total;
+  unsigned long long lo = start + tid * per;
+  unsigned long long end = start + count;
+  if (lo >= end) return;
+  unsigned long long hi = lo + per; if (hi > end) hi = end;
+
+  unsigned char digits[16];
+  unsigned char buf[24];
+  buf[0] = '#';
+  unsigned long long n = lo;
+  for (int pos = name_len - 1; pos >= 0; pos--) {
+    int d = (int)(n % base); n /= base;
+    digits[pos] = (unsigned char)d; buf[1 + pos] = charset[d];
+  }
+
+  for (unsigned long long idx = lo; idx < hi; idx++) {
+    unsigned char d1[32];
+    sha256(buf, name_len + 1, d1);     // psk = d1[:16]
+    unsigned char d2[32];
+    sha256(d1, 16, d2);
+    unsigned char hb = d2[0];
+
+    if (wanted[hb]) {
+      unsigned char ipad[64], opad[64];
+      #pragma unroll
+      for (int k = 0; k < 64; k++) {
+        unsigned char kb = (k < 16) ? d1[k] : 0;
+        ipad[k] = kb ^ 0x36; opad[k] = kb ^ 0x5c;
+      }
+      Sha c;
+      unsigned char innerd[32], macd[32];
+      int off = ct_off[hb], clen = ct_len[hb];
+      sha_init(&c); sha_update(&c, ipad, 64); sha_update(&c, ct_blob + off, clen); sha_final(&c, innerd);
+      sha_init(&c); sha_update(&c, opad, 64); sha_update(&c, innerd, 32); sha_final(&c, macd);
+      if (macd[0] == macs[2*hb] && macd[1] == macs[2*hb + 1]) {
+        unsigned int slot = atomicAdd(out_cnt, 1u);
+        if (slot < out_max) { out_idx[slot] = idx; out_hash[slot] = hb; }
+      }
+    }
+
+    // ripple-carry increment of the name (amortized O(1))
+    int pos = name_len - 1;
+    while (pos >= 0) {
+      int d = digits[pos] + 1;
+      if (d < base) { digits[pos] = (unsigned char)d; buf[1 + pos] = charset[d]; break; }
+      digits[pos] = 0; buf[1 + pos] = charset[0]; pos--;
+    }
+  }
+}
+
 }  // extern "C"
 """
 
 
+_module = None
+
+
+def _get_module():
+    global _module
+    if _module is None:
+        cp = _load_cupy()
+        _module = cp.RawModule(code=_CUDA_SRC, options=("--std=c++11",))
+    return _module
+
+
 def _get_kernel():
     global _kernel
-    if _kernel is not None:
-        return _kernel
-    cp = _load_cupy()
-    module = cp.RawModule(code=_CUDA_SRC, options=("--std=c++11",))
-    _kernel = module.get_function("crack")
+    if _kernel is None:
+        _kernel = _get_module().get_function("crack")
     return _kernel
+
+
+def brute_force_batch_gpu(
+    targets,
+    charset: str = DEFAULT_CHARSET,
+    max_length: int = 6,
+    on_progress: Optional[Callable] = None,
+    should_stop: Optional[Callable] = None,
+    threads_per_block: int = 256,
+    chunk_bits: int = 28,
+) -> dict:
+    """Crack many channels in ONE sweep, amortizing the shared SHA work.
+
+    Args:
+        targets: {hash_byte(int): {"mac_and_data": bytes, "extras": [bytes,...]}}.
+            One representative packet per channel-hash byte; extras are sibling
+            packets used as a collision cross-check during CPU verification.
+        others: as brute_force_channel_gpu.
+
+    Returns {hash_byte: "#name"} for every channel solved. Unsolved hashes are
+    absent (the caller marks those exhausted). Channels drop out of the sweep as
+    they're found, so the wanted set — and the HMAC cost — shrinks over the run.
+    """
+    cp = _load_cupy()
+    if cp is None:
+        raise RuntimeError(f"CuPy unavailable: {_import_error}")
+
+    kernel = _get_module().get_function("crack_batch")
+    charset_bytes = charset.encode()
+    base = len(charset_bytes)
+    d_charset = cp.asarray(bytearray(charset_bytes), dtype=cp.uint8)
+
+    wanted = bytearray(256)
+    macs = bytearray(512)
+    ct_off = [0] * 256
+    ct_len = [0] * 256
+    ct_parts = []
+    off = 0
+    active = {}
+    for hb, t in targets.items():
+        hb = int(hb)
+        mad = t["mac_and_data"]
+        mac, ct = mad[:2], mad[2:]
+        if len(ct) == 0 or len(ct) % CIPHER_BLOCK_SIZE != 0 or len(ct) > 256:
+            continue
+        wanted[hb] = 1
+        macs[2 * hb] = mac[0]
+        macs[2 * hb + 1] = mac[1]
+        ct_off[hb] = off
+        ct_len[hb] = len(ct)
+        ct_parts.append(ct)
+        off += len(ct)
+        active[hb] = t
+    if not active:
+        return {}
+
+    d_wanted = cp.asarray(bytearray(wanted), dtype=cp.uint8)
+    d_macs = cp.asarray(bytearray(macs), dtype=cp.uint8)
+    d_ct_off = cp.asarray(ct_off, dtype=cp.int32)
+    d_ct_len = cp.asarray(ct_len, dtype=cp.int32)
+    d_ct_blob = cp.asarray(bytearray(b"".join(ct_parts) or b"\x00"), dtype=cp.uint8)
+
+    OUT_MAX = 1 << 20
+    d_out_idx = cp.zeros(OUT_MAX, dtype=cp.uint64)
+    d_out_hash = cp.zeros(OUT_MAX, dtype=cp.uint8)
+    d_out_cnt = cp.zeros(1, dtype=cp.uint32)
+
+    solved = {}
+    chunk = 1 << chunk_bits
+    tpb = threads_per_block
+    t0 = time.monotonic()
+
+    for length in range(1, max_length + 1):
+        total = base ** length
+        pos = 0
+        while pos < total:
+            if should_stop is not None and should_stop():
+                return solved
+            if not active:
+                return solved
+            count = min(chunk, total - pos)
+            d_out_cnt.fill(0)
+            threads_total = min(int(count), 1 << 22)
+            blocks = (threads_total + tpb - 1) // tpb
+            kernel(
+                (blocks,), (tpb,),
+                (d_charset, cp.int32(base), cp.int32(length),
+                 cp.uint64(pos), cp.uint64(count), cp.uint64(threads_total),
+                 d_wanted, d_macs, d_ct_off, d_ct_len, d_ct_blob,
+                 d_out_idx, d_out_hash, d_out_cnt, cp.uint32(OUT_MAX)),
+            )
+            cnt = int(d_out_cnt.get()[0])
+            if cnt:
+                n = min(cnt, OUT_MAX)
+                idxs = d_out_idx.get()[:n].tolist()
+                hbs = d_out_hash.get()[:n].tolist()
+                for idx, hb in zip(idxs, hbs):
+                    if hb not in active:
+                        continue
+                    t = active[hb]
+                    name = _verify(int(idx), charset_bytes, length,
+                                   t["mac_and_data"], tuple(t.get("extras") or ()))
+                    if name is not None:
+                        solved[hb] = name
+                        del active[hb]
+                        d_wanted[hb] = 0  # stop testing this hash on-GPU
+            pos += count
+        if on_progress:
+            on_progress(length, total, time.monotonic() - t0)
+
+    return solved
 
 
 def _index_to_name(idx: int, charset: bytes, length: int) -> bytes:

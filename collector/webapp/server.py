@@ -112,6 +112,10 @@ def make_handler(app: CrackerApp):
                 self._call(lambda: self._crack(body))
             elif path == "/api/crack/packet":
                 self._call(lambda: self._crack_packet(body))
+            elif path == "/api/crack/sweep":
+                self._call(lambda: app.enqueue_sweep(
+                    charset=body.get("charset") or None,
+                    max_length=int(body["max_length"]) if body.get("max_length") else None))
             elif path == "/api/crack/cancel":
                 self._call(lambda: self._cancel(body))
             elif path == "/api/crack/retry":
