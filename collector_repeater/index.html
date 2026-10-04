@@ -10,13 +10,13 @@
       
       
       
-        <link rel="canonical" href="https://meshcore-dev.github.io/meshcore/qr_codes/">
+        <link rel="canonical" href="https://meshcore-dev.github.io/meshcore/collector_repeater/">
       
       
-        <link rel="prev" href="../payloads/">
+        <link rel="prev" href="../cli_commands/">
       
       
-        <link rel="next" href="../radio_presets/">
+        <link rel="next" href="../companion_protocol/">
       
       
         
@@ -27,7 +27,7 @@
     
     
       
-        <title>QR Codes - MeshCore Docs</title>
+        <title>Collector Repeater - MeshCore Docs</title>
       
     
     
@@ -70,7 +70,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#qr-codes" class="md-skip">
+        <a href="#collector-repeater" class="md-skip">
           Skip to content
         </a>
       
@@ -105,7 +105,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              QR Codes
+              Collector Repeater
             
           </span>
         </div>
@@ -304,10 +304,37 @@
       
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../collector_repeater/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Collector Repeater
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -323,6 +350,92 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#ways-to-connect" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ways to connect
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#credentials-env" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Credentials: .env
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#first-time-setup-usb" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        First-time setup (USB)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#day-to-day" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Day to day
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cli-additions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CLI additions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#gotchas" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gotchas
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -547,37 +660,10 @@
       
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    QR Codes
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../qr_codes/" class="md-nav__link">
         
   
   
@@ -593,48 +679,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#add-channel" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Add Channel
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#add-contact" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Add Contact
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -747,10 +791,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#add-channel" class="md-nav__link">
+  <a href="#ways-to-connect" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Add Channel
+        Ways to connect
       
     </span>
   </a>
@@ -758,10 +802,54 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#add-contact" class="md-nav__link">
+  <a href="#credentials-env" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Add Contact
+        Credentials: .env
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#first-time-setup-usb" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        First-time setup (USB)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#day-to-day" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Day to day
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cli-additions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CLI additions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#gotchas" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gotchas
       
     </span>
   </a>
@@ -785,7 +873,7 @@
 
 
   
-    <a href="https://github.com/meshcore-dev/meshcore/edit/main/docs/qr_codes.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://github.com/meshcore-dev/meshcore/edit/main/docs/collector_repeater.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -793,36 +881,163 @@
   
 
 
-<h1 id="qr-codes">QR Codes</h1>
-<p>This document provides an overview of QR Code formats that can be used for sharing MeshCore channels and contacts. The formats described below are supported by the MeshCore mobile app.</p>
-<h2 id="add-channel">Add Channel</h2>
-<p><strong>Example URL</strong>:</p>
-<pre><code>meshcore://channel/add?name=Public&amp;secret=8b3387e9c5cdea6ac9e5edbaa115cd72
-</code></pre>
-<p><strong>Parameters</strong>:</p>
+<h1 id="collector-repeater">Collector Repeater</h1>
+<p>A repeater that relays mesh traffic normally and also streams every packet it hears to a computer, which stores
+it in SQLite (<code>collector/</code>). The firmware lives in <code>examples/simple_repeater</code>, so every <code>*_repeater</code> build has it.
+The collector is off until a host sends <code>collector start</code>.</p>
+<p>The WiFi build, <code>Heltec_v3_collector_wifi</code>, can also be reached over your network, configured and flashed
+without a cable. That means a few ways of connecting that a stock repeater doesn't have. This page covers them.</p>
+<h2 id="ways-to-connect">Ways to connect</h2>
+<p>Every link carries the same byte stream: CLI text (echoed input, <code>-&gt; reply</code> lines) with binary collector frames
+mixed in. All commands work on every link, including the ones the CLI docs mark as serial-only.</p>
+<table>
+<thead>
+<tr>
+<th>Link</th>
+<th>Address</th>
+<th>Login</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>USB serial</td>
+<td><code>COMx</code> / <code>/dev/tty…</code>, 115200 baud</td>
+<td>none</td>
+<td>first-time setup, <code>pio</code> flashing, any serial terminal</td>
+</tr>
+<tr>
+<td>TCP</td>
+<td><code>&lt;host&gt;:5005</code></td>
+<td><code>auth &lt;admin password&gt;</code></td>
+<td>the Python collector (<code>socket://</code> port)</td>
+</tr>
+<tr>
+<td>WebSocket</td>
+<td><code>ws://&lt;host&gt;/ws</code> (binary messages)</td>
+<td><code>auth &lt;admin password&gt;</code></td>
+<td>the config page, <code>python -m collector.remote</code></td>
+</tr>
+<tr>
+<td>Firmware upload</td>
+<td>espota on UDP 3232, or <code>http://&lt;host&gt;/update</code></td>
+<td>admin password (<code>/update</code>: user <code>admin</code>)</td>
+<td>network flashing</td>
+</tr>
+<tr>
+<td>LoRa remote admin</td>
+<td>the MeshCore app</td>
+<td>admin password</td>
+<td>stock repeater management</td>
+</tr>
+</tbody>
+</table>
 <ul>
-<li><code>name</code>: Channel name (URL-encoded)</li>
-<li><code>secret</code>: 16-byte secret represented as 32 hex characters</li>
-<li><code>region_scope</code>: Region Scope (optional, URL-encoded if provided)<ul>
-<li>Supported by MeshCore App v1.47.0+</li>
+<li><code>&lt;host&gt;</code> is the node name in lowercase with other characters turned into <code>-</code>, plus <code>.local</code>
+  (e.g. "My Repeater" becomes <code>my-repeater.local</code>), or the node's IP. <code>wifi status</code> prints both.</li>
+<li>Each network link takes one client. A new connection replaces the old one, so a dead session can't lock it.
+  <code>collector.remote</code> uses the WebSocket, so it doesn't kick a collector off TCP.</li>
+<li>Collector frames go to the first logged-in link (TCP, then WebSocket), otherwise to USB.</li>
+<li>Plain HTTP on your LAN: the password crosses the network unencrypted. Fine at home, not on shared networks.</li>
 </ul>
-</li>
-</ul>
-<h2 id="add-contact">Add Contact</h2>
-<p><strong>Example URL</strong>:</p>
-<pre><code>meshcore://contact/add?name=Example+Contact&amp;public_key=9cd8fcf22a47333b591d96a2b848b73f457b1bb1a3ea2453a885f9e5787765b1&amp;type=1
+<h2 id="credentials-env">Credentials: <code>.env</code></h2>
+<p>Device credentials live in a gitignored <code>.env</code> at the repo root, so tools can use them without typing them:</p>
+<pre><code>MESHCORE_HOST=my-repeater.local
+MESHCORE_PASSWORD=&lt;admin password&gt;
 </code></pre>
-<p><strong>Parameters</strong>:</p>
+<p>Copy <code>.env.example</code> to start. <code>collector.remote</code> and the collector both read it; real environment variables win.</p>
 <ul>
-<li><code>name</code>: Contact name (URL-encoded if needed)</li>
-<li><code>public_key</code>: 32-byte public key represented as 64 hex characters</li>
-<li><code>type</code>: numeric contact type<ul>
-<li><code>1</code>: Companion</li>
-<li><code>2</code>: Repeater</li>
-<li><code>3</code>: Room Server</li>
-<li><code>4</code>: Sensor</li>
+<li>Network firmware updates check the admin password the node had <strong>at boot</strong>. After changing the password,
+  reboot before flashing over the network.</li>
+<li>On Windows, Python can stall resolving <code>.local</code> names (it tries IPv6 first). If it does, put the IP in <code>.env</code>.</li>
 </ul>
-</li>
+<h2 id="first-time-setup-usb">First-time setup (USB)</h2>
+<ol>
+<li>Flash over USB and confirm it landed. One upload once reported success without writing the app:
+   <code>bash
+   pio run -e Heltec_v3_collector_wifi -t upload --upload-port COM3
+   pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM3 \
+     verify_flash 0x10000 .pio/build/Heltec_v3_collector_wifi/firmware.bin</code>
+   Settings, identity and ACL survive a firmware flash. <strong>Never run <code>pio run -t uploadfs</code></strong>: it replaces the whole
+   filesystem, wiping the node's key, settings, ACL and WiFi config.</li>
+<li>Join WiFi, either from the config page's WiFi card (below) or in a serial terminal:
+   <code>wifi ssid &lt;network name&gt;
+   wifi pass &lt;wifi password&gt;
+   wifi on
+   wifi status</code></li>
+<li>Change the admin password from the default (<code>password</code>), then <code>reboot</code>.</li>
+<li>Fill in <code>.env</code>. From then on the cable is only needed for power.</li>
+</ol>
+<h2 id="day-to-day">Day to day</h2>
+<p><strong>Commands over WiFi</strong></p>
+<pre><code class="language-bash">collector/.venv/Scripts/python -m collector.remote cmd &quot;wifi status&quot; neighbors stats-packets
+</code></pre>
+<p><strong>Flash over WiFi</strong> (prints the version before and after):</p>
+<pre><code class="language-bash">pio run -e Heltec_v3_collector_wifi
+collector/.venv/Scripts/python -m collector.remote flash            # or: flash path/to/firmware.bin
+</code></pre>
+<p>Alternatives: open <code>http://&lt;host&gt;/update</code> in a browser, or
+<code>PLATFORMIO_UPLOAD_FLAGS="--auth=&lt;pw&gt;" pio run -e Heltec_v3_collector_wifi -t upload --upload-port &lt;ip&gt;</code>.
+Windows Firewall may ask to allow Python the first time, because the node connects back to fetch the image.</p>
+<p><strong>Config page.</strong> The fork at <code>../config.meshcore.io</code> (branch <code>collector-wifi</code>, github.com/jpinsonault/config.meshcore.io)
+adds <strong>Connect WiFi</strong> next to Connect USB, plus a WiFi card that's shown when the node supports it. Serve it locally:</p>
+<pre><code class="language-bash">python -m http.server 8000 --directory ../config.meshcore.io
+</code></pre>
+<p>Then open <code>http://localhost:8000</code> in Chrome or Edge. USB needs Web Serial, which some browsers (e.g. DuckDuckGo) lack.</p>
+<p><strong>Collector over WiFi</strong></p>
+<pre><code class="language-bash">collector/.venv/Scripts/python -m collector --port socket://&lt;host&gt;:5005     # password from .env
+collector/.venv/Scripts/python -m collector.server --port socket://&lt;host&gt;:5005
+</code></pre>
+<p>The node keeps buffering while no collector is connected (128KB ring, roughly 1,000–2,500 packets) and replays
+from where the host left off when it reconnects.</p>
+<p><strong>Monitoring the link.</strong> The cracker web app's <strong>Device &amp; link</strong> view (and the topbar badge: <em>fresh</em> / <em>stale Nm</em> /
+<em>LINK DOWN</em>) shows how fresh the capture is, so a dropped device is obvious instead of surfacing as hours-old
+messages. If the device vanishes off WiFi, the host notices within ~45s (<code>core.LINK_IDLE_TIMEOUT</code>) and reconnects
+on its own once the node is back — no service restart needed. Link up/down events are logged to <code>connection_events</code>,
+and each reboot the device reports (reset cause + last-alive heap/RSSI, recovered from its RTC RAM) lands in
+<code>device_boots</code>; both survive a collector restart. Note the reboot log needs the firmware built after this change —
+reflash with the <strong>Flash over WiFi</strong> step above.</p>
+<h2 id="cli-additions">CLI additions</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wifi status</code></td>
+<td>connection, IP, RSSI, hostname, which links are logged in, free heap</td>
+</tr>
+<tr>
+<td><code>wifi ssid &lt;name&gt;</code> / <code>wifi pass &lt;password&gt;</code></td>
+<td>stored in <code>/collector_wifi</code>; local links only (not LoRa)</td>
+</tr>
+<tr>
+<td><code>wifi on</code> / <code>wifi off</code></td>
+<td><code>on</code> reconnects with the stored credentials</td>
+</tr>
+<tr>
+<td><code>start ota</code></td>
+<td>with WiFi up, points to <code>/update</code> instead of starting the stock hotspot (it would clash on port 80)</td>
+</tr>
+<tr>
+<td><code>collector start\|stop\|status\|diag\|inject\|send\|screen</code></td>
+<td>collector control (see <code>CLAUDE.md</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="gotchas">Gotchas</h2>
+<ul>
+<li><strong>Clock.</strong> The Heltec V3 has no battery-backed clock. After a power loss it restarts at 15 May 2024 (soft reboots
+  and network flashing keep the time). Set it with <code>collector.remote cmd "time $(date +%s)"</code> or <code>clock sync</code> from the
+  app. <code>time</code> only moves the clock forward.</li>
+<li><strong>Memory.</strong> No PSRAM, so the ring buffer is capped at 128KB (<code>COLLECTOR_RING_FALLBACK</code>). With WiFi and the web
+  server up, about 73KB of heap is left. Watch <code>heap=</code> in <code>wifi status</code> after adding features.</li>
+<li><strong>Commands that print straight to USB</strong> (<code>get acl</code>, <code>log</code>) show their output only on USB serial, not on network links.</li>
+<li><strong>Windows <code>pio</code>.</strong> If <code>pio</code> fails with "uv trampoline failed to canonicalize script path", run PlatformIO through
+  its own Python instead: <code>%APPDATA%\uv\tools\platformio\Scripts\python.exe -m platformio run ...</code>.</li>
 </ul>
 
 
