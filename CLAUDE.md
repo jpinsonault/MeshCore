@@ -235,6 +235,8 @@ CLI command, enabling full chat participation from the TUI.
 - [x] Exhausted-attempt cache (schema v7, `crack_attempts`): a fully-swept-not-found (hash, charset, max_length) is remembered so auto-crack doesn't re-grind it; packet-count heuristic re-tries on a likely collision; `/api/crack/retry` clears it
 - [x] Channel model + UI restructure: cracked_channels.method (schema v8); one unified Channels list with state chips (Named/Unknown/Cracking/Exhausted/Public), identifier-vs-identity, packets-vs-messages, method badges, hash-collision display, channel detail, exhausted+retry
 - [x] Thread-local SQLite connections (store.py): per-thread connections (WAL) so the webapp's worker + HTTP threads don't corrupt a shared cursor; `:memory:` keeps one shared connection
+- [x] Relay-duplicate collapse: the same message floods in on multiple paths (many raw packets); channel reads dedup by (channel, msg_timestamp, sender, text) so each logical message shows once (retroactive decode stored one row per packet; live decode dedups at store)
+- [x] Decryptability-based decoded/undecoded counts: a packet is "decoded" if a known channel's key decrypts it (not row-based, which miscounts since the two decode paths store differently); drives the packets-vs-messages + hash-collision display and which packets a crack targets
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
