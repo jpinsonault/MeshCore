@@ -49,6 +49,10 @@ CRACKER_DEFAULTS = {
 # slow/infeasible in the config UI.
 SEARCH_SIZE_WARN = 5_000_000_000
 
+# Re-attempt an exhausted hash once this many new packets have piled up since the
+# sweep — a likely sign a different channel now shares the 1-byte hash byte.
+EXHAUST_RETRY_PACKET_DELTA = 30
+
 
 class CrackerApp:
     """Cracker operations over a store, optionally attached to a live core.
@@ -371,6 +375,35 @@ class CrackerApp:
         blobs = self._mac_and_data_for_hash(target_hash, limit=1)
         return blobs[0] if blobs else None
 
+    def _packet_count_for_hash(self, target_hash: int) -> int:
+        """Count stored GRP_TXT packets with this channel hash."""
+        n = 0
+        for pkt in self.store.get_grp_txt_packets():
+            raw_hex = pkt.get("raw_hex", "")
+            if not raw_hex:
+                continue
+            try:
+                raw = bytes.fromhex(raw_hex)
+            except ValueError:
+                continue
+            extracted = extract_group_payload(raw)
+            if extracted and extracted["channel_hash"] == target_hash:
+                n += 1
+        return n
+
+    def is_exhausted(self, target_hash, charset, max_length, current_packets=None) -> bool:
+        """True if (hash, charset, max_length) was already swept without a hit
+        and not enough new packets have arrived to suspect a different channel."""
+        try:
+            row = self.store.get_crack_attempt(int(target_hash), charset, int(max_length))
+        except Exception:
+            return False
+        if row is None:
+            return False
+        if current_packets is None:
+            current_packets = self._packet_count_for_hash(target_hash)
+        return current_packets < (row["packets_seen"] + EXHAUST_RETRY_PACKET_DELTA)
+
     def _mac_and_data_for_hash(self, target_hash: int, limit: int = 4) -> list:
         """Up to `limit` distinct mac_and_data blobs from stored GRP_TXT packets
         whose channel_hash matches. Siblings serve as brute-force cross-checks:
@@ -403,6 +436,7 @@ class CrackerApp:
         max_length: Optional[int] = None,
         cancel_event=None,
         allow_bruteforce: bool = True,
+        record_exhausted: bool = True,
     ) -> dict:
         """Synchronously crack the channel name for target_hash.
 
@@ -500,6 +534,17 @@ class CrackerApp:
                 result = {"cracked": False, "channel_hash": target_hash}
                 if canceled:
                     result["canceled"] = True
+                elif record_exhausted:
+                    # Full sweep completed without a hit — remember so auto-crack
+                    # doesn't re-grind the same dead end every pass.
+                    try:
+                        self.store.record_crack_attempt(
+                            target_hash, charset, max_length, "exhausted",
+                            self._packet_count_for_hash(target_hash),
+                        )
+                    except Exception:
+                        pass
+                    result["exhausted"] = True
                 return self._finish(result)
 
             decoded_count = self._on_cracked(name, target_hash)
@@ -679,6 +724,8 @@ class CrackerApp:
                     charset=job["charset"], max_length=job["max_length"],
                     cancel_event=job["cancel"],
                     allow_bruteforce=job["allow_bruteforce"],
+                    # A pasted one-off packet shouldn't mark the hash exhausted.
+                    record_exhausted=(job["source"] != "packet"),
                 )
 
             with self._lock:
@@ -708,6 +755,31 @@ class CrackerApp:
         with self._lock:
             return self._current is not None
 
+    def exhausted_channels(self) -> list:
+        """Hashes already swept without a hit (for the UI's Exhausted state)."""
+        try:
+            rows = self.store.get_crack_attempts()
+        except Exception:
+            return []
+        return [{
+            "hash": r["channel_hash"],
+            "charset": r["charset"],
+            "max_length": r["max_length"],
+            "result": r["result"],
+            "packets_seen": r["packets_seen"],
+            "attempted_at": r["attempted_at"],
+        } for r in rows]
+
+    def retry_hash(self, target_hash) -> dict:
+        """Forget exhausted marks for a hash and enqueue a fresh crack."""
+        try:
+            self.store.clear_crack_attempt(int(target_hash))
+        except Exception:
+            pass
+        r = self.enqueue(int(target_hash), source="manual",
+                         allow_bruteforce=True, dedupe=True)
+        return {"started": bool(r.get("queued")), **r}
+
     # --- auto-crack ----------------------------------------------------------
 
     def auto_crack_once(self) -> list:
@@ -721,6 +793,8 @@ class CrackerApp:
         # the default charset/length takes minutes, far too slow to run per
         # pending channel automatically. CPU hosts stay dictionary-only.
         auto_brute = not bool(self._settings.get("auto_dict_only")) and self.engine() == "gpu"
+        charset = self._settings["charset"]
+        max_length = self._settings["max_length"]
         for p in self.pending_channels():
             h = p["hash"]
             blobs = self._mac_and_data_for_hash(h, limit=1)
@@ -735,7 +809,10 @@ class CrackerApp:
                     "method": "dictionary",
                 })
                 continue
-            if auto_brute:
+            # Skip hashes already swept at these params (unless new packets
+            # suggest a different channel now shares the hash byte).
+            if auto_brute and not self.is_exhausted(
+                    h, charset, max_length, current_packets=p.get("packet_count")):
                 self.enqueue(h, source="auto", allow_bruteforce=True, dedupe=True)
         return cracked
 

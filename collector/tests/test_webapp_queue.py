@@ -122,3 +122,44 @@ def test_auto_crack_bruteforces_pending_on_gpu():
         app.shutdown()
     finally:
         store.close()
+
+
+# --- exhausted-attempt cache -----------------------------------------------
+
+def test_exhausted_cache_records_and_blocks_auto():
+    store, _ = make_temp_store()
+    try:
+        # A short non-dictionary name that a tiny charset can't reach -> the
+        # brute-force exhausts and should be recorded, not retried by auto.
+        ch = Channel.from_hashtag("#zq7")
+        store_grp_txt_packet(store, ch, "bob: hi")
+        app = CrackerApp(store, use_gpu=False)
+        res = app.crack(ch.hash, charset="ab", max_length=2)  # can't contain z/q/7
+        assert res["cracked"] is False
+        assert res.get("exhausted") is True
+        assert app.is_exhausted(ch.hash, "ab", 2) is True
+        # Different params aren't considered exhausted.
+        assert app.is_exhausted(ch.hash, "ab", 3) is False
+        # retry clears it.
+        app.retry_hash(ch.hash)
+        assert app.is_exhausted(ch.hash, "ab", 2) is False
+        app.shutdown()
+    finally:
+        store.close()
+
+
+def test_pasted_packet_does_not_record_exhausted():
+    store, _ = make_temp_store()
+    try:
+        from collector.crypto import encrypt_then_mac
+        ch = Channel.from_hashtag("#zq7")
+        mad = encrypt_then_mac(ch.secret, (0).to_bytes(4, "little") + b"\x00bob: hi\x00")
+        app = CrackerApp(store, use_gpu=False)
+        res = app.crack(ch.hash, mac_and_data=mad, charset="ab", max_length=2,
+                        record_exhausted=False)
+        assert res["cracked"] is False
+        assert "exhausted" not in res
+        assert app.is_exhausted(ch.hash, "ab", 2) is False
+        app.shutdown()
+    finally:
+        store.close()

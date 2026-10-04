@@ -19,7 +19,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -151,6 +151,18 @@ CREATE INDEX IF NOT EXISTS idx_channel_messages_id_channel
     ON channel_messages(channel_name, id);
 """
 
+SCHEMA_V7_SQL = """
+CREATE TABLE IF NOT EXISTS crack_attempts (
+    channel_hash INTEGER NOT NULL,
+    charset      TEXT    NOT NULL,
+    max_length   INTEGER NOT NULL,
+    result       TEXT    NOT NULL,          -- 'exhausted' = swept, not found
+    packets_seen INTEGER NOT NULL DEFAULT 0, -- packet count for this hash when attempted
+    attempted_at REAL    NOT NULL,
+    PRIMARY KEY (channel_hash, charset, max_length)
+);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -219,6 +231,14 @@ class CollectorStore:
                 (str(6),),
             )
             current = 6
+
+        if current < 7:
+            self._conn.executescript(SCHEMA_V7_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(7),),
+            )
+            current = 7
 
     def close(self):
         if self._conn:
@@ -685,3 +705,47 @@ class CollectorStore:
             except (ValueError, TypeError):
                 continue
         return out
+
+    # --- Crack-attempt cache (don't re-grind exhausted channels) ---
+
+    def record_crack_attempt(self, channel_hash, charset, max_length,
+                             result="exhausted", packets_seen=0):
+        """Record that (channel_hash, charset, max_length) was swept with the
+        given outcome ('exhausted' = fully searched, not found)."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO crack_attempts "
+                "(channel_hash, charset, max_length, result, packets_seen, attempted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(channel_hash, charset, max_length) DO UPDATE SET "
+                "result = excluded.result, packets_seen = excluded.packets_seen, "
+                "attempted_at = excluded.attempted_at",
+                (int(channel_hash), charset, int(max_length), result,
+                 int(packets_seen), time.time()),
+            )
+
+    def get_crack_attempt(self, channel_hash, charset, max_length):
+        """Return the attempt row for exactly these params, or None."""
+        return self._conn.execute(
+            "SELECT * FROM crack_attempts WHERE channel_hash = ? AND charset = ? "
+            "AND max_length = ?",
+            (int(channel_hash), charset, int(max_length)),
+        ).fetchone()
+
+    def get_crack_attempts(self):
+        """All recorded crack attempts (for the UI's exhausted list)."""
+        return self._conn.execute(
+            "SELECT * FROM crack_attempts ORDER BY attempted_at DESC"
+        ).fetchall()
+
+    def clear_crack_attempt(self, channel_hash):
+        """Forget all exhausted marks for a hash so it can be retried."""
+        with self._tx() as conn:
+            conn.execute(
+                "DELETE FROM crack_attempts WHERE channel_hash = ?",
+                (int(channel_hash),),
+            )
+
+    def clear_all_crack_attempts(self):
+        with self._tx() as conn:
+            conn.execute("DELETE FROM crack_attempts")

@@ -96,6 +96,7 @@ def make_handler(app: CrackerApp):
                 "/api/channels": app.channels,
                 "/api/results": app.results,
                 "/api/crack/status": app.crack_status,
+                "/api/exhausted": app.exhausted_channels,
             }
             handler = get_routes.get(path)
             if handler:
@@ -113,6 +114,9 @@ def make_handler(app: CrackerApp):
                 self._call(lambda: self._crack_packet(body))
             elif path == "/api/crack/cancel":
                 self._call(lambda: self._cancel(body))
+            elif path == "/api/crack/retry":
+                self._call(lambda: app.retry_hash(body["hash"]) if body.get("hash") is not None
+                           else {"started": False, "error": "missing 'hash'"})
             elif path == "/api/config":
                 self._call(lambda: app.update_settings(body))
             elif path == "/api/wordlist":
