@@ -41,6 +41,11 @@ from .store import CollectorStore
 
 ACK_INTERVAL = 1.0  # seconds between ACK frames
 
+# Auto-reconnect backoff bounds (seconds). The firmware's ring buffer replays
+# packets missed while the host was away, so reconnecting recovers the gap.
+RECONNECT_MIN = 2.0
+RECONNECT_MAX = 30.0
+
 
 def list_serial_ports():
     """Return list of available serial port info dicts."""
@@ -78,10 +83,14 @@ class CollectorCore:
         on_error(msg)       — called on non-fatal errors
     """
 
-    def __init__(self, port=None, baud=115200, db_path="collector.db", password=None):
+    def __init__(self, port=None, baud=115200, db_path="collector.db", password=None,
+                 reconnect=True):
         self.port = port
         self.baud = baud
         self.db_path = db_path
+        # Auto-reconnect with backoff after a dropped/failed connection, until
+        # stop() is called. The caller can disable it for one-shot use.
+        self.reconnect = reconnect
         # Admin password for network links (the WiFi build wants "auth <password>" first).
         # Falls back to MESHCORE_PASSWORD from the environment or the repo-root .env file.
         if password is None:
@@ -184,10 +193,26 @@ class CollectorCore:
         if not any(ch.name == DEFAULT_PUBLIC_CHANNEL_NAME for ch in self._channels):
             self._channels.insert(0, default_public_channel())
 
+        backoff = RECONNECT_MIN
         try:
-            self._connect_and_collect()
-        except Exception as e:
-            self._fire_error(f"Fatal error: {e}")
+            while not self._stop_event.is_set():
+                self._connected = False
+                try:
+                    self._connect_and_collect()
+                except Exception as e:
+                    self._fire_error(f"Collector error: {e}")
+
+                if self._stop_event.is_set() or not self.reconnect:
+                    break
+
+                # Connection ended on its own. A stable session that just
+                # dropped resets the backoff; repeated quick failures grow it.
+                if self._connected:
+                    backoff = RECONNECT_MIN
+                self._fire_text(f"[collector] reconnecting in {backoff:.0f}s")
+                if self._stop_event.wait(timeout=backoff):
+                    break
+                backoff = min(backoff * 2, RECONNECT_MAX)
         finally:
             self._cleanup()
             self._running = False
