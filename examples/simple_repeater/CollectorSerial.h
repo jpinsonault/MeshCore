@@ -26,6 +26,10 @@
 #ifndef COLLECTOR_RING_SIZE
 #define COLLECTOR_RING_SIZE     (200 * 1024)
 #endif
+// Ring size when PSRAM isn't available (e.g. Heltec V3). WiFi builds need the heap for the network stack.
+#ifndef COLLECTOR_RING_FALLBACK
+#define COLLECTOR_RING_FALLBACK (150 * 1024)
+#endif
 #define RING_SENTINEL           0xFFFF
 
 // Ring entry format: [uint16_t entry_len][uint8_t type][uint32_t seq][payload...]
@@ -112,7 +116,7 @@ public:
     _ring = (uint8_t *)ps_malloc(_ring_size + 2);  // +2 ensures sentinel always fits
     if (!_ring) {
       // No PSRAM — fall back to regular heap with reduced size
-      _ring_size = 150 * 1024;
+      _ring_size = COLLECTOR_RING_FALLBACK;
       _ring = (uint8_t *)malloc(_ring_size + 2);
     }
 #else

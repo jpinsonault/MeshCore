@@ -23,6 +23,41 @@ void halt() {
 }
 
 static char command[160];
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+static char tcp_command[160];
+#endif
+
+// Reads CLI input from one source into buf; returns true once buf holds a complete line ('\r' stripped).
+// Collector host frames (0xC0 ...) on the same stream go to the collector instead, if allowed.
+static bool readCliLine(Stream& s, char* buf, size_t size, bool allow_frames) {
+  size_t len = strlen(buf);
+  while (s.available() && len < size - 1) {
+    if ((uint8_t)s.peek() == 0xC0) {
+      if (allow_frames) {
+        the_mesh.handleCollectorFrame(s);
+      } else {
+        s.read();
+      }
+      continue;
+    }
+    char c = s.read();
+    if (c != '\n') {
+      buf[len++] = c;
+      buf[len] = 0;
+      s.print(c);
+    }
+    if (c == '\r') break;
+  }
+  if (len == size - 1 && buf[len - 1] != '\r') {  // buffer full: treat as a complete line
+    buf[len - 1] = '\r';
+  }
+  if (len > 0 && buf[len - 1] == '\r') {
+    s.print('\n');
+    buf[len - 1] = 0;
+    return true;
+  }
+  return false;
+}
 #ifdef ETHERNET_ENABLED
 static char ethernet_command[160];
 #endif
@@ -124,27 +159,7 @@ void setup() {
 
 void loop() {
   // Handle Serial CLI
-  int len = strlen(command);
-  while (Serial.available() && len < sizeof(command)-1) {
-    if ((uint8_t)Serial.peek() == 0xC0) {
-      the_mesh.handleCollectorFrame();
-      continue;
-    }
-    char c = Serial.read();
-    if (c != '\n') {
-      command[len++] = c;
-      command[len] = 0;
-      Serial.print(c);
-    }
-    if (c == '\r') break;
-  }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
-  }
-
-  if (len > 0 && command[len - 1] == '\r') {  // received complete line
-    Serial.print('\n');
-    command[len - 1] = 0;  // replace newline with C string null terminator
+  if (readCliLine(Serial, command, sizeof(command), true)) {
     char reply[160];
     reply[0] = 0;
 #ifdef ETHERNET_ENABLED
@@ -160,6 +175,27 @@ void loop() {
 
     command[0] = 0;  // reset command buffer
   }
+
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+  // Same CLI + collector stream over TCP; nothing but "auth <password>" until the client logs in
+  static uint32_t tcp_session = 0;
+  if (collector_wifi.sessionId() != tcp_session) {
+    tcp_session = collector_wifi.sessionId();
+    tcp_command[0] = 0;
+  }
+  Stream* tcp = collector_wifi.rawClient();
+  if (tcp && readCliLine(*tcp, tcp_command, sizeof(tcp_command), collector_wifi.isAuthed())) {
+    char reply[160];
+    reply[0] = 0;
+    if (!collector_wifi.handleAuth(tcp_command, reply)) {
+      the_mesh.handleCommand(0, tcp_command, reply);
+    }
+    if (reply[0]) {
+      tcp->print("  -> "); tcp->println(reply);
+    }
+    tcp_command[0] = 0;
+  }
+#endif
 
 #ifdef ETHERNET_ENABLED
   ethernet_loop_maintain();

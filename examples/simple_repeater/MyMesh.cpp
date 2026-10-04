@@ -967,10 +967,17 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+  _collector.begin(collector_link);   // TCP client when logged in, else USB serial
+#else
   _collector.begin(Serial);
+#endif
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+  collector_wifi.begin(_fs, _prefs.node_name, _prefs.password);
+#endif
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -1325,6 +1332,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+  } else if (collector_wifi.handleCommand(command, sender_timestamp == 0, reply)) {
+    // handled: wifi status|on|off|ssid|pass
+#endif
   } else if (sender_timestamp == 0 && memcmp(command, "collector", 9) == 0) {
     const char *sub = command + 9;
     while (*sub == ' ') sub++;
@@ -1503,6 +1514,9 @@ void MyMesh::loop() {
 #ifdef WITH_BRIDGE
   bridge.loop();
 #endif
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+  collector_wifi.loop();
+#endif
 
   mesh::Mesh::loop();
 
@@ -1583,9 +1597,11 @@ void MyMesh::loop() {
   last_millis = now;
 }
 
-void MyMesh::handleCollectorFrame() {
+void MyMesh::handleCollectorFrame(Stream& s) {
   if (_collector_enabled) {
-    _collector.processIncoming(Serial);
+    _collector.processIncoming(s);
+  } else {
+    s.read();   // drop the 0xC0 so the caller's input loop can't spin on it
   }
 }
 
@@ -1593,6 +1609,9 @@ void MyMesh::handleCollectorFrame() {
 bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
+#endif
+#if defined(ESP32) && defined(COLLECTOR_WIFI)
+  if (collector_wifi.isRunning()) return true;  // sleeping would drop the WiFi link
 #endif
   return _mgr->getOutboundTotal() > 0;
 }

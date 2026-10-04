@@ -37,6 +37,7 @@
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
 #include "CollectorSerial.h"
+#include "CollectorWifi.h"
 #include "RateLimiter.h"
 
 #ifdef WITH_BRIDGE
@@ -260,7 +261,7 @@ public:
   }
 #endif
 
-  void handleCollectorFrame();
+  void handleCollectorFrame(Stream& s);
 
   // To check if there is pending work
   bool hasPendingWork() const;
