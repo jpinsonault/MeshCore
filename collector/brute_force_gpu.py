@@ -1,0 +1,340 @@
+"""
+MeshCore Collector — GPU brute-force channel cracker (CUDA via CuPy).
+
+Hashtag channels derive their AES-128 key from SHA-256("#name")[:16]. Cracking
+a name from an intercepted packet is pure SHA-256 grinding with a cheap reject,
+which is exactly what a GPU excels at. This module offloads the grind to CUDA:
+
+  Per candidate (all on-GPU):
+    1. psk   = SHA-256("#" + name)[:16]
+    2. hash  = SHA-256(psk)[0]            -> reject 255/256 (cleartext filter)
+    3. mac   = HMAC-SHA256(psk||0, ct)[:2] -> reject 65535/65536
+    4. survivor index written to an output buffer (expected ~1/16M)
+
+The GPU returns only the tiny set of survivors; the host reconstructs each name
+and re-verifies with the shared CPU crypto (AES decrypt + plaintext validation)
+to rule out the rare 2-byte MAC collision. The public entry point matches
+brute_force.brute_force_channel() so callers can treat the two interchangeably.
+
+Requires cupy-cuda12x and an NVIDIA GPU; import-guarded so the module is a no-op
+dependency on machines without one (is_available() returns False).
+"""
+
+import time
+from typing import Callable, Optional
+
+from .crypto import Channel, grp_txt_plaintext_ok, mac_then_decrypt
+
+CIPHER_MAC_SIZE = 2
+CIPHER_BLOCK_SIZE = 16
+
+DEFAULT_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+# Lazily imported so this module loads without cupy present.
+_cp = None
+_kernel = None
+_import_error = None
+
+
+def _load_cupy():
+    global _cp, _import_error
+    if _cp is not None:
+        return _cp
+    if _import_error is not None:
+        return None
+    try:
+        import cupy as cp  # type: ignore
+        _cp = cp
+        return cp
+    except Exception as e:  # ImportError, or CUDA runtime unavailable
+        _import_error = e
+        return None
+
+
+def is_available() -> bool:
+    """True if CuPy + a CUDA device are usable for GPU cracking."""
+    cp = _load_cupy()
+    if cp is None:
+        return False
+    try:
+        return cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
+def gpu_name() -> Optional[str]:
+    """Human-readable GPU name, or None if unavailable."""
+    cp = _load_cupy()
+    if cp is None:
+        return None
+    try:
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        return props["name"].decode()
+    except Exception:
+        return None
+
+
+# CUDA C: single- and multi-block SHA-256, double-hash channel derivation,
+# truncated HMAC-SHA256 MAC check. Inputs are tiny, so correctness over micro-
+# optimization; the hash-byte reject means the HMAC path runs for only ~1/256
+# of threads.
+_CUDA_SRC = r"""
+extern "C" {
+
+__device__ __constant__ unsigned int KK[64] = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+__device__ __forceinline__ unsigned int rotr(unsigned int x, unsigned int n) {
+  return (x >> n) | (x << (32 - n));
+}
+
+__device__ void sha256_compress(unsigned int h[8], const unsigned char* p) {
+  unsigned int w[64];
+  #pragma unroll
+  for (int i = 0; i < 16; i++) {
+    w[i] = (p[i*4] << 24) | (p[i*4+1] << 16) | (p[i*4+2] << 8) | p[i*4+3];
+  }
+  #pragma unroll
+  for (int i = 16; i < 64; i++) {
+    unsigned int s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >> 3);
+    unsigned int s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >> 10);
+    w[i] = w[i-16] + s0 + w[i-7] + s1;
+  }
+  unsigned int a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+  #pragma unroll
+  for (int i = 0; i < 64; i++) {
+    unsigned int S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+    unsigned int ch = (e & f) ^ ((~e) & g);
+    unsigned int t1 = hh + S1 + ch + KK[i] + w[i];
+    unsigned int S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+    unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
+    unsigned int t2 = S0 + maj;
+    hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+  h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+}
+
+// SHA-256 over an arbitrary-length message (len up to a few hundred bytes).
+__device__ void sha256(const unsigned char* data, unsigned int len, unsigned char out[32]) {
+  unsigned int h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                       0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  unsigned int full = len / 64;
+  for (unsigned int b = 0; b < full; b++) {
+    sha256_compress(h, data + b*64);
+  }
+  unsigned char block[64];
+  unsigned int rem = len - full*64;
+  for (unsigned int i = 0; i < rem; i++) block[i] = data[full*64 + i];
+  block[rem] = 0x80;
+  unsigned long long bits = (unsigned long long)len * 8ULL;
+  if (rem < 56) {
+    for (unsigned int i = rem+1; i < 56; i++) block[i] = 0;
+    for (int i = 0; i < 8; i++) block[56+i] = (unsigned char)(bits >> (56 - 8*i));
+    sha256_compress(h, block);
+  } else {
+    for (unsigned int i = rem+1; i < 64; i++) block[i] = 0;
+    sha256_compress(h, block);
+    unsigned char b2[64];
+    for (int i = 0; i < 56; i++) b2[i] = 0;
+    for (int i = 0; i < 8; i++) b2[56+i] = (unsigned char)(bits >> (56 - 8*i));
+    sha256_compress(h, b2);
+  }
+  for (int i = 0; i < 8; i++) {
+    out[i*4]   = (unsigned char)(h[i] >> 24);
+    out[i*4+1] = (unsigned char)(h[i] >> 16);
+    out[i*4+2] = (unsigned char)(h[i] >> 8);
+    out[i*4+3] = (unsigned char)(h[i]);
+  }
+}
+
+__global__ void crack(
+    const unsigned char* charset, int base, int name_len,
+    unsigned long long start, unsigned long long count,
+    unsigned char target_hash, unsigned char mac0, unsigned char mac1,
+    const unsigned char* ct, int ct_len,
+    unsigned long long* out_idx, unsigned int* out_cnt, unsigned int out_max)
+{
+  unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+
+  for (unsigned long long i = tid; i < count; i += stride) {
+    unsigned long long idx = start + i;
+
+    // index -> name (big-endian digit extraction, matches CPU path)
+    unsigned char buf[24];
+    buf[0] = '#';
+    unsigned long long n = idx;
+    for (int pos = name_len - 1; pos >= 0; pos--) {
+      buf[1 + pos] = charset[n % base];
+      n /= base;
+    }
+
+    unsigned char d1[32];
+    sha256(buf, name_len + 1, d1);        // psk = d1[:16]
+    unsigned char d2[32];
+    sha256(d1, 16, d2);                    // channel hash
+    if (d2[0] != target_hash) continue;
+
+    // HMAC-SHA256, key = psk(16) || zeros(48), truncated to 2 bytes
+    unsigned char ipad[64], opad[64];
+    #pragma unroll
+    for (int k = 0; k < 64; k++) {
+      unsigned char kb = (k < 16) ? d1[k] : 0;
+      ipad[k] = kb ^ 0x36;
+      opad[k] = kb ^ 0x5c;
+    }
+    unsigned char inner_msg[64 + 256];
+    for (int k = 0; k < 64; k++) inner_msg[k] = ipad[k];
+    for (int k = 0; k < ct_len; k++) inner_msg[64 + k] = ct[k];
+    unsigned char innerd[32];
+    sha256(inner_msg, 64 + ct_len, innerd);
+
+    unsigned char outer_msg[96];
+    for (int k = 0; k < 64; k++) outer_msg[k] = opad[k];
+    for (int k = 0; k < 32; k++) outer_msg[64 + k] = innerd[k];
+    unsigned char macd[32];
+    sha256(outer_msg, 96, macd);
+
+    if (macd[0] == mac0 && macd[1] == mac1) {
+      unsigned int slot = atomicAdd(out_cnt, 1u);
+      if (slot < out_max) out_idx[slot] = idx;
+    }
+  }
+}
+
+}  // extern "C"
+"""
+
+
+def _get_kernel():
+    global _kernel
+    if _kernel is not None:
+        return _kernel
+    cp = _load_cupy()
+    module = cp.RawModule(code=_CUDA_SRC, options=("--std=c++11",))
+    _kernel = module.get_function("crack")
+    return _kernel
+
+
+def _index_to_name(idx: int, charset: bytes, length: int) -> bytes:
+    base = len(charset)
+    out = bytearray(length)
+    n = idx
+    for pos in range(length - 1, -1, -1):
+        out[pos] = charset[n % base]
+        n //= base
+    return bytes(out)
+
+
+def _verify(idx, charset, length, mac_and_data, extra=()):
+    """Reconstruct the name for a GPU survivor and fully verify on CPU.
+
+    A 2-byte MAC collision over a huge search space can pass the single-packet
+    check, so a survivor must (a) decrypt to a strictly-valid GRP_TXT plaintext
+    and (b) also MAC-verify every `extra` packet of the same channel. A true
+    key decrypts them all; a collision will not.
+    """
+    name = _index_to_name(idx, charset, length)
+    full = b"#" + name
+    ch = Channel.from_hashtag(full.decode())
+    plaintext = mac_then_decrypt(ch.secret, mac_and_data)
+    if plaintext is None or not grp_txt_plaintext_ok(plaintext):
+        return None
+    for extra_blob in extra:
+        other = mac_then_decrypt(ch.secret, extra_blob)
+        if other is None or not grp_txt_plaintext_ok(other):
+            return None
+    return full.decode()
+
+
+def brute_force_channel_gpu(
+    target_hash: int,
+    mac_and_data: bytes,
+    charset: str = DEFAULT_CHARSET,
+    max_length: int = 6,
+    on_progress: Optional[Callable] = None,
+    extra_mac_and_data=None,
+    should_stop: Optional[Callable] = None,
+    threads_per_block: int = 256,
+    chunk_bits: int = 28,
+) -> Optional[str]:
+    """GPU port of brute_force.brute_force_channel().
+
+    Args match the CPU version; extra tuning knobs:
+        extra_mac_and_data: other packets' [mac][ct] blobs for the same channel;
+            a candidate must decrypt all of them (collision guard).
+        should_stop: called between kernel launches; return True to abort early
+            (returns None), used to cancel an in-flight crack.
+        threads_per_block: CUDA block size.
+        chunk_bits: indices per kernel launch = 2**chunk_bits (progress/bounding).
+
+    Returns the cracked channel name with '#', or None if exhausted/stopped.
+    """
+    cp = _load_cupy()
+    if cp is None:
+        raise RuntimeError(f"CuPy unavailable: {_import_error}")
+
+    mac = mac_and_data[:CIPHER_MAC_SIZE]
+    ciphertext = mac_and_data[CIPHER_MAC_SIZE:]
+    if len(ciphertext) == 0 or len(ciphertext) % CIPHER_BLOCK_SIZE != 0:
+        return None
+    if len(ciphertext) > 256:
+        # Kernel inner buffer is 64 + 256; real packets are far smaller.
+        raise ValueError("ciphertext too long for GPU kernel")
+
+    kernel = _get_kernel()
+    charset_bytes = charset.encode()
+    base = len(charset_bytes)
+
+    d_charset = cp.asarray(bytearray(charset_bytes), dtype=cp.uint8)
+    d_ct = cp.asarray(bytearray(ciphertext), dtype=cp.uint8)
+
+    OUT_MAX = 65536
+    d_out_idx = cp.zeros(OUT_MAX, dtype=cp.uint64)
+    d_out_cnt = cp.zeros(1, dtype=cp.uint32)
+
+    extra = tuple(extra_mac_and_data or ())
+
+    chunk = 1 << chunk_bits
+    tpb = threads_per_block
+    t0 = time.monotonic()
+
+    for length in range(1, max_length + 1):
+        total = base ** length
+        pos = 0
+        while pos < total:
+            if should_stop is not None and should_stop():
+                return None
+            count = min(chunk, total - pos)
+            d_out_cnt.fill(0)
+            # Enough blocks to cover the chunk, capped for grid-stride reuse.
+            n_threads = min(count, 1 << 22)
+            blocks = (int(n_threads) + tpb - 1) // tpb
+            kernel(
+                (blocks,), (tpb,),
+                (d_charset, cp.int32(base), cp.int32(length),
+                 cp.uint64(pos), cp.uint64(count),
+                 cp.uint8(target_hash), cp.uint8(mac[0]), cp.uint8(mac[1]),
+                 d_ct, cp.int32(len(ciphertext)),
+                 d_out_idx, d_out_cnt, cp.uint32(OUT_MAX)),
+            )
+            cnt = int(d_out_cnt.get()[0])
+            if cnt:
+                survivors = d_out_idx.get()[:min(cnt, OUT_MAX)]
+                for idx in survivors.tolist():
+                    name = _verify(int(idx), charset_bytes, length, mac_and_data, extra)
+                    if name is not None:
+                        return name
+            pos += count
+        if on_progress:
+            on_progress(length, total, time.monotonic() - t0)
+
+    return None

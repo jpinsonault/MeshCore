@@ -182,6 +182,29 @@ def mac_then_decrypt(secret: bytes, mac_and_data: bytes) -> Optional[bytes]:
     return plaintext
 
 
+def grp_txt_plaintext_ok(plaintext: bytes) -> bool:
+    """Strict validity check for a decrypted GRP_TXT plaintext.
+
+    Used to reject brute-force MAC collisions. A wrong key that happens to pass
+    the 2-byte MAC yields ~random plaintext, which rarely satisfies the real
+    GRP_TXT layout: plain-text flags (type 0), and a non-empty, null-terminated,
+    valid-UTF-8 body. (Matches the decode gate in try_decode_group_message.)
+    """
+    if len(plaintext) < 6:
+        return False
+    if (plaintext[4] >> 2) != 0:          # only plain-text messages (type 0)
+        return False
+    text_part = plaintext[5:]
+    null_idx = text_part.find(0)
+    if null_idx < 1:                       # must have a non-empty, terminated body
+        return False
+    try:
+        text_part[:null_idx].decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def encrypt_then_mac(secret: bytes, plaintext: bytes) -> bytes:
     """Python port of Utils::encryptThenMAC (for testing).
 

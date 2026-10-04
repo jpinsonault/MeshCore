@@ -53,11 +53,13 @@ def _crack_chunk(args):
 
     Returns the cracked channel name (str with '#') or None.
     """
-    target_hash, mac_and_data, charset, length, start, count = args
+    target_hash, mac_and_data, charset, length, start, count, extras = args
 
     import hashlib
     import hmac as _hmac
     from Crypto.Cipher import AES
+
+    from .crypto import grp_txt_plaintext_ok
 
     mac = mac_and_data[:2]
     ciphertext = mac_and_data[2:]
@@ -66,6 +68,18 @@ def _crack_chunk(args):
 
     base = len(charset)
     sha256 = hashlib.sha256
+
+    def _decrypts_ok(psk, blob):
+        """MAC-verify and strictly validate one extra packet for this channel."""
+        mac_e, ct_e = blob[:2], blob[2:]
+        if len(ct_e) == 0 or len(ct_e) % 16 != 0:
+            return False
+        sec = psk + b"\x00" * 16
+        if not _hmac.compare_digest(mac_e, _hmac.new(sec, ct_e, hashlib.sha256).digest()[:2]):
+            return False
+        cph = AES.new(psk, AES.MODE_ECB)
+        pt = b"".join(cph.decrypt(ct_e[o:o + 16]) for o in range(0, len(ct_e), 16))
+        return grp_txt_plaintext_ok(pt)
 
     for i in range(count):
         idx = start + i
@@ -90,24 +104,19 @@ def _crack_chunk(args):
         if not _hmac.compare_digest(mac, computed):
             continue
 
-        # MAC matched — decrypt and validate plaintext to rule out collision.
+        # MAC matched — decrypt and strictly validate to rule out a collision.
         # GRP_TXT plaintext: [timestamp(4)][flags(1)][sender: text\0...]
         cipher = AES.new(psk, AES.MODE_ECB)
         plaintext = b""
         for off in range(0, len(ciphertext), 16):
             plaintext += cipher.decrypt(ciphertext[off : off + 16])
 
-        # Must have at least 6 bytes (4 timestamp + 1 flags + 1 null)
-        # and contain a null terminator after the header.
-        if len(plaintext) < 6:
+        if not grp_txt_plaintext_ok(plaintext):
             continue
-        text_part = plaintext[5:]
-        null_idx = text_part.find(0)
-        if null_idx < 0:
-            continue
-        try:
-            text_part[:null_idx].decode("utf-8")
-        except UnicodeDecodeError:
+
+        # Cross-check: a true key also decrypts every other packet on the
+        # channel; a 2-byte MAC collision (possible over a huge space) will not.
+        if extras and not all(_decrypts_ok(psk, e) for e in extras):
             continue
 
         return full.decode()
@@ -122,6 +131,8 @@ def brute_force_channel(
     max_length: int = 6,
     num_workers: int = None,
     on_progress: Optional[Callable] = None,
+    extra_mac_and_data=None,
+    should_stop: Optional[Callable] = None,
 ) -> Optional[str]:
     """Brute-force a hashtag channel name from an intercepted packet.
 
@@ -132,6 +143,8 @@ def brute_force_channel(
         max_length: maximum name length to try (default: 6)
         num_workers: parallel workers (default: CPU count)
         on_progress: callback(length, total, elapsed_sec) after each length
+        extra_mac_and_data: other packets' [mac][ct] blobs for the same channel;
+            a candidate must decrypt all of them (collision guard)
 
     Returns:
         Channel name with '#' prefix if cracked, None if exhausted.
@@ -140,9 +153,12 @@ def brute_force_channel(
         num_workers = os.cpu_count() or 4
 
     charset_bytes = charset.encode()
+    extras = tuple(extra_mac_and_data or ())
     t0 = time.monotonic()
 
     for length in range(1, max_length + 1):
+        if should_stop is not None and should_stop():
+            return None
         total = len(charset) ** length
 
         # Split into chunks — oversub for load balancing on heterogeneous cores
@@ -154,12 +170,16 @@ def brute_force_channel(
             chunk_count = min(chunk_size, total - chunk_start)
             tasks.append((
                 target_hash, mac_and_data, charset_bytes,
-                length, chunk_start, chunk_count,
+                length, chunk_start, chunk_count, extras,
             ))
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(_crack_chunk, task) for task in tasks]
             for future in as_completed(futures):
+                if should_stop is not None and should_stop():
+                    for f in futures:
+                        f.cancel()
+                    return None
                 result = future.result()
                 if result is not None:
                     for f in futures:

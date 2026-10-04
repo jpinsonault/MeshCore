@@ -109,7 +109,7 @@ class TestBruteForce:
         result = _crack_chunk((
             extracted["channel_hash"],
             extracted["mac_and_data"],
-            charset, 2, 0, 26 * 26,
+            charset, 2, 0, 26 * 26, (),
         ))
         assert result == "#hi"
 
@@ -122,7 +122,7 @@ class TestBruteForce:
         result = _crack_chunk((
             extracted["channel_hash"],
             extracted["mac_and_data"],
-            charset, 2, 0, 100,
+            charset, 2, 0, 100, (),
         ))
         assert result is None
 
