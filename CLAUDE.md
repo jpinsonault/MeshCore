@@ -35,7 +35,33 @@ sh build.sh build-matching-firmwares RAK_4631
 clang-format -i <file>
 ```
 
-There are no automated tests. Validation is done through physical device testing.
+### Tests
+
+Firmware is still mainly validated by building (`pio run -e <env>`) and on hardware, but there are host-side suites:
+
+```bash
+# Collector host app (Python). Hardware tests need MESHCORE_PORT; see "Collector Repeater" below.
+cd collector && uv sync && uv run pytest tests -m "not system and not stress"
+
+# BuzzerBoard TUI (repo-root pyproject). Hardware tests skip when no device is found.
+uv sync && uv run pytest tests
+
+# C++ host tests: upstream googletest suites, and the collector ring-buffer suite (Unity).
+# These need a host C/C++ compiler (gcc/g++) on PATH.
+pio test -e native
+pio test -e native_kiss_modem
+pio test -e native_tests
+```
+
+Note `test/` (PlatformIO, C++) and `tests/` (pytest, BuzzerBoard) are different suites.
+
+### Windows dev setup
+
+- PlatformIO is installed as a uv tool: `uv tool install platformio`, then `uv tool update-shell` so `pio` is on PATH.
+- Serial ports are `COMx` (e.g. `--port COM5`), not `/dev/cu.*` as in the macOS examples below.
+- Keep the checkout at a short path. PlatformIO hits Windows' 260-character path limit when it installs
+  RadioLib under a deep directory, and the build fails with `[WinError 3]`.
+- Git checks symlinks out as plain text files here (`core.symlinks=false`). Use a forwarding `#include`, not a symlink.
 
 ### Flashing ESP32 Boards
 
@@ -124,7 +150,7 @@ Each example in `examples/` is a complete firmware:
 - No dynamic memory allocation except during `setup()`/`begin()`
 - Think embedded — keep code concise without unnecessary abstraction layers
 
-## Collector Repeater (feature/collector-repeater branch)
+## Collector Repeater (merged into main)
 
 ### Goal
 
@@ -138,6 +164,9 @@ CLI command, enabling full chat participation from the TUI.
 ### Architecture
 
 **Firmware** (modified `simple_repeater`):
+- Because it lives in `simple_repeater`, it is compiled into **every** `*_repeater` env on every platform
+  (ESP32, nRF52, RP2040, STM32). Guard platform-specific calls (e.g. the ESP heap API is ESP32-only) and
+  don't pull in libraries that only some envs list in `lib_deps`.
 - Hooks into `logRxRaw()`, `logTx()`, `onAdvertRecv()` to capture all traffic
 - Binary frame protocol v2 over serial: `[0xC0] [len_lo] [len_hi] [type] [seq(4B)] [payload...] [crc16(2B)]`
 - 200KB ring buffer with sequence numbers, CRC-16 integrity, and ACK/RESUME handshake for reliable delivery
@@ -232,8 +261,10 @@ CLI command, enabling full chat participation from the TUI.
 ### Running
 
 ```bash
-# Activate the collector venv
-source collector/.venv/bin/activate
+# Create/update the collector venv, then activate it
+(cd collector && uv sync)
+source collector/.venv/bin/activate          # macOS/Linux
+source collector/.venv/Scripts/activate      # Windows (Git Bash)
 
 # TUI mode (interactive port selection)
 python -m collector
