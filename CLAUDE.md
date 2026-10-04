@@ -230,6 +230,11 @@ CLI command, enabling full chat participation from the TUI.
 - [x] Crack queue: FIFO worker processing manual/pasted/auto jobs one at a time, each cancelable (`/api/crack/cancel`); brute-forcers take a `should_stop` callback so a running grind aborts
 - [x] Auto-crack: when on, pending channels are cracked automatically — dictionary first, then queued for GPU brute-force on a miss (CPU hosts stay dictionary-only; `auto_dict_only` to force it)
 - [x] Core auto-reconnect: `core._run` reconnects with backoff after a dropped/failed link (firmware ring buffer replays the gap); `reconnect=False` for one-shot use
+- [x] Rules engine (`rules.py`): hashcat-style mangling of the catalog+built-in list (word+digits/years, hyphenated connectors), ~225K candidates indexed by hash byte; tried after exact dictionary, before brute-force (recovers #weather2024, #bot-tacoma, …)
+- [x] Batched multi-target GPU sweep (`brute_force_batch_gpu` / `crack_batch` kernel): one pass cracks every pending channel (shared double-SHA filter, per-wanted HMAC), ~26x vs separate sweeps on a live 100-channel mesh; cancelable "sweep" queue job (`/api/crack/sweep`); kernel hot path uses streaming HMAC + ripple-carry name increment
+- [x] Exhausted-attempt cache (schema v7, `crack_attempts`): a fully-swept-not-found (hash, charset, max_length) is remembered so auto-crack doesn't re-grind it; packet-count heuristic re-tries on a likely collision; `/api/crack/retry` clears it
+- [x] Channel model + UI restructure: cracked_channels.method (schema v8); one unified Channels list with state chips (Named/Unknown/Cracking/Exhausted/Public), identifier-vs-identity, packets-vs-messages, method badges, hash-collision display, channel detail, exhausted+retry
+- [x] Thread-local SQLite connections (store.py): per-thread connections (WAL) so the webapp's worker + HTTP threads don't corrupt a shared cursor; `:memory:` keeps one shared connection
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -258,6 +263,7 @@ CLI command, enabling full chat participation from the TUI.
 - `collector/brute_force.py` — Multicore CPU brute-force channel cracker (ProcessPoolExecutor, SHA-256 + HMAC + AES); strict GRP_TXT validation + optional sibling-packet cross-check
 - `collector/brute_force_gpu.py` — GPU brute-force cracker: custom CUDA SHA-256 RawKernel via CuPy, on-GPU hash + 2-byte-MAC filter, CPU verify of survivors; same signature as the CPU path, `is_available()`/`gpu_name()` gate it. Needs `cupy-cuda12x` (installed in `collector/.venv`)
 - `collector/data/meshcore_channels.txt` — bundled hashtag-channel catalog (~2.7K names, CC0, from github.com/marcelverdult/meshcore-channels); auto-loaded by `cracker.py`
+- `collector/rules.py` — rule-based candidate mangling (hashcat-style) + `RulesMatcher` (hash-indexed, ~225K candidates); tried after the exact dictionary, before brute-force
 - `collector/webapp/` — cracker web app: `cracker_app.py` (mode-agnostic logic), `server.py` (stdlib HTTP), `static/index.html` (vanilla-JS UI), `__main__.py` (`python -m collector.webapp --db <path>` offline, or `--port COMx` live; `--cpu` forces CPU). `--http-port` defaults to `$PORT` when set (Portico) else 8090
 - `collector/cracker.portico.toml` — Portico manifest: registers the web app as `http://cracker.localhost/` (autostart on logon, never idle-stops), offline mode against the durable DB `~/.config/meshcore-collector/collector.db`. Runs via the GPU venv (`collector\.venv\Scripts\python.exe`). The porticod daemon (repos/portico) is already a logon task, so the service comes back on Windows start. Dev loop: edit code, then `curl -X POST -H "Content-Type: application/json" -d '{}' http://portico.localhost/api/apps/cracker/restart` (static-asset edits just need a browser refresh)
 - `collector/activities/node_list.py` — Scrollable node list filtered by adv_type (repeaters, rooms, all)
