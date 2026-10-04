@@ -203,3 +203,26 @@ class TestGetStatsIncludesChannels:
         store.store_channel_message(_msg())
         stats = store.get_stats()
         assert stats["channel_msg_count"] == 1
+
+
+class TestRelayDeduplication:
+    def test_relay_duplicates_collapsed_in_reads(self, store):
+        # Same logical message captured 3x via relay (identical sender/text/ts),
+        # stored as separate per-packet rows, plus one distinct message.
+        for i in range(3):
+            store.store_channel_message(
+                _msg(channel="#r", sender="Al", text="flood", ts=111),
+                raw_packet_id=i + 1)
+        store.store_channel_message(
+            _msg(channel="#r", sender="Bo", text="other", ts=222), raw_packet_id=99)
+
+        # Reads collapse the relay copies: 2 logical messages, not 4.
+        assert store.count_channel_messages(channel_name="#r") == 2
+        page = store.page_channel_messages(channel_name="#r")
+        assert len(page) == 2
+        summ = {s["channel_name"]: s for s in store.get_named_channel_summaries()}
+        assert summ["#r"]["msg_count"] == 2
+        # Search still works and is deduped.
+        assert store.count_channel_messages(channel_name="#r", search="flood") == 1
+        # But the per-packet rows remain (undecoded/collision tracking needs them).
+        assert store.get_channel_message_count() == 4

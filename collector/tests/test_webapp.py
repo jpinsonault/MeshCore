@@ -118,16 +118,17 @@ def test_crack_dictionary_first(seeded_store):
 
 
 def test_crack_bruteforce_fallback():
-    # A random name not in any wordlist falls through to brute-force.
-    import secrets
+    # A name reachable only by brute-force. Disable dictionary+rules so the
+    # fast path can't match, making the brute path deterministic.
     store, _ = make_temp_store()
-    name = "#" + secrets.token_hex(2)  # 4 hex chars
+    name = "#q7z"  # short, in the brute charset, not a word/mangle
     ch = Channel.from_hashtag(name)
     store_grp_txt_packet(store, ch, "carol: hi")
     store_grp_txt_packet(store, ch, "dave: corroborating packet")  # sibling for cross-check
     try:
         app = CrackerApp(store, use_gpu=False)
-        result = app.crack(ch.hash, charset="0123456789abcdef", max_length=4)
+        app.update_settings({"use_rules": False, "use_catalog": False})
+        result = app.crack(ch.hash, charset="0123456789abcdefqz", max_length=3)
         assert result["cracked"] is True
         assert result["channel_name"] == name
         assert result["method"] == "bruteforce"

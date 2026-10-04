@@ -664,11 +664,18 @@ class CollectorStore:
             params.extend([pattern, pattern])
         return sql, params
 
+    # Relay flooding means the same message is captured in several raw packets
+    # (identical sender/text/sender-timestamp, different path). Collapse those to
+    # one logical message in reads, keeping the per-packet rows that the
+    # undecoded/collision tracking relies on.
+    _DEDUP_GROUP = " GROUP BY channel_name, msg_timestamp, sender, text"
+
     def count_channel_messages(self, channel_name=None, search=None):
-        """Count decoded messages matching an optional channel + text/sender search."""
+        """Count distinct decoded messages (relay duplicates collapsed)."""
         where, params = self._message_filter(channel_name, search)
         row = self._conn.execute(
-            "SELECT COUNT(*) AS cnt FROM channel_messages WHERE 1=1" + where,
+            "SELECT COUNT(*) AS cnt FROM (SELECT 1 FROM channel_messages "
+            "WHERE 1=1" + where + self._DEDUP_GROUP + ")",
             params,
         ).fetchone()
         return row["cnt"]
@@ -683,15 +690,18 @@ class CollectorStore:
         Use either cursor, not both. ``limit`` is clamped to [1, 500].
         """
         limit = max(1, min(int(limit), 500))
-        where, params = self._message_filter(channel_name, search)
+        inner_where, params = self._message_filter(channel_name, search)
+        # Canonical id = the first (lowest-id) copy of each logical message.
+        sql = ("SELECT * FROM channel_messages WHERE id IN ("
+               "SELECT MIN(id) FROM channel_messages WHERE 1=1" + inner_where
+               + self._DEDUP_GROUP + ")")
         if before_id is not None:
-            where += " AND id < ?"
+            sql += " AND id < ?"
             params.append(int(before_id))
         if after_id is not None:
-            where += " AND id > ?"
+            sql += " AND id > ?"
             params.append(int(after_id))
-        sql = ("SELECT * FROM channel_messages WHERE 1=1" + where
-               + " ORDER BY id DESC LIMIT ?")
+        sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
@@ -725,7 +735,8 @@ class CollectorStore:
         """
         rows = self._conn.execute(
             "SELECT m.channel_name, "
-            "       COUNT(m.id) AS msg_count, "
+            "       COUNT(DISTINCT COALESCE(m.msg_timestamp,'') || '|' || "
+            "             COALESCE(m.sender,'') || '|' || COALESCE(m.text,'')) AS msg_count, "
             "       MAX(m.timestamp) AS last_activity, "
             "       COUNT(DISTINCT m.sender) AS unique_senders, "
             "       c.channel_hash AS channel_hash, "
