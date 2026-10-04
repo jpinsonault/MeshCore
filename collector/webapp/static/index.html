@@ -25,22 +25,40 @@
     <!-- Sidebar -->
     <nav class="sidebar" aria-label="Navigation">
       <div class="nav-section">
-        <div class="nav-title">Tools</div>
-        <button id="nav-pending" class="nav-item">
-          <span class="nm">Pending channels</span>
-          <span id="nav-pending-count" class="count">0</span>
+        <div class="nav-title">View</div>
+        <button id="nav-channels" class="nav-item">
+          <span class="nm">Channels</span>
+          <span id="nav-channels-count" class="count">0</span>
         </button>
         <button id="nav-config" class="nav-item">
           <span class="nm">Cracker config</span>
         </button>
       </div>
-      <div class="nav-section" style="flex:1; min-height:0; display:flex; flex-direction:column">
-        <div class="nav-title">Cracked channels</div>
-        <div id="nav-channels" style="overflow-y:auto; min-height:0"></div>
+
+      <div class="nav-section">
+        <div class="nav-title">At a glance</div>
+        <div class="glance">
+          <div class="glance-row"><span class="g-k">Named</span><span id="g-named" class="g-v">0</span></div>
+          <div class="glance-row"><span class="g-k">Unknown</span><span id="g-unknown" class="g-v">0</span></div>
+          <div class="glance-row"><span class="g-k">Cracking</span><span id="g-cracking" class="g-v">0</span></div>
+          <div class="glance-row"><span class="g-k">Exhausted</span><span id="g-exhausted" class="g-v">0</span></div>
+        </div>
       </div>
-      <div class="nav-section faint" style="font-size:11px">
-        <span class="kbd">p</span> pending ·
+
+      <div class="nav-section">
+        <div class="nav-title">About a channel hash</div>
+        <p class="hint-copy">
+          A <b>channel hash</b> is a single cleartext byte (0–255) — the only part of an
+          encrypted packet visible without the key. Many channels can share one byte, so a
+          hash is an <i>identifier</i>, not an identity. Recovering the name turns an
+          <b>Unknown</b> hash into a <b>Named</b> channel.
+        </p>
+      </div>
+
+      <div class="nav-section faint" style="font-size:11px; margin-top:auto">
+        <span class="kbd">g</span> channels ·
         <span class="kbd">c</span> config ·
+        <span class="kbd">s</span> sweep ·
         <span class="kbd">/</span> search ·
         <span class="kbd">t</span> theme
       </div>
@@ -50,11 +68,15 @@
     <main class="main">
       <div class="scroll">
 
-        <!-- Pending view -->
-        <section id="view-pending">
-          <div class="view-head"><h1>Pending channels</h1></div>
+        <!-- Channels view (unified list) -->
+        <section id="view-channels">
+          <div class="view-head">
+            <h1>Channels</h1>
+            <span class="sub-inline">One row per channel. The hash is the only cleartext byte; packets are encrypted, messages are decoded.</span>
+          </div>
 
-          <div class="panel">
+          <!-- Queue / progress -->
+          <div class="panel" id="queue-panel">
             <div class="row" style="align-items:center; justify-content:space-between">
               <h2 style="margin:0">Crack queue</h2>
               <button id="q-cancel-all" style="display:none">Cancel all</button>
@@ -63,50 +85,86 @@
             <div id="queue"></div>
           </div>
 
-          <div class="panel">
-            <h2>Unknown channels seen on the mesh</h2>
-            <p class="sub">Hashtag channels whose name we haven't recovered yet. Crack one to decode every stored message on it.</p>
-            <div id="pending-body"><div class="loading">Loading…</div></div>
+          <!-- Primary actions -->
+          <div class="panel actions-panel">
+            <div class="actions-main">
+              <button class="primary big" id="sweep-go">Crack all pending (sweep)</button>
+              <span id="sweep-note" class="sub">Cracks every <b>Unknown</b> channel in one batched GPU sweep.</span>
+            </div>
+            <details class="more-actions">
+              <summary>Crack a specific hash or pasted packet</summary>
+              <div class="more-body">
+                <div class="row" style="align-items:flex-end">
+                  <div style="flex:0 0 160px">
+                    <label for="m-hash">channel hash (0–255)</label>
+                    <input id="m-hash" type="number" min="0" max="255" placeholder="e.g. 42">
+                  </div>
+                  <div style="flex:0 0 auto">
+                    <button id="m-go">Crack hash</button>
+                  </div>
+                </div>
+                <div style="margin-top:12px">
+                  <label for="p-hex">…or a raw GRP_TXT packet (hex)</label>
+                  <textarea id="p-hex" placeholder="1500ab…"></textarea>
+                  <div class="row" style="margin-top:10px">
+                    <button id="p-go">Crack packet</button>
+                  </div>
+                </div>
+              </div>
+            </details>
           </div>
 
-          <div class="panel">
-            <h2>Crack a specific hash</h2>
-            <p class="sub">Uses the charset &amp; max length from <b>Cracker config</b>. Dictionary/catalog is always tried first.</p>
-            <div class="row">
-              <div style="flex:0 0 160px">
-                <label for="m-hash">channel hash (0–255)</label>
-                <input id="m-hash" type="number" min="0" max="255" placeholder="e.g. 42">
-              </div>
-              <div style="flex:0 0 auto">
-                <button class="primary" id="m-go">Crack hash</button>
-              </div>
+          <!-- Filter chips + sort -->
+          <div class="list-controls">
+            <div class="chips" id="chips"></div>
+            <div class="sort">
+              <label for="sort-by" class="inline-label">Sort</label>
+              <select id="sort-by">
+                <option value="packets">Packets (activity)</option>
+                <option value="recent">Last activity</option>
+              </select>
             </div>
           </div>
 
-          <div class="panel">
-            <h2>Crack from a pasted packet</h2>
-            <label for="p-hex">raw GRP_TXT packet bytes (hex)</label>
-            <textarea id="p-hex" placeholder="1500ab…"></textarea>
-            <div class="row" style="margin-top:10px">
-              <div style="flex:0 0 auto">
-                <button class="primary" id="p-go">Crack packet</button>
-              </div>
-            </div>
+          <!-- Unified channel list -->
+          <div class="panel list-panel">
+            <div id="channel-list"><div class="loading">Loading…</div></div>
           </div>
         </section>
 
-        <!-- Channel message view -->
+        <!-- Channel detail view -->
         <section id="view-channel" style="display:none">
-          <div class="view-head">
-            <h1 id="msg-title">#channel</h1>
-            <span id="msg-stats" class="msg-stats"></span>
+          <button id="back-btn" class="back-btn">&#8592; Channels</button>
+          <div class="detail-head">
+            <div class="detail-title">
+              <h1 id="d-title">#channel</h1>
+              <span id="d-method" class="method-badge" style="display:none"></span>
+              <span id="d-state" class="state-pill"></span>
+            </div>
+            <div id="d-collision" class="collision-note" style="display:none"></div>
+            <div class="detail-stats" id="d-stats"></div>
           </div>
-          <div class="msg-toolbar">
-            <input id="msg-search" class="search" type="search" placeholder="Search messages & senders  (press /)">
-            <button id="msg-search-btn">Search</button>
+
+          <!-- Crack controls for Unknown / Exhausted -->
+          <div class="panel" id="d-crack-panel" style="display:none">
+            <h2>This channel is still encrypted</h2>
+            <p class="sub" id="d-crack-sub"></p>
+            <div id="d-attempt" class="attempt-info" style="display:none"></div>
+            <div class="row" style="align-items:center">
+              <button class="primary" id="d-crack-go">Crack this hash</button>
+              <button id="d-retry-go" style="display:none">Retry (clear exhausted)</button>
+            </div>
           </div>
-          <div id="msg-scroll" class="msg-scroll" style="height: calc(100vh - 230px); min-height: 280px">
-            <div id="msg-list" class="msg-list"></div>
+
+          <!-- Message stream -->
+          <div id="d-msg-wrap">
+            <div class="msg-toolbar">
+              <input id="msg-search" class="search" type="search" placeholder="Search messages & senders  (press /)">
+              <button id="msg-search-btn">Search</button>
+            </div>
+            <div id="msg-scroll" class="msg-scroll" style="height: calc(100vh - 300px); min-height: 260px">
+              <div id="msg-list" class="msg-list"></div>
+            </div>
           </div>
         </section>
 
@@ -152,17 +210,22 @@
           </div>
 
           <div class="panel">
-            <h2>Dictionary &amp; catalog</h2>
+            <h2>Dictionary, catalog &amp; rules</h2>
             <div class="stat-row" style="margin-bottom:14px">
               <div class="stat"><span class="v" id="wl-total">0</span><span class="k">total candidates</span></div>
               <div class="stat"><span class="v" id="wl-builtin">0</span><span class="k">built-in</span></div>
               <div class="stat"><span class="v" id="wl-catalog">0</span><span class="k">catalog</span></div>
+              <div class="stat"><span class="v" id="wl-rules">0</span><span class="k">rule mangles</span></div>
             </div>
-            <label class="toggle" style="margin-bottom:14px">
+            <label class="toggle" style="margin-bottom:12px">
               <span class="switch"><input type="checkbox" id="cfg-catalog"><span class="track"></span></span>
               <span>Include the bundled community catalog (~2.7K names)</span>
             </label>
-            <div style="margin-bottom:6px"><label>custom wordlists</label><div id="wl-custom"></div></div>
+            <label class="toggle" style="margin-bottom:6px">
+              <span class="switch"><input type="checkbox" id="cfg-rules"><span class="track"></span></span>
+              <span>Apply rule-based mangling to candidates <span id="cfg-rules-hint" class="faint"></span></span>
+            </label>
+            <div style="margin:14px 0 6px"><label>custom wordlists</label><div id="wl-custom"></div></div>
             <div class="row" style="margin-top:12px; align-items:flex-start">
               <div>
                 <label for="wl-text">add words (one per line)</label>
@@ -178,14 +241,14 @@
 
           <div class="panel">
             <h2>Auto-crack</h2>
-            <p class="sub">When on, pending channels are cracked automatically as they appear — dictionary first, then queued for brute-force (GPU only) on a miss. Status: <b id="auto-state">idle</b>.</p>
+            <p class="sub">When on, Unknown channels are cracked automatically as they appear — dictionary/rules first, then queued for brute-force (GPU only) on a miss. Status: <b id="auto-state">idle</b>.</p>
             <label class="toggle" style="margin-bottom:12px">
               <span class="switch"><input type="checkbox" id="cfg-auto"><span class="track"></span></span>
-              <span>Auto-crack pending channels</span>
+              <span>Auto-crack Unknown channels</span>
             </label>
             <label class="toggle">
               <span class="switch"><input type="checkbox" id="cfg-auto-dict"><span class="track"></span></span>
-              <span>Dictionary only (skip brute-force in auto)</span>
+              <span>Dictionary/rules only (skip brute-force in auto)</span>
             </label>
           </div>
         </section>

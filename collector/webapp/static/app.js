@@ -1,7 +1,16 @@
 /* MeshCore Channel Cracker — front-end logic.
-   Single page, no build step. Three views (Pending, Channel, Config) switched
-   in the main pane; a sidebar lists pending + cracked channels. Message views
-   are virtualized and paginated so thousands of rows never choke the DOM. */
+   Single page, no build step.
+
+   Model:
+     - A CHANNEL is one entity with a STATE (named | public | unknown | exhausted),
+       plus a transient "cracking" overlay while a job targets it.
+     - A channel HASH is a single cleartext byte (0–255) and a *colliding* identifier:
+       many channels can share one byte. Unknown/Exhausted rows are shown by hash.
+     - PACKETS are the encrypted frames seen on a hash; MESSAGES are the ones we've
+       decoded. They are distinct and shown as two columns everywhere.
+
+   Three views switch in the main pane: Channels (unified list), Channel (detail with
+   virtualized message stream), Config. */
 
 "use strict";
 
@@ -20,12 +29,20 @@ async function postJSON(url, body) {
   return r.json();
 }
 function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML; }
-function hex2(n) { return "0x" + (n || 0).toString(16).padStart(2, "0"); }
+function hex2(n) { return "0x" + (n || 0).toString(16).padStart(2, "0").toUpperCase(); }
 function fmtInt(n) { return (n || 0).toLocaleString(); }
 function fmtTime(ts) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
   return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+function fmtAgo(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 90) return "just now";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
 }
 function fmtBig(n) {
   if (n >= 1e12) return (n / 1e12).toFixed(1) + "T";
@@ -44,14 +61,32 @@ function toast(msg, isErr) {
   toastTimer = setTimeout(() => (t.className = ""), 3200);
 }
 
+/* ---------------- Method badges ---------------- */
+
+// Map a backend "method" to a short human label + css modifier.
+function methodBadge(method) {
+  switch (method) {
+    case "dictionary": return { label: "catalog", cls: "dict" };
+    case "rules":      return { label: "rules", cls: "rules" };
+    case "bruteforce": return { label: "GPU brute-force", cls: "brute" };
+    case "public":     return { label: "public PSK", cls: "public" };
+    default:           return { label: "recovered", cls: "unk" };
+  }
+}
+
 /* ---------------- App state ---------------- */
 
 const state = {
-  view: "pending",          // pending | channel | config
-  activeChannel: null,
+  view: "channels",            // channels | channel | config
+  active: null,                // active detail entry (unified row object)
   config: null,
-  pending: [],
-  channels: [],
+  channels: [],                // /api/channels
+  pending: [],                 // /api/pending
+  exhausted: [],               // /api/exhausted
+  crackStatus: null,           // /api/crack/status
+  entries: [],                 // unified, computed
+  filter: "all",               // all | named | unknown | cracking | exhausted | public
+  sort: "packets",             // packets | recent
   cracking: false,
 };
 
@@ -82,97 +117,283 @@ function updateThemeIcon() {
 async function refreshConfig() {
   const cfg = await getJSON("/api/config");
   state.config = cfg;
-  // engine badge
   const b = $("engine-badge");
   b.textContent = cfg.engine.toUpperCase();
   b.className = "badge " + cfg.engine;
   b.title = cfg.gpu.name ? cfg.gpu.name : (cfg.engine === "cpu" ? "CPU fallback" : "");
-  // mode badge
   const m = $("mode-badge");
   m.innerHTML = '<span class="dot"></span>' + (cfg.live ? "LIVE" : "OFFLINE");
   m.className = "badge " + (cfg.live ? "live" : "offline");
-  // db path
   $("db-path").textContent = cfg.db_path;
   $("db-path").title = cfg.db_path;
   return cfg;
 }
 
+/* ---------------- Unified channel model ---------------- */
+
+// Build state.entries from channels + pending + exhausted + crack status.
+function buildEntries() {
+  // Which hashes are being actively worked right now?
+  const crackingHashes = new Set();
+  let sweeping = false;
+  const st = state.crackStatus;
+  if (st) {
+    const jobs = [];
+    if (st.active) jobs.push(st.active);
+    for (const j of (st.queued || [])) jobs.push(j);
+    for (const j of jobs) {
+      if (j.kind === "sweep") sweeping = true;
+      else if (j.target_hash != null) crackingHashes.add(j.target_hash);
+    }
+    if (st.running && st.target_hash != null) crackingHashes.add(st.target_hash);
+  }
+
+  const exhMap = new Map();
+  for (const e of state.exhausted) exhMap.set(e.hash, e);
+
+  const entries = [];
+
+  // Named + public come from /api/channels.
+  for (const c of state.channels) {
+    const kind = c.state === "public" ? "public" : "named";
+    entries.push({
+      key: "name:" + c.channel_name,
+      kind,
+      name: c.channel_name,
+      hash: c.channel_hash,
+      method: c.method,
+      packets: c.packets,
+      messages: c.messages,
+      undecoded: c.undecoded || 0,
+      unique_senders: c.unique_senders || 0,
+      last_activity: c.last_activity,
+      cracking: crackingHashes.has(c.channel_hash),
+    });
+  }
+
+  // Unknown / exhausted come from /api/pending.
+  for (const p of state.pending) {
+    const isExh = !!p.exhausted;
+    const isCracking = sweeping || crackingHashes.has(p.hash);
+    entries.push({
+      key: "hash:" + p.hash,
+      kind: isExh ? "exhausted" : "unknown",
+      name: null,
+      hash: p.hash,
+      method: null,
+      packets: p.packet_count,
+      messages: 0,
+      undecoded: p.undecoded_count || 0,
+      unique_senders: 0,
+      last_activity: null,
+      cracking: isCracking,
+      attempt: exhMap.get(p.hash) || null,
+    });
+  }
+
+  state.entries = entries;
+  state.sweeping = sweeping;
+  return entries;
+}
+
+// Which filter buckets does an entry belong to?
+function entryBuckets(e) {
+  const b = ["all"];
+  b.push(e.kind);              // named | public | unknown | exhausted
+  if (e.cracking) b.push("cracking");
+  return b;
+}
+
+function filteredSorted() {
+  const f = state.filter;
+  let list = state.entries.filter((e) => entryBuckets(e).includes(f));
+  const by = state.sort;
+  list = list.slice().sort((a, b) => {
+    if (by === "recent") return (b.last_activity || 0) - (a.last_activity || 0);
+    return (b.packets || 0) - (a.packets || 0);
+  });
+  return list;
+}
+
+function bucketCounts() {
+  const c = { all: 0, named: 0, unknown: 0, cracking: 0, exhausted: 0, public: 0 };
+  for (const e of state.entries) {
+    for (const b of entryBuckets(e)) if (b in c) c[b]++;
+  }
+  return c;
+}
+
 /* ---------------- Sidebar ---------------- */
 
 function renderSidebar() {
-  // nav items
-  const pendingCount = state.pending.length;
-  $("nav-pending").classList.toggle("active", state.view === "pending");
-  $("nav-pending-count").textContent = pendingCount;
+  $("nav-channels").classList.toggle("active", state.view === "channels" || state.view === "channel");
   $("nav-config").classList.toggle("active", state.view === "config");
-
-  const el = $("nav-channels");
-  if (!state.channels.length) {
-    el.innerHTML = '<div class="empty" style="padding:8px">none yet</div>';
-    return;
-  }
-  el.innerHTML = "";
-  for (const c of state.channels) {
-    const btn = document.createElement("button");
-    btn.className = "nav-item" + (state.view === "channel" && state.activeChannel === c.channel_name ? " active" : "");
-    btn.innerHTML = `<span class="nm">${esc(c.channel_name)}</span>`
-      + `<span class="count">${fmtInt(c.msg_count)}</span>`;
-    btn.onclick = () => openChannel(c.channel_name);
-    el.appendChild(btn);
-  }
+  const c = bucketCounts();
+  $("nav-channels-count").textContent = c.all;
+  $("g-named").textContent = fmtInt(c.named + c.public);
+  $("g-unknown").textContent = fmtInt(c.unknown);
+  $("g-cracking").textContent = fmtInt(c.cracking);
+  $("g-exhausted").textContent = fmtInt(c.exhausted);
 }
 
 /* ---------------- View switching ---------------- */
 
 function setView(v) {
   state.view = v;
-  for (const id of ["view-pending", "view-channel", "view-config"]) {
+  for (const id of ["view-channels", "view-channel", "view-config"]) {
     $(id).style.display = ("view-" + v === id) ? "" : "none";
   }
   renderSidebar();
 }
 
-function showPending() { setView("pending"); refreshPending(); }
+function showChannels() { setView("channels"); renderChannels(); }
 function showConfig() { setView("config"); renderConfig(); }
 
-/* ---------------- Pending view ---------------- */
+/* ---------------- Channels (unified list) view ---------------- */
 
-async function refreshPending() {
-  try {
-    state.pending = await getJSON("/api/pending");
-  } catch (e) { state.pending = []; }
+const CHIPS = [
+  { id: "all", label: "All" },
+  { id: "named", label: "Named" },
+  { id: "unknown", label: "Unknown" },
+  { id: "cracking", label: "Cracking" },
+  { id: "exhausted", label: "Exhausted" },
+  { id: "public", label: "Public" },
+];
+
+function renderChips() {
+  const counts = bucketCounts();
+  const el = $("chips");
+  el.innerHTML = "";
+  for (const c of CHIPS) {
+    const btn = document.createElement("button");
+    btn.className = "chip" + (state.filter === c.id ? " active" : "")
+      + (c.id === "cracking" && counts.cracking ? " live" : "");
+    btn.innerHTML = `${esc(c.label)}<span class="chip-count">${counts[c.id] || 0}</span>`;
+    btn.onclick = () => { state.filter = c.id; renderChannels(); };
+    el.appendChild(btn);
+  }
+}
+
+function renderChannels() {
+  buildEntries();
+  renderChips();
   renderSidebar();
-  const el = $("pending-body");
-  if (!state.pending.length) {
-    el.innerHTML = '<div class="empty">No pending channels — everything decodes.</div>';
+  const el = $("channel-list");
+  const list = filteredSorted();
+  if (!list.length) {
+    el.innerHTML = '<div class="empty">' + emptyCopy() + "</div>";
     return;
   }
-  let html = "<table><thead><tr><th>hash</th><th>packets</th><th>undecoded</th><th></th></tr></thead><tbody>";
-  for (const p of state.pending) {
-    html += `<tr>
-      <td><code class="hash">${hex2(p.hash)}</code> <span class="faint">(${p.hash})</span></td>
-      <td>${fmtInt(p.packet_count)}</td>
-      <td>${fmtInt(p.undecoded_count)}</td>
-      <td class="nowrap"><button class="sm crack-btn" data-hash="${p.hash}">Crack</button></td>
-    </tr>`;
-  }
-  html += "</tbody></table>";
-  el.innerHTML = html;
-  for (const btn of el.querySelectorAll(".crack-btn")) {
-    btn.onclick = () => startCrack(parseInt(btn.dataset.hash, 10));
+  el.innerHTML = "";
+  for (const e of list) el.appendChild(channelRow(e));
+}
+
+function emptyCopy() {
+  switch (state.filter) {
+    case "named": return "No named channels recovered yet.";
+    case "unknown": return "No unknown channels — everything on the mesh decodes.";
+    case "cracking": return "Nothing is being cracked right now.";
+    case "exhausted": return "No exhausted hashes.";
+    case "public": return "No public channels seen.";
+    default: return "No channels seen yet.";
   }
 }
 
-/* ---------------- Crack actions + progress ---------------- */
+function channelRow(e) {
+  const row = document.createElement("div");
+  row.className = "chrow " + e.kind + (e.cracking ? " cracking" : "");
 
-function setCrackButtons(disabled) {
-  // Queue accepts jobs anytime; no need to disable the crack buttons.
+  // Identifier / identity column.
+  let ident;
+  if (e.kind === "unknown" || e.kind === "exhausted") {
+    ident = `<span class="ident hash-ident">hash <code>${hex2(e.hash)}</code>`
+      + `<span class="faint dec">(${e.hash})</span></span>`;
+  } else {
+    ident = `<span class="ident name-ident">${esc(e.name)}</span>`;
+  }
+
+  // State / method tag.
+  let tag = "";
+  if (e.kind === "named" || e.kind === "public") {
+    const mb = methodBadge(e.method);
+    tag = `<span class="method-badge ${mb.cls}">${esc(mb.label)}</span>`;
+  } else if (e.kind === "exhausted") {
+    tag = `<span class="state-pill exhausted">exhausted</span>`;
+  } else {
+    tag = `<span class="state-pill unknown">unknown</span>`;
+  }
+  if (e.cracking) tag += `<span class="state-pill cracking"><span class="spin">◐</span> cracking</span>`;
+
+  // packets vs messages columns.
+  const ratio = e.packets ? Math.round((e.messages / e.packets) * 100) : 0;
+  const msgCol = (e.kind === "named" || e.kind === "public")
+    ? `<span class="num">${fmtInt(e.messages)}</span><span class="col-k">messages</span><span class="pct">${ratio}%</span>`
+    : `<span class="num zero">0</span><span class="col-k">messages</span>`;
+
+  // Collision note (named channel with leftover undecodable packets on its byte).
+  let collision = "";
+  if ((e.kind === "named" || e.kind === "public") && e.undecoded > 0) {
+    collision = `<div class="collision-note">${esc(e.name)} · ${fmtInt(e.messages)}/${fmtInt(e.packets)} packets decoded · `
+      + `${fmtInt(e.undecoded)} still undecodable <span class="faint">(another channel on this hash?)</span></div>`;
+  }
+
+  // Per-row action.
+  let action = "";
+  if (e.kind === "unknown") {
+    action = `<button class="sm row-crack" ${e.cracking ? "disabled" : ""}>Crack</button>`;
+  } else if (e.kind === "exhausted") {
+    action = `<button class="sm row-retry" ${e.cracking ? "disabled" : ""}>Retry</button>`;
+  } else {
+    action = `<span class="row-go faint">View &#8594;</span>`;
+  }
+
+  row.innerHTML = `
+    <div class="chrow-top">
+      <div class="chrow-id">${ident} ${tag}</div>
+      <div class="chrow-cols">
+        <div class="col"><span class="num">${fmtInt(e.packets)}</span><span class="col-k">packets</span></div>
+        <div class="col">${msgCol}</div>
+        <div class="col meta-col">
+          <span class="num small">${e.unique_senders ? fmtInt(e.unique_senders) : "—"}</span><span class="col-k">senders</span>
+        </div>
+        <div class="col meta-col when"><span class="when-v">${e.last_activity ? fmtAgo(e.last_activity) : "—"}</span><span class="col-k">activity</span></div>
+        <div class="col action-col">${action}</div>
+      </div>
+    </div>
+    ${collision}`;
+
+  // Clicks: open detail (except the action button).
+  row.onclick = (ev) => {
+    if (ev.target.closest("button")) return;
+    openEntry(e);
+  };
+  const cb = row.querySelector(".row-crack");
+  if (cb) cb.onclick = (ev) => { ev.stopPropagation(); startCrack(e.hash); };
+  const rb = row.querySelector(".row-retry");
+  if (rb) rb.onclick = (ev) => { ev.stopPropagation(); retryCrack(e.hash); };
+  return row;
 }
+
+/* ---------------- Crack actions + progress + queue ---------------- */
 
 async function startCrack(hash) {
   const res = await postJSON("/api/crack", { hash });
-  if (res.started === false) { toast(res.error || "could not queue", true); return; }
+  if (res.queued === false || res.started === false) { toast(res.error || "could not queue", true); return; }
   toast(res.position > 1 ? `Queued (#${res.position})` : "Cracking…");
+  pollStatus();
+}
+
+async function retryCrack(hash) {
+  const res = await postJSON("/api/crack/retry", { hash });
+  if (res.queued === false || res.started === false || res.ok === false) { toast(res.error || "could not retry", true); return; }
+  toast("Retrying hash " + hex2(hash));
+  pollStatus();
+}
+
+async function startSweep() {
+  const res = await postJSON("/api/crack/sweep", {});
+  if (res.queued === false || res.started === false) { toast(res.error || "could not start sweep", true); return; }
+  toast("Sweeping all pending channels…");
   pollStatus();
 }
 
@@ -186,23 +407,13 @@ async function startCrackPacket() {
   const hex = $("p-hex").value.trim();
   if (!hex) { toast("Paste packet hex first", true); return; }
   const res = await postJSON("/api/crack/packet", { hex });
-  if (res.started === false) { toast(res.error || "could not queue", true); return; }
+  if (res.queued === false || res.started === false) { toast(res.error || "could not queue", true); return; }
   toast("Queued pasted packet");
   pollStatus();
 }
 
-async function cancelJob(id) {
-  await postJSON("/api/crack/cancel", { job_id: id });
-  pollStatus();
-}
-
-async function cancelAllJobs() {
-  await postJSON("/api/crack/cancel", { all: true });
-  pollStatus();
-}
-
-const JOB_STATE = { queued: "queued", running: "running", done: "done",
-                    canceled: "canceled", failed: "failed" };
+async function cancelJob(id) { await postJSON("/api/crack/cancel", { job_id: id }); pollStatus(); }
+async function cancelAllJobs() { await postJSON("/api/crack/cancel", { all: true }); pollStatus(); }
 
 function renderQueue(st) {
   const el = $("queue");
@@ -210,10 +421,9 @@ function renderQueue(st) {
   const queued = st.queued || [];
   const recent = st.recent || [];
   const rows = [];
-  if (active) rows.push(jobRow(active, true));
-  for (const j of queued) rows.push(jobRow(j, true));
-  // show a few recent finished jobs for context (no cancel)
-  for (const j of recent.slice(0, 4)) rows.push(jobRow(j, false));
+  if (active) rows.push(jobRow(active, true, st));
+  for (const j of queued) rows.push(jobRow(j, true, st));
+  for (const j of recent.slice(0, 4)) rows.push(jobRow(j, false, st));
   el.innerHTML = rows.length ? `<div class="queue-list">${rows.join("")}</div>` : "";
   $("q-cancel-all").style.display = (active || queued.length) ? "" : "none";
   for (const b of el.querySelectorAll("[data-cancel]")) {
@@ -221,18 +431,38 @@ function renderQueue(st) {
   }
 }
 
-function jobRow(j, cancelable) {
+function jobLabel(j, st) {
+  if (j.kind === "sweep") {
+    // Sweep of all pending channels.
+    if (j.status === "running" && st && st.running) {
+      const prog = `len ${st.length}/${st.max_length || "?"} · ${fmtInt(st.total || 0)} tried`;
+      return `Sweeping pending channels <span class="muted">(${prog})</span>`;
+    }
+    return `Sweep all pending channels`;
+  }
+  // Single hash.
+  const h = j.target_hash;
+  return `Crack hash ${h != null ? hex2(h) : ""}`;
+}
+
+function jobRow(j, cancelable, st) {
   const srcTag = j.source && j.source !== "manual" ? ` <span class="muted">(${esc(j.source)})</span>` : "";
-  let right = `<span class="qstate ${j.status}">${j.status}</span>`;
-  if (j.status === "done" && j.result && j.result.cracked) {
-    right = `<span class="qstate done">✅ ${esc(j.result.channel_name)}</span>`;
-  } else if (j.status === "done") {
-    right = `<span class="qstate failed">not found</span>`;
+  let right = `<span class="qstate ${j.status}">${esc(j.status)}</span>`;
+  const r = j.result;
+  if (j.status === "done" && r) {
+    if (j.kind === "sweep" && r.method === "sweep") {
+      const names = (r.names || []).map(esc).join(", ");
+      right = `<span class="qstate done">✅ ${fmtInt(r.found || 0)} found${names ? " · " + names : ""}</span>`;
+    } else if (r.cracked) {
+      right = `<span class="qstate done">✅ ${esc(r.channel_name)}</span>`;
+    } else {
+      right = `<span class="qstate failed">not found</span>`;
+    }
   }
   if (cancelable && (j.status === "queued" || j.status === "running")) {
     right += ` <button class="qcancel" data-cancel="${j.id}" title="Cancel">✕</button>`;
   }
-  return `<div class="qrow"><span>${esc(j.label)}${srcTag}</span><span>${right}</span></div>`;
+  return `<div class="qrow"><span>${jobLabel(j, st)}${srcTag}</span><span>${right}</span></div>`;
 }
 
 function renderProgress(st) {
@@ -240,20 +470,26 @@ function renderProgress(st) {
   if (st.running) {
     el.className = "progress running";
     const total = fmtInt(st.total || 0);
+    const who = st.target_hash != null ? "hash " + hex2(st.target_hash) : "sweep";
     el.innerHTML = `<span class="spin">◐</span>`
       + `<div class="bar"><span style="width:${st.max_length ? Math.min(100, (st.length / st.max_length) * 100) : 0}%"></span></div>`
-      + `<span class="nowrap">${(st.engine || "").toUpperCase()} · hash ${st.target_hash} · len ${st.length}/${st.max_length || "?"} · ${total} tried · ${(st.elapsed || 0).toFixed(1)}s</span>`;
+      + `<span class="nowrap">${(st.engine || "").toUpperCase()} · ${who} · len ${st.length}/${st.max_length || "?"} · ${total} tried · ${(st.elapsed || 0).toFixed(1)}s</span>`;
   } else if (st.result) {
     const r = st.result;
-    if (r.cracked) {
+    if (r.method === "sweep") {
+      el.className = r.found ? "progress ok" : "progress";
+      const names = (r.names || []).map(esc).join(", ");
+      el.innerHTML = r.found
+        ? `✅ Sweep recovered <b>${fmtInt(r.found)}</b> channel${r.found === 1 ? "" : "s"}${names ? ` — ${names}` : ""}.`
+        : `Sweep finished — no new channels recovered.`;
+    } else if (r.cracked) {
       el.className = "progress ok";
-      const via = r.method === "dictionary" ? "catalog"
-        : (r.method === "bruteforce" ? `${(st.engine || "").toUpperCase()} brute-force` : "");
-      el.innerHTML = `✅ Cracked <b>${esc(r.channel_name)}</b> (${hex2(r.channel_hash)})`
-        + (via ? ` via ${via}` : "") + ` — ${fmtInt(r.decoded_count)} messages decoded.`;
+      const mb = methodBadge(r.method);
+      el.innerHTML = `✅ Cracked <b>${esc(r.channel_name)}</b> (${hex2(r.channel_hash)}) via ${esc(mb.label)}`
+        + ` — ${fmtInt(r.decoded_count)} messages decoded.`;
     } else {
       el.className = "progress err";
-      el.innerHTML = `❌ Hash ${r.channel_hash} not cracked`
+      el.innerHTML = `❌ Hash ${r.channel_hash != null ? hex2(r.channel_hash) : "?"} not cracked`
         + (r.error ? ` — ${esc(r.error)}` : " (search exhausted).");
     }
   } else {
@@ -266,47 +502,159 @@ let _pollScheduled = false;
 async function pollStatus() {
   let st;
   try { st = await getJSON("/api/crack/status"); } catch (e) { st = { running: false }; }
+  state.crackStatus = st;
   renderProgress(st);
   renderQueue(st);
   const busy = st.running || (st.queued && st.queued.length) || st.active;
+  state.cracking = !!busy;
+  // Keep the unified list's cracking overlay fresh while jobs run.
+  if (state.view === "channels") renderChannels();
+  if (state.view === "channel" && state.active) refreshDetailState();
   if (busy) {
     if (!_pollScheduled) { _pollScheduled = true; setTimeout(() => { _pollScheduled = false; pollStatus(); }, 500); }
   } else {
-    state.cracking = false;
-    await refreshChannels();
-    await refreshPending();
-    if (state.view === "channel" && state.activeChannel) {
-      msgView.reload();  // a crack may have decoded new rows for the open channel
+    await refreshData();
+    if (state.view === "channels") renderChannels();
+    if (state.view === "channel" && state.active) {
+      await refreshDetailState();
+      if (state.active.kind === "named" || state.active.kind === "public") msgView.reload();
     }
   }
 }
 
-/* ---------------- Channels list (cracked) ---------------- */
+/* ---------------- Data refresh ---------------- */
 
-async function refreshChannels() {
-  try {
-    state.channels = await getJSON("/api/channels");
-  } catch (e) { state.channels = []; }
+async function refreshData() {
+  try { state.channels = await getJSON("/api/channels"); } catch (e) { state.channels = []; }
+  try { state.pending = await getJSON("/api/pending"); } catch (e) { state.pending = []; }
+  try { state.exhausted = await getJSON("/api/exhausted"); } catch (e) { state.exhausted = []; }
+  buildEntries();
   renderSidebar();
+}
+
+/* ---------------- Channel detail view ---------------- */
+
+function openEntry(e) {
+  state.active = e;
+  setView("channel");
+  renderDetail(e);
+  if (e.kind === "named" || e.kind === "public") {
+    $("d-msg-wrap").style.display = "";
+    msgView.open(e.name);
+  } else {
+    $("d-msg-wrap").style.display = "none";
+  }
+}
+
+// Re-locate the active entry in fresh data (its state may have changed after a crack).
+async function refreshDetailState() {
+  if (!state.active) return;
+  buildEntries();
+  let next = null;
+  if (state.active.name) next = state.entries.find((x) => x.name === state.active.name);
+  if (!next && state.active.hash != null) next = state.entries.find((x) => x.hash === state.active.hash);
+  if (next) {
+    const wasEncrypted = state.active.kind === "unknown" || state.active.kind === "exhausted";
+    state.active = next;
+    renderDetail(next);
+    // A hash we were viewing just got a name — load its messages.
+    if (wasEncrypted && (next.kind === "named" || next.kind === "public")) {
+      $("d-msg-wrap").style.display = "";
+      msgView.open(next.name);
+    }
+  }
+}
+
+function renderDetail(e) {
+  const encrypted = e.kind === "unknown" || e.kind === "exhausted";
+  // Title.
+  if (encrypted) {
+    $("d-title").innerHTML = `hash <code>${hex2(e.hash)}</code> <span class="faint dec">(${e.hash})</span>`;
+  } else {
+    $("d-title").textContent = e.name;
+  }
+  // Method badge.
+  const mb = $("d-method");
+  if (e.kind === "named" || e.kind === "public") {
+    const b = methodBadge(e.method);
+    mb.textContent = b.label;
+    mb.className = "method-badge " + b.cls;
+    mb.style.display = "";
+  } else {
+    mb.style.display = "none";
+  }
+  // State pill.
+  const sp = $("d-state");
+  const stateLabel = { named: "named", public: "public", unknown: "unknown", exhausted: "exhausted" }[e.kind];
+  sp.textContent = e.cracking ? "cracking…" : stateLabel;
+  sp.className = "state-pill " + (e.cracking ? "cracking" : e.kind);
+
+  // Collision note.
+  const col = $("d-collision");
+  if ((e.kind === "named" || e.kind === "public") && e.undecoded > 0) {
+    col.style.display = "";
+    col.innerHTML = `${esc(e.name)} · ${fmtInt(e.messages)}/${fmtInt(e.packets)} packets decoded · `
+      + `${fmtInt(e.undecoded)} still undecodable <span class="faint">(another channel sharing this hash?)</span>`;
+  } else {
+    col.style.display = "none";
+  }
+
+  // Stats row (packets vs messages explicit).
+  const ratio = e.packets ? Math.round((e.messages / e.packets) * 100) : 0;
+  $("d-stats").innerHTML = [
+    stat(fmtInt(e.packets), "packets (encrypted)"),
+    stat(encrypted ? "0" : fmtInt(e.messages), "messages (decoded)"),
+    encrypted ? "" : stat(ratio + "%", "decoded"),
+    stat(e.unique_senders ? fmtInt(e.unique_senders) : "—", "unique senders"),
+    stat(e.last_activity ? fmtAgo(e.last_activity) : "—", "last activity"),
+  ].filter(Boolean).join("");
+
+  // Crack controls for encrypted channels.
+  const panel = $("d-crack-panel");
+  if (encrypted) {
+    panel.style.display = "";
+    $("d-crack-sub").textContent = e.kind === "exhausted"
+      ? "Already swept at the current parameters without a hit. Retry clears the exhausted mark and tries again."
+      : "Recover the name to decode every stored packet on this hash. Dictionary/catalog/rules first, then brute-force.";
+    const attempt = $("d-attempt");
+    if (e.kind === "exhausted" && e.attempt) {
+      attempt.style.display = "";
+      const a = e.attempt;
+      attempt.innerHTML = `Last attempt: charset <code>${esc(a.charset || "?")}</code>, max length `
+        + `<b>${esc(a.max_length)}</b>, ${fmtInt(a.packets_seen)} packets seen`
+        + (a.attempted_at ? ` · ${fmtTime(a.attempted_at)}` : "");
+    } else {
+      attempt.style.display = "none";
+    }
+    $("d-crack-go").disabled = !!e.cracking;
+    $("d-retry-go").style.display = e.kind === "exhausted" ? "" : "none";
+    $("d-retry-go").disabled = !!e.cracking;
+  } else {
+    panel.style.display = "none";
+  }
+}
+
+function stat(v, k) {
+  return `<div class="stat"><span class="v">${esc(v)}</span><span class="k">${esc(k)}</span></div>`;
 }
 
 /* ---------------- Channel message view (virtualized) ---------------- */
 
 const msgView = (function () {
-  const ROW_EST = 34;        // estimated row height (px) for the spacer math
-  const WINDOW = 60;         // rows rendered around the viewport
-  const PAGE = 80;           // rows fetched per page
+  const ROW_EST = 34;
+  const WINDOW = 60;
+  const PAGE = 80;
   let channel = null;
   let search = "";
-  let rows = [];             // newest-first
+  let rows = [];
   let total = 0;
-  let oldestId = null;       // cursor for paging back
-  let newestId = null;       // cursor for incremental live fetch
+  let oldestId = null;
+  let newestId = null;
   let hasMore = true;
   let loading = false;
   let avgRow = ROW_EST;
   let winStart = 0;
-  let scrollEl, listEl, topSpacer, bottomSpacer, rowsHost;
+  let scrollEl, listEl;
 
   function mount() {
     scrollEl = $("msg-scroll");
@@ -318,7 +666,6 @@ const msgView = (function () {
     channel = name;
     search = $("msg-search").value.trim();
     rows = []; total = 0; oldestId = null; newestId = null; hasMore = true; winStart = 0;
-    $("msg-title").textContent = name;
     $("msg-list").innerHTML = '<div class="loading">Loading…</div>';
     await loadOlder(true);
   }
@@ -340,7 +687,7 @@ const msgView = (function () {
       total = data.total;
       hasMore = data.has_more;
       if (data.messages.length) {
-        rows = rows.concat(data.messages);           // older rows appended (newest-first list)
+        rows = rows.concat(data.messages);
         oldestId = data.oldest_id;
         if (first) newestId = data.newest_id;
       } else {
@@ -356,13 +703,11 @@ const msgView = (function () {
     render();
   }
 
-  // Fetch rows newer than our newest cursor and prepend them (live updates).
   async function loadNewer() {
     if (loading || !channel || newestId == null) return;
     try {
       const data = await getJSON(url({ limit: 200, after_id: newestId }));
       if (data.messages && data.messages.length) {
-        // messages are newest-first; prepend preserving order
         rows = data.messages.concat(rows);
         newestId = data.newest_id;
         total = data.total;
@@ -376,14 +721,15 @@ const msgView = (function () {
 
   function renderStats() {
     const s = search ? ` matching “${esc(search)}”` : "";
-    $("msg-stats").innerHTML = `${fmtInt(total)} message${total === 1 ? "" : "s"}${s}`;
+    const el = document.querySelector("#d-msg-wrap .msg-count");
+    const txt = `${fmtInt(total)} message${total === 1 ? "" : "s"}${s}`;
+    if (el) el.textContent = txt;
   }
 
   function onScroll() {
     const st = scrollEl.scrollTop;
     const newWin = Math.max(0, Math.floor(st / avgRow) - 8);
     if (Math.abs(newWin - winStart) >= 8) { winStart = newWin; render(); }
-    // Near the bottom: fetch older rows.
     if (st + scrollEl.clientHeight >= scrollEl.scrollHeight - 400) loadOlder(false);
   }
 
@@ -399,11 +745,10 @@ const msgView = (function () {
     html += `<div style="height:${(rows.length - end) * avgRow}px"></div>`;
     if (loading) html += '<div class="loading">Loading more…</div>';
     listEl.innerHTML = html;
-    measure(start, end);
+    measure();
   }
 
-  function measure(start, end) {
-    // Refine avgRow from rendered rows so the spacers stay roughly accurate.
+  function measure() {
     const sample = listEl.querySelectorAll(".msg");
     if (sample.length) {
       let h = 0;
@@ -432,12 +777,6 @@ const msgView = (function () {
   return { mount, open, reload, loadNewer, doSearch };
 })();
 
-function openChannel(name) {
-  state.activeChannel = name;
-  setView("channel");
-  msgView.open(name);
-}
-
 /* ---------------- Config view ---------------- */
 
 function renderConfig() {
@@ -445,7 +784,6 @@ function renderConfig() {
   if (!cfg) return;
   const s = cfg.settings;
 
-  // engine
   $("cfg-engine").value = s.engine;
   $("cfg-engine-gpu").textContent = cfg.gpu.available
     ? "GPU available" + (cfg.gpu.name ? ` (${cfg.gpu.name})` : "")
@@ -453,22 +791,25 @@ function renderConfig() {
   $("cfg-engine-gpu").className = "field-hint " + (cfg.gpu.available ? "" : "warn-note");
   $("cfg-engine-opt-gpu").disabled = !cfg.gpu.available;
 
-  // brute-force params
   $("cfg-charset").value = s.charset;
   $("cfg-maxlen").value = s.max_length;
   updateSearchEstimate();
 
-  // wordlist
-  $("wl-total").textContent = fmtInt(cfg.wordlist.total);
-  $("wl-builtin").textContent = fmtInt(cfg.wordlist.builtin);
-  $("wl-catalog").textContent = fmtInt(cfg.wordlist.catalog);
-  $("cfg-catalog").checked = cfg.wordlist.catalog_enabled;
-  const files = cfg.wordlist.custom_files || [];
+  const wl = cfg.wordlist;
+  $("wl-total").textContent = fmtInt(wl.total);
+  $("wl-builtin").textContent = fmtInt(wl.builtin);
+  $("wl-catalog").textContent = fmtInt(wl.catalog);
+  $("wl-rules").textContent = fmtInt(wl.rules_count || 0);
+  $("cfg-catalog").checked = wl.catalog_enabled;
+  $("cfg-rules").checked = !!s.use_rules;
+  $("cfg-rules-hint").textContent = wl.rules_enabled
+    ? (wl.rules_built ? `(${fmtInt(wl.rules_count)} mangles built)` : "(built on demand)")
+    : "";
+  const files = wl.custom_files || [];
   $("wl-custom").innerHTML = files.length
     ? files.map((f) => `<div class="faint mono" style="font-size:12px">+ ${esc(f)}</div>`).join("")
     : '<span class="faint">none</span>';
 
-  // auto-crack
   $("cfg-auto").checked = s.auto_crack;
   $("cfg-auto-dict").checked = s.auto_dict_only;
   $("cfg-auto-dict").disabled = !s.auto_crack;
@@ -486,26 +827,15 @@ function updateSearchEstimate() {
   $("cfg-estimate-warn").style.display = warn ? "" : "none";
 }
 
-async function saveEngine() {
-  await applyConfig({ engine: $("cfg-engine").value });
-}
+async function saveEngine() { await applyConfig({ engine: $("cfg-engine").value }); }
 async function saveBrute() {
-  await applyConfig({
-    charset: $("cfg-charset").value,
-    max_length: parseInt($("cfg-maxlen").value, 10),
-  });
+  await applyConfig({ charset: $("cfg-charset").value, max_length: parseInt($("cfg-maxlen").value, 10) });
   toast("Brute-force defaults saved");
 }
-async function toggleCatalog() {
-  await applyConfig({ use_catalog: $("cfg-catalog").checked });
-}
-async function toggleAuto() {
-  await applyConfig({ auto_crack: $("cfg-auto").checked });
-  pollStatus();  // reflect auto-queued jobs immediately
-}
-async function toggleAutoDict() {
-  await applyConfig({ auto_dict_only: $("cfg-auto-dict").checked });
-}
+async function toggleCatalog() { await applyConfig({ use_catalog: $("cfg-catalog").checked }); }
+async function toggleRules() { await applyConfig({ use_rules: $("cfg-rules").checked }); }
+async function toggleAuto() { await applyConfig({ auto_crack: $("cfg-auto").checked }); pollStatus(); }
+async function toggleAutoDict() { await applyConfig({ auto_dict_only: $("cfg-auto-dict").checked }); }
 
 async function applyConfig(patch) {
   try {
@@ -537,9 +867,11 @@ function onKey(e) {
     return;
   }
   if (e.key === "/") { e.preventDefault(); if (state.view === "channel") $("msg-search").focus(); }
-  else if (e.key === "p") showPending();
+  else if (e.key === "g") showChannels();
   else if (e.key === "c") showConfig();
+  else if (e.key === "s") { if (state.view !== "config") startSweep(); }
   else if (e.key === "t") toggleTheme();
+  else if (e.key === "Escape" && state.view === "channel") showChannels();
 }
 
 /* ---------------- Init ---------------- */
@@ -548,12 +880,25 @@ async function init() {
   initTheme();
   msgView.mount();
 
+  // Message toolbar count element (kept out of the virtualized list).
+  const tb = document.querySelector("#d-msg-wrap .msg-toolbar");
+  if (tb && !tb.querySelector(".msg-count")) {
+    const span = document.createElement("span");
+    span.className = "msg-count msg-stats";
+    tb.appendChild(span);
+  }
+
   $("theme-btn").onclick = toggleTheme;
-  $("nav-pending").onclick = showPending;
+  $("nav-channels").onclick = showChannels;
   $("nav-config").onclick = showConfig;
+  $("back-btn").onclick = showChannels;
+  $("sweep-go").onclick = startSweep;
   $("m-go").onclick = startCrackHash;
   $("p-go").onclick = startCrackPacket;
+  $("sort-by").onchange = () => { state.sort = $("sort-by").value; renderChannels(); };
   $("msg-search-btn").onclick = () => msgView.doSearch();
+  $("d-crack-go").onclick = () => { if (state.active) startCrack(state.active.hash); };
+  $("d-retry-go").onclick = () => { if (state.active) retryCrack(state.active.hash); };
   $("cfg-engine").onchange = saveEngine;
   $("cfg-charset").oninput = updateSearchEstimate;
   $("cfg-maxlen").oninput = updateSearchEstimate;
@@ -561,6 +906,7 @@ async function init() {
   $("cfg-maxlen").onchange = saveBrute;
   $("cfg-save-brute").onclick = saveBrute;
   $("cfg-catalog").onchange = toggleCatalog;
+  $("cfg-rules").onchange = toggleRules;
   $("cfg-auto").onchange = toggleAuto;
   $("cfg-auto-dict").onchange = toggleAutoDict;
   $("q-cancel-all").onclick = cancelAllJobs;
@@ -568,17 +914,17 @@ async function init() {
   document.addEventListener("keydown", onKey);
 
   await refreshConfig();
-  await refreshChannels();
-  setView("pending");
-  await refreshPending();
-  await pollStatus();                 // reflect any in-flight / last result
+  await refreshData();
+  setView("channels");
+  renderChannels();
+  await pollStatus();
 
-  // Periodic incremental refresh (polling, but cheap).
   setInterval(() => {
-    if (state.cracking) return;
-    refreshPending();
-    refreshChannels();
-    if (state.view === "channel") msgView.loadNewer();
+    if (state.cracking) return;   // poll loop handles refresh while busy
+    refreshData().then(() => {
+      if (state.view === "channels") renderChannels();
+      if (state.view === "channel") msgView.loadNewer();
+    });
   }, 5000);
 }
 
