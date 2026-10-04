@@ -164,6 +164,7 @@ function buildEntries() {
       method: c.method,
       packets: c.packets,
       messages: c.messages,
+      decoded_packets: c.decoded_packets != null ? c.decoded_packets : c.packets,
       undecoded: c.undecoded || 0,
       unique_senders: c.unique_senders || 0,
       last_activity: c.last_activity,
@@ -324,8 +325,9 @@ function channelRow(e) {
   }
   if (e.cracking) tag += `<span class="state-pill cracking"><span class="spin">◐</span> cracking</span>`;
 
-  // packets vs messages columns.
-  const ratio = e.packets ? Math.round((e.messages / e.packets) * 100) : 0;
+  // packets vs messages columns. The % is packet coverage (how much of this
+  // hash's traffic is readable) = decoded packets / total packets.
+  const ratio = e.packets ? Math.round((e.decoded_packets / e.packets) * 100) : 0;
   const msgCol = (e.kind === "named" || e.kind === "public")
     ? `<span class="num">${fmtInt(e.messages)}</span><span class="col-k">messages</span><span class="pct">${ratio}%</span>`
     : `<span class="num zero">0</span><span class="col-k">messages</span>`;
@@ -333,7 +335,7 @@ function channelRow(e) {
   // Collision note (named channel with leftover undecodable packets on its byte).
   let collision = "";
   if ((e.kind === "named" || e.kind === "public") && e.undecoded > 0) {
-    collision = `<div class="collision-note">${esc(e.name)} · ${fmtInt(e.messages)}/${fmtInt(e.packets)} packets decoded · `
+    collision = `<div class="collision-note">${esc(e.name)} · ${fmtInt(e.decoded_packets)}/${fmtInt(e.packets)} packets decoded · `
       + `${fmtInt(e.undecoded)} still undecodable <span class="faint">(another channel on this hash?)</span></div>`;
   }
 
@@ -597,14 +599,14 @@ function renderDetail(e) {
   const col = $("d-collision");
   if ((e.kind === "named" || e.kind === "public") && e.undecoded > 0) {
     col.style.display = "";
-    col.innerHTML = `${esc(e.name)} · ${fmtInt(e.messages)}/${fmtInt(e.packets)} packets decoded · `
+    col.innerHTML = `${esc(e.name)} · ${fmtInt(e.decoded_packets)}/${fmtInt(e.packets)} packets decoded · `
       + `${fmtInt(e.undecoded)} still undecodable <span class="faint">(another channel sharing this hash?)</span>`;
   } else {
     col.style.display = "none";
   }
 
   // Stats row (packets vs messages explicit).
-  const ratio = e.packets ? Math.round((e.messages / e.packets) * 100) : 0;
+  const ratio = e.packets ? Math.round((e.decoded_packets / e.packets) * 100) : 0;
   $("d-stats").innerHTML = [
     stat(fmtInt(e.packets), "packets (encrypted)"),
     stat(encrypted ? "0" : fmtInt(e.messages), "messages (decoded)"),

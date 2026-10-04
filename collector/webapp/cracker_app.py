@@ -340,24 +340,7 @@ class CrackerApp:
         """Hashes seen in stored GRP_TXT packets that still have undecoded
         packets, each with its packet counts. Unioned with the live cracker's
         pending set so freshly-seen hashes show up before they hit the DB."""
-        by_hash = defaultdict(lambda: {"total": 0, "undecoded": 0})
-
-        packets = self.store.get_grp_txt_packets()
-        for pkt in packets:
-            raw_hex = pkt.get("raw_hex", "")
-            if not raw_hex:
-                continue
-            try:
-                raw = bytes.fromhex(raw_hex)
-            except ValueError:
-                continue
-            extracted = extract_group_payload(raw)
-            if not extracted:
-                continue
-            h = extracted["channel_hash"]
-            by_hash[h]["total"] += 1
-            if not self.store.has_channel_message_for_packet(pkt["id"]):
-                by_hash[h]["undecoded"] += 1
+        by_hash = self._hash_packet_stats()
 
         charset = self._settings["charset"]
         max_length = self._settings["max_length"]
@@ -394,11 +377,17 @@ class CrackerApp:
 
     def _packet_count_for_hash(self, target_hash: int) -> int:
         """Count stored GRP_TXT packets with this channel hash."""
-        return self._packet_counts_by_hash().get(int(target_hash), 0)
+        st = self._hash_packet_stats().get(int(target_hash))
+        return st["total"] if st else 0
 
-    def _packet_counts_by_hash(self) -> dict:
-        """One scan: {channel_hash: GRP_TXT packet count}."""
-        counts = defaultdict(int)
+    def _hash_packet_stats(self) -> dict:
+        """One scan: {channel_hash: {"total": n, "undecoded": m}}.
+
+        `undecoded` counts packets with no decoded message row — the real
+        still-encrypted count. (packets - distinct messages would wrongly
+        include relay duplicates, which ARE decoded.)
+        """
+        stats = defaultdict(lambda: {"total": 0, "undecoded": 0})
         for pkt in self.store.get_grp_txt_packets():
             raw_hex = pkt.get("raw_hex", "")
             if not raw_hex:
@@ -408,9 +397,13 @@ class CrackerApp:
             except ValueError:
                 continue
             extracted = extract_group_payload(raw)
-            if extracted:
-                counts[extracted["channel_hash"]] += 1
-        return counts
+            if not extracted:
+                continue
+            st = stats[extracted["channel_hash"]]
+            st["total"] += 1
+            if not self.store.has_channel_message_for_packet(pkt["id"]):
+                st["undecoded"] += 1
+        return stats
 
     def is_exhausted(self, target_hash, charset, max_length, current_packets=None) -> bool:
         """True if (hash, charset, max_length) was already swept without a hit
@@ -1059,7 +1052,7 @@ class CrackerApp:
             rows = self.store.get_named_channel_summaries()
         except Exception:
             rows = []
-        pkt_counts = self._packet_counts_by_hash()
+        stats = self._hash_packet_stats()
         out = []
         for row in rows:
             name = row["channel_name"]
@@ -1073,7 +1066,7 @@ class CrackerApp:
                     hb = None
             method = row.get("method") or ("public" if is_public else "?")
             messages = row.get("msg_count") or 0
-            packets = pkt_counts.get(hb, 0) if hb is not None else 0
+            st = stats.get(hb, {"total": 0, "undecoded": 0}) if hb is not None else {"total": 0, "undecoded": 0}
             out.append({
                 "channel_name": name,
                 "channel_hash": hb,
@@ -1081,8 +1074,11 @@ class CrackerApp:
                 "method": method,
                 "messages": messages,
                 "msg_count": messages,          # legacy alias
-                "packets": packets,
-                "undecoded": max(0, packets - messages),  # >0 hints a hash collision
+                "packets": st["total"],
+                "decoded_packets": st["total"] - st["undecoded"],
+                # still-encrypted packets on this hash = a different channel
+                # sharing the byte (relay duplicates are decoded, not counted).
+                "undecoded": st["undecoded"],
                 "unique_senders": row.get("unique_senders") or 0,
                 "last_activity": row.get("last_activity"),
                 "discovered_at": row.get("discovered_at"),
