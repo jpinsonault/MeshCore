@@ -487,6 +487,10 @@ function renderProgress(st) {
       const mb = methodBadge(r.method);
       el.innerHTML = `✅ Cracked <b>${esc(r.channel_name)}</b> (${hex2(r.channel_hash)}) via ${esc(mb.label)}`
         + ` — ${fmtInt(r.decoded_count)} messages decoded.`;
+    } else if (r.need_more_packets) {
+      el.className = "progress";
+      el.innerHTML = `Hash ${hex2(r.channel_hash)}: only one encrypted packet seen — `
+        + `need at least 2 to brute-force safely. Tried the dictionary/rules; waiting for more traffic.`;
     } else {
       el.className = "progress err";
       el.innerHTML = `❌ Hash ${r.channel_hash != null ? hex2(r.channel_hash) : "?"} not cracked`
