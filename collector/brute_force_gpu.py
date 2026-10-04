@@ -435,8 +435,8 @@ def brute_force_batch_gpu(
                         del active[hb]
                         d_wanted[hb] = 0  # stop testing this hash on-GPU
             pos += count
-        if on_progress:
-            on_progress(length, total, time.monotonic() - t0)
+            if on_progress:
+                on_progress(length, pos, time.monotonic() - t0)
 
     return solved
 
@@ -551,7 +551,7 @@ def brute_force_channel_gpu(
                     if name is not None:
                         return name
             pos += count
-        if on_progress:
-            on_progress(length, total, time.monotonic() - t0)
+            if on_progress:
+                on_progress(length, pos, time.monotonic() - t0)
 
     return None
