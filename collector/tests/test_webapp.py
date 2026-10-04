@@ -226,3 +226,28 @@ def test_http_crack_packet_bad_hex(http_server):
     res = _post(base, "/api/crack/packet", {"hex": "zzzz"})
     assert res["started"] is False
     assert "error" in res
+
+
+def test_health_offline_shape(seeded_store):
+    store, _ = seeded_store
+    app = CrackerApp(store, use_gpu=False)
+    h = app.health()
+    assert h["live"] is False          # no core attached
+    assert h["connected"] is False
+    assert h["last_packet_at"] is not None   # seeded packets exist
+    assert h["connection_events"] == []
+    assert h["device_boots"] == []
+
+
+def test_health_reports_boots_and_events(seeded_store):
+    store, _ = seeded_store
+    store.record_connection_event("connected", detail="protocol v2", now=10.0)
+    store.store_device_boot({
+        "reset_reason": 7, "reset_reason_name": "brownout", "boot_count": 4,
+        "prev_alive": True, "prev_uptime_secs": 900, "prev_heap_min": 30000,
+        "prev_rssi": -80, "prev_err_flags": 0,
+    }, now=11.0)
+    app = CrackerApp(store, use_gpu=False)
+    h = app.health()
+    assert any(b["reset_name"] == "brownout" for b in h["device_boots"])
+    assert any(e["event"] == "connected" for e in h["connection_events"])

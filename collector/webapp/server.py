@@ -97,6 +97,7 @@ def make_handler(app: CrackerApp):
                 "/api/results": app.results,
                 "/api/crack/status": app.crack_status,
                 "/api/exhausted": app.exhausted_channels,
+                "/api/health": app.health,
             }
             handler = get_routes.get(path)
             if handler:

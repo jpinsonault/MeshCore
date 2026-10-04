@@ -950,6 +950,32 @@ class CrackerApp:
             st["queue_len"] = len(self._queue)
         return st
 
+    def health(self) -> dict:
+        """Link + device health: live connection state, the durable connection
+        event log, and the device boot/crash log. Lets the UI show *why* data
+        stopped (device off WiFi, a crash, a reboot) instead of just going stale."""
+        connected = bool(getattr(self.core, "is_connected", False)) if self.core else False
+        try:
+            events = self.store.get_connection_events(limit=50)
+        except Exception:
+            events = []
+        try:
+            boots = self.store.get_device_boots(limit=25)
+        except Exception:
+            boots = []
+        last_packet = None
+        try:
+            last_packet = self.store.get_last_packet_time()
+        except Exception:
+            pass
+        return {
+            "live": self.core is not None,
+            "connected": connected,
+            "last_packet_at": last_packet,
+            "connection_events": events,
+            "device_boots": boots,
+        }
+
     def _crack_running(self) -> bool:
         with self._lock:
             return self._current is not None

@@ -14,6 +14,7 @@
     <div class="spacer"></div>
     <div class="meta">
       <span id="mode-badge" class="badge offline"><span class="dot"></span>…</span>
+      <span id="fresh-badge" class="badge" style="display:none" title="How fresh the capture is"></span>
       <span id="engine-badge" class="badge">…</span>
       <span id="db-path" class="db-path" title=""></span>
       <button id="theme-btn" class="icon-btn" title="Toggle theme (t)">&#9728;</button>
@@ -32,6 +33,9 @@
         </button>
         <button id="nav-config" class="nav-item">
           <span class="nm">Cracker config</span>
+        </button>
+        <button id="nav-health" class="nav-item">
+          <span class="nm">Device &amp; link</span>
         </button>
       </div>
 
@@ -250,6 +254,24 @@
               <span class="switch"><input type="checkbox" id="cfg-auto-dict"><span class="track"></span></span>
               <span>Dictionary/rules only (skip brute-force in auto)</span>
             </label>
+          </div>
+        </section>
+
+        <!-- Device & link health -->
+        <section id="view-health" style="display:none">
+          <div class="panel">
+            <h2>Link status</h2>
+            <p class="sub" id="health-summary">Loading…</p>
+          </div>
+          <div class="panel">
+            <h2>Device reboots</h2>
+            <p class="sub">Why the device last restarted, recovered from its RTC memory on each reconnect — so a crash or power loss leaves a trail even though the device's RAM is wiped.</p>
+            <div id="boot-list"><div class="loading">Loading…</div></div>
+          </div>
+          <div class="panel">
+            <h2>Connection history</h2>
+            <p class="sub">Link up/down events, kept on disk so the history survives a collector restart.</p>
+            <div id="conn-list"><div class="loading">Loading…</div></div>
           </div>
         </section>
 

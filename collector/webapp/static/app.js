@@ -129,6 +129,91 @@ async function refreshConfig() {
   return cfg;
 }
 
+/* ---------------- Device & link health ---------------- */
+
+function fmtDur(secs) {
+  if (secs == null) return "—";
+  secs = Math.max(0, Math.round(secs));
+  if (secs < 60) return secs + "s";
+  if (secs < 3600) return Math.floor(secs / 60) + "m " + (secs % 60) + "s";
+  if (secs < 86400) return Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m";
+  return Math.floor(secs / 86400) + "d " + Math.floor((secs % 86400) / 3600) + "h";
+}
+
+// A reboot cause that isn't a clean power-on / external reset is worth flagging.
+const BOOT_BAD = new Set(["panic/crash", "interrupt watchdog", "task watchdog", "watchdog", "brownout"]);
+
+async function refreshHealth() {
+  let h;
+  try { h = await getJSON("/api/health"); } catch (e) { h = null; }
+  state.health = h;
+  updateFreshBadge(h);
+  if (state.view === "health") renderHealth();
+  return h;
+}
+
+// Topbar indicator: how stale the capture is. This is the at-a-glance answer to
+// "why are the messages hours old" — a dropped device shows up here immediately.
+function updateFreshBadge(h) {
+  const b = $("fresh-badge");
+  if (!h || !h.live) { b.style.display = "none"; return; }
+  b.style.display = "";
+  const last = h.last_packet_at;
+  const age = last ? (Date.now() / 1000 - last) : null;
+  let cls, label;
+  if (!h.connected) { cls = "offline"; label = "LINK DOWN"; }
+  else if (age == null) { cls = "warn"; label = "no packets yet"; }
+  else if (age > 300) { cls = "warn"; label = "stale " + fmtAgo(last).replace(" ago", ""); }
+  else { cls = "live"; label = "fresh"; }
+  b.className = "badge " + cls;
+  b.innerHTML = '<span class="dot"></span>' + label;
+  b.title = last ? ("last packet " + fmtTime(last) + " (" + fmtAgo(last) + ")") : "no packets captured yet";
+}
+
+function renderHealth() {
+  const h = state.health;
+  const sum = $("health-summary");
+  if (!h) { sum.textContent = "Unavailable."; return; }
+  if (!h.live) {
+    sum.textContent = "Offline mode — serving a stored database, no live device link.";
+  } else {
+    const last = h.last_packet_at;
+    sum.innerHTML = (h.connected
+        ? '<b class="ok">Connected</b> to the device.'
+        : '<b class="bad">Link down</b> — not currently receiving.')
+      + " Last packet: " + (last ? esc(fmtTime(last)) + " (" + esc(fmtAgo(last)) + ")" : "none yet") + ".";
+  }
+
+  const boots = (h.device_boots || []);
+  $("boot-list").innerHTML = boots.length ? boots.map(b => {
+    const bad = BOOT_BAD.has(b.reset_name);
+    const prev = b.prev_alive
+      ? `ran ${fmtDur(b.prev_uptime_secs)} · heap min ${fmtInt(b.prev_heap_min)}B` +
+        (b.prev_rssi ? ` · RSSI ${b.prev_rssi}dBm` : "")
+      : "cold boot (no prior stats)";
+    return `<div class="hrow">
+      <span class="state-pill ${bad ? "bad" : ""}">${esc(b.reset_name || "?")}</span>
+      <span class="hmain">boot #${esc(b.boot_count)} · <span class="faint">${esc(prev)}</span></span>
+      <span class="faint" title="${esc(fmtTime(b.timestamp))}">${esc(fmtAgo(b.timestamp))}</span>
+    </div>`;
+  }).join("") : '<div class="faint">No reboots recorded yet.</div>';
+
+  const events = (h.connection_events || []);
+  $("conn-list").innerHTML = events.length ? events.map(e => {
+    const up = e.event === "connected";
+    const gap = e.gap_secs != null
+      ? (up ? `after ${fmtDur(e.gap_secs)} down` : `up for ${fmtDur(e.gap_secs)}`)
+      : "";
+    return `<div class="hrow">
+      <span class="state-pill ${up ? "ok" : "bad"}">${up ? "up" : "down"}</span>
+      <span class="hmain">${esc(e.detail || "")} <span class="faint">${esc(gap)}</span></span>
+      <span class="faint" title="${esc(fmtTime(e.timestamp))}">${esc(fmtAgo(e.timestamp))}</span>
+    </div>`;
+  }).join("") : '<div class="faint">No connection events recorded yet.</div>';
+}
+
+function showHealth() { setView("health"); renderHealth(); refreshHealth(); }
+
 /* ---------------- Unified channel model ---------------- */
 
 // Build state.entries from channels + pending + exhausted + crack status.
@@ -229,6 +314,7 @@ function bucketCounts() {
 function renderSidebar() {
   $("nav-channels").classList.toggle("active", state.view === "channels" || state.view === "channel");
   $("nav-config").classList.toggle("active", state.view === "config");
+  $("nav-health").classList.toggle("active", state.view === "health");
   const c = bucketCounts();
   $("nav-channels-count").textContent = c.all;
   $("g-named").textContent = fmtInt(c.named + c.public);
@@ -241,7 +327,7 @@ function renderSidebar() {
 
 function setView(v) {
   state.view = v;
-  for (const id of ["view-channels", "view-channel", "view-config"]) {
+  for (const id of ["view-channels", "view-channel", "view-config", "view-health"]) {
     $(id).style.display = ("view-" + v === id) ? "" : "none";
   }
   renderSidebar();
@@ -897,6 +983,7 @@ async function init() {
   $("theme-btn").onclick = toggleTheme;
   $("nav-channels").onclick = showChannels;
   $("nav-config").onclick = showConfig;
+  $("nav-health").onclick = showHealth;
   $("back-btn").onclick = showChannels;
   $("sweep-go").onclick = startSweep;
   $("m-go").onclick = startCrackHash;
@@ -921,11 +1008,13 @@ async function init() {
 
   await refreshConfig();
   await refreshData();
+  await refreshHealth();
   setView("channels");
   renderChannels();
   await pollStatus();
 
   setInterval(() => {
+    refreshHealth();   // keep the freshness badge live even mid-crack
     if (state.cracking) return;   // poll loop handles refresh while busy
     refreshData().then(() => {
       if (state.view === "channels") renderChannels();

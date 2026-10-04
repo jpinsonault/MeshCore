@@ -482,3 +482,17 @@ button.big { padding: 11px 20px; font-size: 14.5px; }
   border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
 }
 .attempt-info code { color: var(--fg); word-break: break-all; }
+
+/* Device & link health view */
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.state-pill.ok  { color: var(--ok);  border-color: var(--ok); }
+.state-pill.bad { color: var(--err); border-color: var(--err); }
+b.ok  { color: var(--ok); }
+b.bad { color: var(--err); }
+.hrow {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 2px; border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.hrow:last-child { border-bottom: none; }
+.hrow .hmain { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hrow .state-pill { flex: 0 0 auto; }

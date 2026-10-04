@@ -645,6 +645,14 @@ class CollectorStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_last_packet_time(self):
+        """Timestamp of the most recent raw packet, or None — i.e. how fresh the
+        capture is. Drives the UI's 'data is N minutes stale' indicator."""
+        row = self._conn.execute(
+            "SELECT MAX(timestamp) AS t FROM raw_packets"
+        ).fetchone()
+        return row["t"] if row and row["t"] is not None else None
+
     def get_latest_diagnostics(self):
         """Return the most recent diagnostics row, or None."""
         row = self._conn.execute(
