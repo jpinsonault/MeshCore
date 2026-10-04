@@ -3,6 +3,7 @@
 import socket
 import struct
 import threading
+import time
 
 import pytest
 
@@ -91,7 +92,7 @@ class FakeWifiDevice:
         self._srv.close()
 
 
-def _run_core(port, password, wait_for):
+def _run_core(port, password, wait_for, reconnect=True):
     """Start a core against the fake device; returns (core, events dict) after wait_for fires."""
     events = {"connected": threading.Event(), "disconnected": threading.Event(),
               "heartbeat": threading.Event(), "reason": None, "text": []}
@@ -101,12 +102,13 @@ def _run_core(port, password, wait_for):
             events["heartbeat"].set()
 
     def on_disconnected(reason):
-        events["reason"] = reason
+        if events["reason"] is None:   # keep the first reason (later ones are reconnect noise)
+            events["reason"] = reason
         events["disconnected"].set()
 
     tmp = temp_file(".db")
     db = tmp.__enter__()
-    core = CollectorCore(port=port, db_path=db.name, password=password)
+    core = CollectorCore(port=port, db_path=db.name, password=password, reconnect=reconnect)
     core.on_frame = on_frame
     core.on_text = lambda line: events["text"].append(line)
     core.on_connected = events["connected"].set
@@ -183,3 +185,49 @@ class TestNetworkLink:
         finally:
             core.stop()
             tmp.__exit__(None, None, None)
+
+
+def _wait_for_event(store, event, timeout=3.0):
+    """Poll the durable connection log until an event of the given kind appears."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = [e for e in store.get_connection_events() if e["event"] == event]
+        if rows:
+            return rows
+        time.sleep(0.05)
+    return []
+
+
+class TestConnectionLog:
+    """The durable link up/down log and the idle watchdog (core.py)."""
+
+    def test_connected_event_recorded(self):
+        dev = FakeWifiDevice()
+        core, ev, tmp = _run_core(f"socket://127.0.0.1:{dev.port}", PASSWORD, "connected")
+        try:
+            assert ev["connected"].is_set(), ev["reason"]
+            assert _wait_for_event(core.store, "connected")
+        finally:
+            core.stop()
+            core.store.close()   # close this thread's connection before temp cleanup (Windows)
+            tmp.__exit__(None, None, None)
+            dev.close()
+
+    def test_idle_watchdog_disconnects(self, monkeypatch):
+        # A device that connects then goes silent must be detected: read() keeps
+        # returning empty with no error, so only the idle watchdog breaks the loop.
+        monkeypatch.setattr("collector.core.LINK_IDLE_TIMEOUT", 0.5)
+        dev = FakeWifiDevice()   # sends one heartbeat, then nothing
+        core, ev, tmp = _run_core(f"socket://127.0.0.1:{dev.port}", PASSWORD,
+                                  "disconnected", reconnect=False)
+        try:
+            assert ev["disconnected"].is_set()
+            assert "idle" in ev["reason"], ev["reason"]
+            downs = _wait_for_event(core.store, "disconnected")
+            assert downs and "idle" in (downs[0]["detail"] or "")
+            assert downs[0]["gap_secs"] is not None   # session length recorded
+        finally:
+            core.stop()
+            core.store.close()   # close this thread's connection before temp cleanup (Windows)
+            tmp.__exit__(None, None, None)
+            dev.close()

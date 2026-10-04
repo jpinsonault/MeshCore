@@ -46,6 +46,13 @@ ACK_INTERVAL = 1.0  # seconds between ACK frames
 RECONNECT_MIN = 2.0
 RECONNECT_MAX = 30.0
 
+# A healthy device sends a HEARTBEAT every 10s even on a silent mesh. If nothing
+# at all arrives for this long, the link is dead — on a network (socket://) link
+# a peer that vanishes off WiFi leaves read() returning empty forever with no
+# error, so without this watchdog the read loop would wait indefinitely on a
+# corpse and never reconnect. Must comfortably exceed COLLECTOR_HEARTBEAT_INTERVAL.
+LINK_IDLE_TIMEOUT = 45.0
+
 
 def list_serial_ports():
     """Return list of available serial port info dicts."""
@@ -69,7 +76,29 @@ def is_network_port(port):
 def open_link(port, baud):
     """Open the device link: a serial port (COM3, /dev/ttyUSB0) or a pyserial URL
     such as socket://heltec-repeater.local:5005 for the WiFi collector build."""
-    return serial.serial_for_url(port, baudrate=baud, timeout=0.1)
+    ser = serial.serial_for_url(port, baudrate=baud, timeout=0.1)
+    if is_network_port(port):
+        _enable_tcp_keepalive(ser)
+    return ser
+
+
+def _enable_tcp_keepalive(ser):
+    """Turn on TCP keepalive for a socket:// link so a peer that silently drops
+    off the network is detected by the OS instead of hanging forever. Best-effort:
+    the application-level idle watchdog (LINK_IDLE_TIMEOUT) is the real backstop."""
+    sock = getattr(ser, "_socket", None)
+    if sock is None:
+        return
+    import socket as _socket
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+        # Tighten the idle/interval/count where the platform exposes it.
+        for opt, val in (("TCP_KEEPIDLE", 20), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
+            name = getattr(_socket, opt, None)
+            if name is not None:
+                sock.setsockopt(_socket.IPPROTO_TCP, name, val)
+    except (OSError, AttributeError):
+        pass
 
 
 class CollectorCore:
@@ -118,6 +147,11 @@ class CollectorCore:
         self._stop_event = threading.Event()
         self._thread = None
         self._connected = False
+        # Set once a handshake succeeds; used to reset the reconnect backoff after
+        # an established session drops (vs. a connection that never came up).
+        self._session_established = False
+        # Wall-clock time the link last went down, so a reconnect can log the gap.
+        self._link_down_since = None
 
         # Group message dedup — tracks recent payload hashes to suppress
         # relay echoes (same message arriving via different paths).
@@ -205,9 +239,10 @@ class CollectorCore:
                 if self._stop_event.is_set() or not self.reconnect:
                     break
 
-                # Connection ended on its own. A stable session that just
-                # dropped resets the backoff; repeated quick failures grow it.
-                if self._connected:
+                # Connection ended on its own. A session that actually came up
+                # (handshake succeeded) resets the backoff so a drop reconnects
+                # fast; connections that never established grow the backoff.
+                if self._session_established:
                     backoff = RECONNECT_MIN
                 self._fire_text(f"[collector] reconnecting in {backoff:.0f}s")
                 if self._stop_event.wait(timeout=backoff):
@@ -217,8 +252,22 @@ class CollectorCore:
             self._cleanup()
             self._running = False
 
+    def _log_link_down(self, reason, session_start):
+        """Record a durable disconnect event for a session that was established,
+        and remember when the link went down so the next connect logs the gap."""
+        now = time.time()
+        self._link_down_since = now
+        if self._store is not None and session_start is not None:
+            try:
+                self._store.record_connection_event(
+                    "disconnected", detail=reason,
+                    gap_secs=round(now - session_start, 1), now=now)
+            except Exception:
+                pass
+
     def _connect_and_collect(self):
         """Connect to serial port, enable collector mode, and read frames."""
+        self._session_established = False
         try:
             self._ser = open_link(self.port, self.baud)
         except (serial.SerialException, OSError, ValueError) as e:
@@ -267,20 +316,46 @@ class CollectorCore:
             self._fire_disconnected("No valid handshake received")
             return
 
+        session_start = time.time()
         self._connected = True
+        self._session_established = True
         if self.on_connected:
             self.on_connected()
+        # Durable link-up log, written after notifying so a disk write never
+        # delays the connected callback. gap_secs is the downtime since the
+        # last drop (None on the first connect of this run).
+        if self._store is not None:
+            gap = None
+            if self._link_down_since is not None:
+                gap = round(session_start - self._link_down_since, 1)
+            try:
+                self._store.record_connection_event(
+                    "connected", detail=f"protocol v{self._protocol_version}",
+                    gap_secs=gap, now=session_start)
+            except Exception:
+                pass
 
-        # Main read loop
+        # Main read loop. last_data drives the idle watchdog: a live device sends
+        # a heartbeat every 10s, so a long silence means the link is dead even
+        # when read() keeps returning empty (a vanished network peer never errors).
+        last_data = time.monotonic()
         while not self._stop_event.is_set():
             try:
                 chunk = self._ser.read(256)
             except serial.SerialException as e:
-                self._fire_disconnected(f"Serial error: {e}")
+                reason = f"Serial error: {e}"
+                self._log_link_down(reason, session_start)
+                self._fire_disconnected(reason)
                 return
 
             if chunk:
                 self._reader.feed(chunk)
+                last_data = time.monotonic()
+            elif time.monotonic() - last_data > LINK_IDLE_TIMEOUT:
+                reason = f"link idle: no data for {LINK_IDLE_TIMEOUT:.0f}s"
+                self._log_link_down(reason, session_start)
+                self._fire_disconnected(reason)
+                return
 
             for frame in self._reader.take_frames():
                 self._process_frame(frame)
@@ -306,6 +381,7 @@ class CollectorCore:
             pass
 
         self._connected = False
+        self._log_link_down("Stopped by user", session_start)
         self._fire_disconnected("Stopped by user")
 
     def _authenticate(self):

@@ -20,7 +20,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -169,6 +169,20 @@ SCHEMA_V8_SQL = """
 ALTER TABLE cracked_channels ADD COLUMN method TEXT;
 """
 
+# Durable link up/down log. Survives host restarts so the connection history
+# (when the device dropped, how long it was gone, why) isn't lost to process
+# memory — the ephemeral stdout log is gone the moment the service restarts.
+SCHEMA_V9_SQL = """
+CREATE TABLE IF NOT EXISTS connection_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp  REAL NOT NULL,
+    event      TEXT NOT NULL,   -- 'connected' | 'disconnected'
+    detail     TEXT,            -- handshake info / disconnect reason
+    gap_secs   REAL             -- 'connected': downtime since last link; 'disconnected': session length
+);
+CREATE INDEX IF NOT EXISTS idx_connection_events_ts ON connection_events(timestamp);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -277,6 +291,14 @@ class CollectorStore:
                 (str(8),),
             )
             current = 8
+
+        if current < 9:
+            self._conn.executescript(SCHEMA_V9_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(9),),
+            )
+            current = 9
 
     def close(self):
         if self._is_memory:
@@ -606,6 +628,30 @@ class CollectorStore:
         """Return recent diagnostics rows."""
         rows = self._conn.execute(
             "SELECT * FROM diagnostics ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Connection event log ---
+
+    def record_connection_event(self, event, detail=None, gap_secs=None, now=None):
+        """Append a durable link up/down event.
+
+        event: 'connected' or 'disconnected'. gap_secs is the downtime before a
+        reconnect ('connected') or the session length ('disconnected'). Persisted
+        so the link history outlives the collector process.
+        """
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO connection_events (timestamp, event, detail, gap_secs) "
+                "VALUES (?, ?, ?, ?)",
+                (now if now is not None else time.time(), event, detail, gap_secs),
+            )
+
+    def get_connection_events(self, limit=100):
+        """Return recent connection events, newest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM connection_events ORDER BY timestamp DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
