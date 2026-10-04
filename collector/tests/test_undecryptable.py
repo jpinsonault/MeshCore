@@ -18,18 +18,23 @@ from collector.crypto import (
 )
 from collector.events import UndecryptablePacket, CollectorFrame
 from collector.protocol import FRAME_TYPE_RX_RAW
+from collector.tests.packet_helpers import temp_file
 
 
 def _make_chat():
     return ChatActivity(port="/dev/ttyUSB0", auto_start=False)
 
 
-def _grp_txt_frame(channel_hash=0xFF, raw=None):
-    """Build an RX_RAW frame with GRP_TXT payload type."""
+def _grp_txt_frame(channel_hash=0xFF, raw=None, variant=0):
+    """Build an RX_RAW frame with GRP_TXT payload type.
+
+    ``variant`` changes the ciphertext so distinct calls aren't suppressed by
+    the core's group-message dedup.
+    """
     if raw is None:
         # Build a packet that looks like GRP_TXT but won't decrypt
         header = (PAYLOAD_TYPE_GRP_TXT << 2) | 0x01  # FLOOD
-        raw = bytes([header, 0, channel_hash]) + b"\xDE\xAD" + b"\x00" * 16
+        raw = bytes([header, 0, channel_hash]) + b"\xDE\xAD" + bytes([variant]) + b"\x00" * 15
     return {
         "type": FRAME_TYPE_RX_RAW,
         "received_at": time.time(),
@@ -50,7 +55,7 @@ class TestCoreUndecryptableCounter:
         assert core._undecryptable_count == 0
 
     def test_counter_increments_on_failed_decode(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port=None, db_path=f.name)
             core._store = __import__("collector.store", fromlist=["CollectorStore"]).CollectorStore(f.name)
             core._store.open()
@@ -60,12 +65,16 @@ class TestCoreUndecryptableCounter:
             core._process_frame(frame)
             assert core._undecryptable_count == 1
 
+            # Same message relayed again: deduped, not double-counted
             core._process_frame(frame)
+            assert core._undecryptable_count == 1
+
+            core._process_frame(_grp_txt_frame(channel_hash=0xFF, variant=1))
             assert core._undecryptable_count == 2
             core._store.close()
 
     def test_callback_fires_on_undecryptable(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port=None, db_path=f.name)
             core._store = __import__("collector.store", fromlist=["CollectorStore"]).CollectorStore(f.name)
             core._store.open()
@@ -77,12 +86,12 @@ class TestCoreUndecryptableCounter:
             core._process_frame(_grp_txt_frame())
             assert counts == [1]
 
-            core._process_frame(_grp_txt_frame())
+            core._process_frame(_grp_txt_frame(variant=1))
             assert counts == [1, 2]
             core._store.close()
 
     def test_no_callback_when_decrypt_succeeds(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port=None, db_path=f.name)
             core._store = __import__("collector.store", fromlist=["CollectorStore"]).CollectorStore(f.name)
             core._store.open()

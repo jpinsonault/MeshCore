@@ -478,6 +478,7 @@ class TestCachePersistence:
     def test_reopen_loads_cached_cracks(self):
         # Crack a channel and save to cache
         f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        f.close()  # only the path is needed; an open handle blocks unlink on Windows
         db_path = f.name
 
         store = CollectorStore(db_path)

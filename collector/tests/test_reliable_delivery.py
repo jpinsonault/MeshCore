@@ -22,6 +22,7 @@ from collector.protocol import (
 )
 from collector.store import CollectorStore
 from collector.core import CollectorCore
+from collector.tests.packet_helpers import temp_file
 
 
 def _make_v1_frame(frame_type, payload):
@@ -65,7 +66,7 @@ class TestResumeOnV2Connect:
 
     def test_resume_sent_on_v2_handshake(self):
         """When handshake is v2, core sends RESUME with last_committed_seq."""
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             # Pre-seed the DB with a committed seq
             store = CollectorStore(f.name)
             store.open()
@@ -102,7 +103,7 @@ class TestResumeOnV2Connect:
 
     def test_no_resume_on_v1_handshake(self):
         """When handshake is v1, no RESUME or ACK should be sent."""
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -122,7 +123,7 @@ class TestSeqTracking:
     """Core should track highest seq and detect resets."""
 
     def test_highest_seq_tracked(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -147,7 +148,7 @@ class TestSeqTracking:
 
     def test_seq_reset_detection(self):
         """When incoming seq < last seen and seq < 100, log a warning."""
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -174,7 +175,7 @@ class TestReplayDedup:
     """Frames with seq <= replay_above_seq should be skipped for storage."""
 
     def test_replay_frames_not_stored(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -200,7 +201,7 @@ class TestReplayDedup:
             core._store.close()
 
     def test_new_frames_stored_after_replay(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -223,7 +224,7 @@ class TestReplayDedup:
             core._store.close()
 
     def test_replay_watermark_cleared_on_first_new_frame(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -256,7 +257,7 @@ class TestPeriodicAck:
     """Core should send ACK every ~1 second in v2 mode."""
 
     def test_ack_sent_after_interval(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()
@@ -277,7 +278,7 @@ class TestV1Fallback:
     """v1 firmware should work normally without RESUME or ACK."""
 
     def test_v1_frames_stored_without_seq(self):
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             core = CollectorCore(port="/dev/null", db_path=f.name)
             core._store = CollectorStore(f.name)
             core._store.open()

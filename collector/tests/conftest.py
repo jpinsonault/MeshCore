@@ -5,6 +5,7 @@ import pytest
 
 from pyos.testing import MockScreen, HarnessApplication
 from collector.store import CollectorStore
+from collector.tests.packet_helpers import temp_file
 
 
 @pytest.fixture
@@ -40,7 +41,7 @@ def make_app():
 @pytest.fixture
 def store():
     """Fresh SQLite store backed by a temp file."""
-    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+    with temp_file(".db") as f:
         s = CollectorStore(f.name)
         s.open()
         yield s

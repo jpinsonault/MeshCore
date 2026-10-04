@@ -6,11 +6,12 @@ import pytest
 
 from collector.store import CollectorStore
 from collector.crypto import GroupMessage
+from collector.tests.packet_helpers import temp_file
 
 
 @pytest.fixture
 def store():
-    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+    with temp_file(".db") as f:
         s = CollectorStore(f.name)
         s.open()
         yield s
@@ -98,7 +99,7 @@ class TestSchemaVersion:
     def test_migration_from_v1(self):
         """Simulate a V1 database and verify migration adds channel_messages."""
         import sqlite3
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             # Create a V1 database manually
             conn = sqlite3.connect(f.name)
             conn.executescript("""

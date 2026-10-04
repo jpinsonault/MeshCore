@@ -5,6 +5,7 @@ import time
 import pytest
 
 from collector.store import CollectorStore
+from collector.tests.packet_helpers import temp_file
 from collector.protocol import (
     FRAME_TYPE_RX_RAW,
     FRAME_TYPE_TX_RAW,
@@ -15,7 +16,7 @@ from collector.protocol import (
 
 @pytest.fixture
 def store():
-    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+    with temp_file(".db") as f:
         s = CollectorStore(f.name)
         s.open()
         yield s

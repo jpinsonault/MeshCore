@@ -9,6 +9,7 @@ import pytest
 from collector.core import CollectorCore
 from collector.crypto import Channel, encrypt_then_mac, PAYLOAD_TYPE_GRP_TXT, ROUTE_TYPE_FLOOD
 from collector.protocol import FRAME_TYPE_RX_RAW, FRAME_TYPE_TX_RAW
+from collector.tests.packet_helpers import temp_file
 
 TEST_PSK = base64.b64encode(b"\x01" * 16).decode()
 
@@ -45,7 +46,7 @@ def _make_rx_frame(raw, payload_type=PAYLOAD_TYPE_GRP_TXT):
 @pytest.fixture
 def core_with_store():
     """Create a CollectorCore with an open store but no serial connection."""
-    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+    with temp_file(".db") as f:
         core = CollectorCore(port=None, db_path=f.name)
         core._store = __import__("collector.store", fromlist=["CollectorStore"]).CollectorStore(f.name)
         core._store.open()

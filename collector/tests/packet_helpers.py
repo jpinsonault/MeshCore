@@ -5,7 +5,10 @@ and test_core_channels into one importable module.
 """
 
 import struct
+import contextlib
+import os
 import tempfile
+import types
 import time
 
 from collector.crypto import (
@@ -78,6 +81,7 @@ def make_group_msg(sender="alice", text="hello everyone", channel="#meshcore",
 def make_temp_store():
     """Create a fresh SQLite store with a temp file. Caller must close."""
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    f.close()  # only the path is needed; an open handle blocks unlink on Windows
     s = CollectorStore(f.name)
     s.open()
     return s, f.name
@@ -97,3 +101,14 @@ def store_n_packets(store, channel, n, text_prefix="Msg", ts_base=1700000000):
         )
         ids.append(pkt_id)
     return ids
+
+
+@contextlib.contextmanager
+def temp_file(suffix=""):
+    """Yield an object with a ``.name`` path in a fresh temp dir, removed on exit.
+
+    Unlike ``NamedTemporaryFile``, the file is not held open, so it can be
+    reopened by name (e.g. by SQLite) on Windows as well as macOS/Linux.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        yield types.SimpleNamespace(name=os.path.join(d, "tmp" + suffix))

@@ -18,6 +18,7 @@ from collector.protocol import (
 )
 from collector.store import CollectorStore
 from collector.events import CollectorFrame
+from collector.tests.packet_helpers import temp_file
 from collector.activities.system_diag import (
     SystemDiagActivity,
     build_diag_lines,
@@ -79,7 +80,7 @@ def _diag_frame(**kwargs):
 
 @pytest.fixture
 def store():
-    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+    with temp_file(".db") as f:
         s = CollectorStore(f.name)
         s.open()
         yield s
@@ -189,7 +190,7 @@ class TestStoreDiagnostics:
 class TestSchemaMigration:
     def test_v2_to_v3_migration(self):
         """A v2 database should migrate to v3 on open()."""
-        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        with temp_file(".db") as f:
             # Create a v2 database with all required columns for indexes
             import sqlite3
             conn = sqlite3.connect(f.name)

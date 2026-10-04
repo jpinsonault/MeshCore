@@ -12,12 +12,14 @@ dependencies = [
   "pycryptodome>=3.20",
   "pygments>=2.17",
   "pyserial>=3.5",
-  "pyos-tui>=0.1",
+  "pyos-tui>=0.5.3",
   "websockets>=13.0",
+  "windows-curses>=2.3; sys_platform == 'win32'",
 ]
 
-[tool.uv.sources]
-pyos-tui = { path = "../../pyos", editable = true }
+# To develop against a local pyos checkout instead of PyPI, add:
+# [tool.uv.sources]
+# pyos-tui = { path = "../../pyos", editable = true }
 
 [tool.setuptools.packages.find]
 where = [".."]

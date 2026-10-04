@@ -23,6 +23,7 @@ from collector.protocol import FRAME_TYPE_RX_RAW
 def _make_store():
     """Create a fresh in-memory-style store with a temp file."""
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    f.close()  # only the path is needed; an open handle blocks unlink on Windows
     store = CollectorStore(f.name)
     store.open()
     return store, f.name
