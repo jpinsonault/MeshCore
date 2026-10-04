@@ -465,11 +465,20 @@ def _verify(idx, charset, length, mac_and_data, extra=()):
     plaintext = mac_then_decrypt(ch.secret, mac_and_data)
     if plaintext is None or not grp_txt_plaintext_ok(plaintext):
         return None
-    for extra_blob in extra:
-        other = mac_then_decrypt(ch.secret, extra_blob)
-        if other is None or not grp_txt_plaintext_ok(other):
+    # At least one sibling must corroborate (decrypt to valid GRP_TXT). On a
+    # shared hash byte the siblings may belong to other channels and simply
+    # won't decrypt with this key — that's fine, they just don't corroborate.
+    # Callers only brute-force when extras exist, so a lone-packet channel
+    # (no corroboration possible) is never brute-forced here.
+    if extra:
+        if not any(_strict_decodes(ch.secret, e) for e in extra):
             return None
     return full.decode()
+
+
+def _strict_decodes(secret, mac_and_data) -> bool:
+    pt = mac_then_decrypt(secret, mac_and_data)
+    return pt is not None and grp_txt_plaintext_ok(pt)
 
 
 def brute_force_channel_gpu(

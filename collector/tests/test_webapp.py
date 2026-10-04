@@ -124,6 +124,7 @@ def test_crack_bruteforce_fallback():
     name = "#" + secrets.token_hex(2)  # 4 hex chars
     ch = Channel.from_hashtag(name)
     store_grp_txt_packet(store, ch, "carol: hi")
+    store_grp_txt_packet(store, ch, "dave: corroborating packet")  # sibling for cross-check
     try:
         app = CrackerApp(store, use_gpu=False)
         result = app.crack(ch.hash, charset="0123456789abcdef", max_length=4)

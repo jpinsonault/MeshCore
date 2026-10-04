@@ -114,9 +114,11 @@ def _crack_chunk(args):
         if not grp_txt_plaintext_ok(plaintext):
             continue
 
-        # Cross-check: a true key also decrypts every other packet on the
-        # channel; a 2-byte MAC collision (possible over a huge space) will not.
-        if extras and not all(_decrypts_ok(psk, e) for e in extras):
+        # Cross-check: at least one sibling must also decrypt to valid GRP_TXT.
+        # A 2-byte MAC collision won't; and on a shared hash byte, siblings from
+        # other channels won't either, so corroboration needs only one same-
+        # channel sibling (callers brute-force only when siblings exist).
+        if extras and not any(_decrypts_ok(psk, e) for e in extras):
             continue
 
         return full.decode()

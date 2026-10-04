@@ -113,6 +113,7 @@ def test_auto_crack_bruteforces_pending_on_gpu():
         # (3 chars) finds it quickly through the auto loop + queue.
         ch = Channel.from_hashtag("#zq7")
         store_grp_txt_packet(store, ch, "bob: hello")
+        store_grp_txt_packet(store, ch, "carol: sibling")  # >=2 packets to brute-force
         app = CrackerApp(store, use_gpu=True)
         assert app.engine() == "gpu"
         app.update_settings({"auto_crack": True})  # no manual press
@@ -133,6 +134,7 @@ def test_exhausted_cache_records_and_blocks_auto():
         # brute-force exhausts and should be recorded, not retried by auto.
         ch = Channel.from_hashtag("#zq7")
         store_grp_txt_packet(store, ch, "bob: hi")
+        store_grp_txt_packet(store, ch, "carol: sibling")  # >=2 packets to brute-force
         app = CrackerApp(store, use_gpu=False)
         res = app.crack(ch.hash, charset="ab", max_length=2)  # can't contain z/q/7
         assert res["cracked"] is False
@@ -211,6 +213,7 @@ def test_batch_sweep_cracks_many_and_marks_exhausted():
             store_grp_txt_packet(store, Channel.from_hashtag(nm), "carol: two")
         unsolv = Channel.from_hashtag("#unsolvablelongname")
         store_grp_txt_packet(store, unsolv, "dave: hi")
+        store_grp_txt_packet(store, unsolv, "erin: sibling")  # >=2 so it's swept (then exhausted)
 
         app = CrackerApp(store, use_gpu=True)
         assert app.engine() == "gpu"
@@ -261,6 +264,49 @@ def test_channels_carry_method_state_packets():
         assert c["state"] == "named"
         assert c["packets"] == 3
         assert c["messages"] == 3
+        app.shutdown()
+    finally:
+        store.close()
+
+
+# --- hash collision: cracking must progress to the second channel ----------
+
+@pytest.mark.skipif(not brute_force_gpu.is_available(), reason="no CUDA GPU")
+def test_collision_hash_cracks_both_channels():
+    import itertools
+    store, _ = make_temp_store()
+    try:
+        cs = "abcdefghijklmnopqrstuvwxyz0123456789"
+        dictname = "#weather"                    # in catalog -> fast-match
+        hw = Channel.from_hashtag(dictname).hash
+        # find a short a-z0-9 name on the SAME hash byte (a real collision)
+        collide = None
+        for a, b, c in itertools.product(cs, cs, cs):
+            nm = "#" + a + b + c
+            if Channel.from_hashtag(nm).hash == hw and nm != dictname:
+                collide = nm
+                break
+        assert collide, "no colliding name found"
+
+        chA, chB = Channel.from_hashtag(dictname), Channel.from_hashtag(collide)
+        for i in range(3):
+            store_grp_txt_packet(store, chA, f"alice: a{i}")
+            store_grp_txt_packet(store, chB, f"bob: b{i}")
+
+        app = CrackerApp(store, use_gpu=True)
+        assert any(p["hash"] == hw for p in app.pending_channels())
+
+        # Crack #1: fast-match recovers #weather; the colliding channel stays.
+        app.crack(hw, charset=cs, max_length=3)
+        names = {c["channel_name"] for c in app.channels()}
+        assert dictname in names and collide not in names
+        assert any(p["hash"] == hw for p in app.pending_channels()), "collision still pending"
+
+        # Crack #2: now targets the undecoded collider -> brute-force finds it.
+        app.crack(hw, charset=cs, max_length=3)
+        names = {c["channel_name"] for c in app.channels()}
+        assert collide in names, "second channel on the hash not recovered"
+        assert not any(p["hash"] == hw for p in app.pending_channels()), "hash fully decoded now"
         app.shutdown()
     finally:
         store.close()

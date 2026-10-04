@@ -426,14 +426,24 @@ class CrackerApp:
         return current_packets < (row["packets_seen"] + EXHAUST_RETRY_PACKET_DELTA)
 
     def _mac_and_data_for_hash(self, target_hash: int, limit: int = 4) -> list:
-        """Up to `limit` distinct mac_and_data blobs from stored GRP_TXT packets
-        whose channel_hash matches. Siblings serve as brute-force cross-checks:
-        a true key decrypts them all, a MAC collision will not."""
+        """Up to `limit` distinct mac_and_data blobs from *undecoded* stored
+        GRP_TXT packets whose channel_hash matches.
+
+        Only undecoded packets: a 1-byte hash can be shared by several real
+        channels, so once one is recovered its packets are decoded and must be
+        skipped — otherwise a crack of that hash just re-finds the known channel
+        and never progresses to the still-encrypted one on the same byte.
+        Siblings (blobs[1:]) corroborate a brute-force hit; on a collision hash
+        the foreign-channel siblings simply won't decrypt, so they don't help
+        or harm (see the verify step).
+        """
         blobs = []
         for pkt in self.store.get_grp_txt_packets():
             raw_hex = pkt.get("raw_hex", "")
             if not raw_hex:
                 continue
+            if self.store.has_channel_message_for_packet(pkt["id"]):
+                continue  # already decoded (this or another channel on the hash)
             try:
                 raw = bytes.fromhex(raw_hex)
             except ValueError:
@@ -527,6 +537,14 @@ class CrackerApp:
                 return self._finish({
                     "cracked": False, "channel_hash": target_hash,
                     "method": "dictionary", "dictionary_only": True,
+                })
+            if not extras:
+                # Only one undecoded packet on this hash: brute-force can't be
+                # corroborated by a sibling, so skip it (don't risk a false
+                # positive, don't mark exhausted — more packets may arrive).
+                return self._finish({
+                    "cracked": False, "channel_hash": target_hash,
+                    "need_more_packets": True,
                 })
             if should_stop is not None and should_stop():
                 return self._finish({"cracked": False, "channel_hash": target_hash,
@@ -863,6 +881,8 @@ class CrackerApp:
             if self.is_exhausted(h, charset, max_length,
                                  current_packets=p.get("packet_count")):
                 continue
+            if len(blobs) < 2:
+                continue  # need a sibling to corroborate a brute-force hit
             targets[h] = {"mac_and_data": blobs[0], "extras": blobs[1:]}
 
         if engine != "gpu" or not targets:
@@ -967,7 +987,7 @@ class CrackerApp:
         remaining = False
         for p in self.pending_channels():
             h = p["hash"]
-            blobs = self._mac_and_data_for_hash(h, limit=1)
+            blobs = self._mac_and_data_for_hash(h, limit=2)  # undecoded packets
             if not blobs:
                 continue
             fast_ch, method = self._fast_match(h, blobs[0])
@@ -979,9 +999,9 @@ class CrackerApp:
                     "method": method,
                 })
                 continue
-            # Skip hashes already swept at these params (unless new packets
-            # suggest a different channel now shares the hash byte).
-            if use_sweep and not self.is_exhausted(
+            # Needs a sweep: fast-match missed, has a sibling to corroborate a
+            # brute hit, and isn't already swept at these params.
+            if use_sweep and len(blobs) >= 2 and not self.is_exhausted(
                     h, charset, max_length, current_packets=p.get("packet_count")):
                 remaining = True
         # One batched sweep handles every remaining channel at once.
