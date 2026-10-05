@@ -140,6 +140,7 @@ def brute_force_channel(
     on_progress: Optional[Callable] = None,
     extra_mac_and_data=None,
     should_stop: Optional[Callable] = None,
+    min_length: int = 1,
 ) -> Optional[str]:
     """Brute-force a hashtag channel name from an intercepted packet.
 
@@ -152,6 +153,9 @@ def brute_force_channel(
         on_progress: callback(length, total, elapsed_sec) after each length
         extra_mac_and_data: other packets' [mac][ct] blobs for the same channel;
             a candidate must decrypt all of them (collision guard)
+        min_length: first length to try (default 1). Lengths below this were
+            already swept for this hash, so they're skipped — bumping a prior
+            max_length=6 run to 7 only grinds length 7.
 
     Returns:
         Channel name with '#' prefix if cracked, None if exhausted.
@@ -163,7 +167,7 @@ def brute_force_channel(
     extras = tuple(extra_mac_and_data or ())
     t0 = time.monotonic()
 
-    for length in range(1, max_length + 1):
+    for length in range(max(1, min_length), max_length + 1):
         if should_stop is not None and should_stop():
             return None
         total = len(charset) ** length

@@ -413,6 +413,7 @@ def brute_force_batch_gpu(
     should_stop: Optional[Callable] = None,
     threads_per_block: int = 256,
     chunk_bits: int = 28,
+    min_length_by_hash: Optional[dict] = None,
 ) -> dict:
     """Crack many channels in ONE sweep, amortizing the shared SHA work.
 
@@ -420,12 +421,18 @@ def brute_force_batch_gpu(
         targets: {hash_byte(int): {"mac_and_data": bytes, "extras": [bytes,...]}}.
             One representative packet per channel-hash byte; extras are sibling
             packets used as a collision cross-check during CPU verification.
+        min_length_by_hash: {hash_byte: first_length_to_try}. A hash already swept
+            to length M is passed M+1 here, so lengths 1..M are skipped for it
+            (bumping a prior max_length=6 run to 7 only grinds length 7). Hashes
+            at a length below their start are excluded from that length's wanted
+            set, and a length with no eligible hash is skipped entirely.
         others: as brute_force_channel_gpu.
 
     Returns {hash_byte: "#name"} for every channel solved. Unsolved hashes are
     absent (the caller marks those exhausted). Channels drop out of the sweep as
     they're found, so the wanted set — and the HMAC cost — shrinks over the run.
     """
+    min_length_by_hash = min_length_by_hash or {}
     cp = _load_cupy()
     if cp is None:
         raise RuntimeError(f"CuPy unavailable: {_import_error}")
@@ -476,6 +483,17 @@ def brute_force_batch_gpu(
     t0 = time.monotonic()
 
     for length in range(1, max_length + 1):
+        if not active:
+            return solved
+        # Only hashes whose already-swept depth is below this length need testing.
+        eligible = [hb for hb in active if length >= min_length_by_hash.get(hb, 1)]
+        if not eligible:
+            continue
+        # Rebuild wanted for this length (also drops hashes solved so far).
+        wl = bytearray(256)
+        for hb in eligible:
+            wl[hb] = 1
+        d_wanted = cp.asarray(bytearray(wl), dtype=cp.uint8)
         total = base ** length
         pos = 0
         while pos < total:
@@ -733,6 +751,7 @@ def brute_force_channel_gpu(
     should_stop: Optional[Callable] = None,
     threads_per_block: int = 256,
     chunk_bits: int = 28,
+    min_length: int = 1,
 ) -> Optional[str]:
     """GPU port of brute_force.brute_force_channel().
 
@@ -743,6 +762,7 @@ def brute_force_channel_gpu(
             (returns None), used to cancel an in-flight crack.
         threads_per_block: CUDA block size.
         chunk_bits: indices per kernel launch = 2**chunk_bits (progress/bounding).
+        min_length: first length to try (lengths below were already swept).
 
     Returns the cracked channel name with '#', or None if exhausted/stopped.
     """
@@ -775,7 +795,7 @@ def brute_force_channel_gpu(
     tpb = threads_per_block
     t0 = time.monotonic()
 
-    for length in range(1, max_length + 1):
+    for length in range(max(1, min_length), max_length + 1):
         total = base ** length
         pos = 0
         while pos < total:

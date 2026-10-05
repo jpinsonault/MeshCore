@@ -507,17 +507,41 @@ class CrackerApp:
         return buckets
 
     def is_exhausted(self, target_hash, charset, max_length, current_packets=None) -> bool:
-        """True if (hash, charset, max_length) was already swept without a hit
-        and not enough new packets have arrived to suspect a different channel."""
+        """True if this hash was already swept to >= max_length on this charset
+        without a hit, and not enough new packets have arrived to suspect a
+        different channel. Subsumption: a prior sweep to length L covers every
+        request for length <= L, so re-running a shallower (or equal) depth is a
+        no-op."""
         try:
-            row = self.store.get_crack_attempt(int(target_hash), charset, int(max_length))
+            info = self.store.max_exhausted_length(int(target_hash), charset)
         except Exception:
             return False
-        if row is None:
+        if info is None:
             return False
+        swept_len, packets_seen = info
+        if swept_len < int(max_length):
+            return False  # requested deeper than ever swept -> not covered
         if current_packets is None:
             current_packets = self._packet_count_for_hash(target_hash)
-        return current_packets < (row["packets_seen"] + EXHAUST_RETRY_PACKET_DELTA)
+        return current_packets < (packets_seen + EXHAUST_RETRY_PACKET_DELTA)
+
+    def _swept_length(self, target_hash, charset, current_packets=None) -> int:
+        """Highest charset length already swept for this hash — the floor for an
+        incremental run (grind only lengths above it). Returns 0 when nothing is
+        cached, or when the packet count has grown enough since the sweep to
+        suspect a *different* channel now shares the byte (re-grind from scratch)."""
+        try:
+            info = self.store.max_exhausted_length(int(target_hash), charset)
+        except Exception:
+            return 0
+        if info is None:
+            return 0
+        swept_len, packets_seen = info
+        if current_packets is None:
+            current_packets = self._packet_count_for_hash(target_hash)
+        if current_packets >= packets_seen + EXHAUST_RETRY_PACKET_DELTA:
+            return 0
+        return swept_len
 
     def _mac_and_data_for_hash(self, target_hash: int, limit: int = 4,
                                buckets: Optional[dict] = None) -> list:
@@ -640,17 +664,23 @@ class CrackerApp:
                     self._status["total"] = total
                     self._status["elapsed"] = elapsed
 
+            # Skip lengths already swept for this hash on this charset (a prior
+            # max_length=6 run means a 7-char run only grinds length 7).
+            min_length = self._swept_length(target_hash, charset) + 1
+
             if engine == "gpu":
                 name = brute_force_gpu.brute_force_channel_gpu(
                     target_hash, mac_and_data, charset=charset,
                     max_length=max_length, on_progress=on_progress,
                     extra_mac_and_data=extras, should_stop=should_stop,
+                    min_length=min_length,
                 )
             else:
                 name = brute_force.brute_force_channel(
                     target_hash, mac_and_data, charset=charset,
                     max_length=max_length, on_progress=on_progress,
                     extra_mac_and_data=extras, should_stop=should_stop,
+                    min_length=min_length,
                 )
 
             if name is None:
@@ -1066,10 +1096,19 @@ class CrackerApp:
                 self._status["total"] = total
                 self._status["elapsed"] = elapsed
 
+        # Per-hash incremental floor: a hash already swept to length M only grinds
+        # lengths M+1..max_length (a freshly-seen hash still starts at 1).
+        min_length_by_hash = {
+            h: self._swept_length(h, charset,
+                                  current_packets=buckets.get(h, {}).get("total")) + 1
+            for h in targets
+        }
+
         try:
             solved = brute_force_gpu.brute_force_batch_gpu(
                 targets, charset=charset, max_length=max_length,
                 on_progress=on_progress, should_stop=lambda: cancel.is_set(),
+                min_length_by_hash=min_length_by_hash,
             )
         except Exception as e:
             return self._finish({"cracked": bool(solved_fast), "method": "sweep",
@@ -1097,13 +1136,29 @@ class CrackerApp:
             "canceled": cancel.is_set(),
         })
 
+    def _multiword_exhausted(self, target_hash, n, tier, include_concat,
+                             include_hyphen, current_packets) -> bool:
+        """True if an equal-or-larger prior N-word sweep already covered this hash
+        (same word count, tier >= this one, separator patterns a superset) and not
+        enough new packets have arrived since. Lets a bump from 2->3 words, or
+        10K->50K tier, run only the new case and skip what's already done."""
+        try:
+            cov = self.store.multiword_attempt_covering(
+                int(target_hash), int(n), int(tier), include_concat, include_hyphen)
+        except Exception:
+            return False
+        if cov is None:
+            return False
+        _tier, packets_seen = cov
+        return current_packets < (packets_seen + EXHAUST_RETRY_PACKET_DELTA)
+
     def _run_multiword(self, job) -> dict:
         """Crack pending channels by combining dictionary words (GPU-only).
 
-        Targets one byte (``job['target_hash']``) or sweeps all pending. Unlike
-        the charset sweep it does NOT touch the exhausted cache — the multiword
-        space is a different search with its own (tier/word-count) parameters, so
-        a miss here says nothing about the charset sweep's exhaustion.
+        Targets one byte (``job['target_hash']``) or sweeps all pending. Keeps its
+        own exhaustion cache (``multiword_attempts``), separate from the charset
+        one: each word count is its own search, so a miss is recorded per
+        (hash, words, tier, concat, hyphen) and a covering prior sweep is skipped.
         """
         cancel = job["cancel"]
         n, tier = job["mw_n"], job["mw_tier"]
@@ -1128,10 +1183,16 @@ class CrackerApp:
         buckets = self._scan_buckets()
         only = job["target_hash"]
         targets = {}
+        skipped = 0
         for p in self.pending_channels(buckets):
             h = p["hash"]
             if only is not None and h != only:
                 continue
+            pkts = buckets.get(h, {}).get("total")
+            if self._multiword_exhausted(h, n, tier, include_concat,
+                                         include_hyphen, pkts):
+                skipped += 1
+                continue  # already swept at >= these params without a hit
             blobs = self._mac_and_data_for_hash(h, limit=4, buckets=buckets)
             if len(blobs) < 2:
                 continue  # need a sibling to corroborate a brute-force hit
@@ -1139,7 +1200,8 @@ class CrackerApp:
 
         if not targets:
             return self._finish({"cracked": False, "method": "multiword",
-                                 "swept": 0, "found": 0, "names": []})
+                                 "swept": 0, "found": 0, "skipped": skipped,
+                                 "names": []})
 
         def on_progress(length, pos, elapsed):
             with self._lock:
@@ -1160,10 +1222,23 @@ class CrackerApp:
         for hb, name in solved.items():
             self._on_cracked(name, hb, "multiword")
             names.append(name)
+
+        # Record a miss per target so this exact (or a subsumed) run is skipped
+        # next time. Don't record on cancel — the search didn't complete.
+        if not cancel.is_set():
+            for hb in targets:
+                if hb not in solved:
+                    try:
+                        self.store.record_multiword_attempt(
+                            hb, n, tier, include_concat, include_hyphen,
+                            packets_seen=buckets.get(hb, {}).get("total", 0))
+                    except Exception:
+                        pass
+
         return self._finish({
             "cracked": bool(names), "method": "multiword",
-            "swept": len(targets), "found": len(solved), "names": names,
-            "canceled": cancel.is_set(),
+            "swept": len(targets), "found": len(solved), "skipped": skipped,
+            "names": names, "canceled": cancel.is_set(),
         })
 
     def crack_status(self) -> dict:
@@ -1207,11 +1282,21 @@ class CrackerApp:
             return self._current is not None
 
     def exhausted_channels(self) -> list:
-        """Hashes already swept without a hit (for the UI's Exhausted state)."""
+        """Hashes already swept without a hit (for the UI's Exhausted state).
+
+        Collapsed to one row per (hash, charset) — the deepest length swept —
+        since a sweep to length L subsumes all shallower ones.
+        """
         try:
             rows = self.store.get_crack_attempts()
         except Exception:
             return []
+        best = {}  # (hash, charset) -> deepest row
+        for r in rows:
+            key = (r["channel_hash"], r["charset"])
+            cur = best.get(key)
+            if cur is None or r["max_length"] > cur["max_length"]:
+                best[key] = r
         return [{
             "hash": r["channel_hash"],
             "charset": r["charset"],
@@ -1219,7 +1304,7 @@ class CrackerApp:
             "result": r["result"],
             "packets_seen": r["packets_seen"],
             "attempted_at": r["attempted_at"],
-        } for r in rows]
+        } for r in best.values()]
 
     def retry_hash(self, target_hash) -> dict:
         """Forget exhausted marks for a hash and enqueue a fresh crack."""

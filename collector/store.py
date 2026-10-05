@@ -21,7 +21,7 @@ from .protocol import (
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -222,6 +222,25 @@ CREATE TABLE IF NOT EXISTS rx_dup_sightings (
 CREATE INDEX IF NOT EXISTS idx_rx_dup_inv ON rx_dup_sightings(inv_hash);
 """
 
+# v12: multiword (word-combination) exhaustion cache. Unlike charset brute-force
+# (one sweep covers lengths 1..max), each word-count N is its own search, so we
+# record per (hash, words, tier, concat, hyphen). A sweep at tier T covers any
+# smaller tier (the wordlist is a top-N prefix) and separator patterns are a
+# subset relation, so a covering prior attempt lets us skip.
+SCHEMA_V12_SQL = """
+CREATE TABLE IF NOT EXISTS multiword_attempts (
+    channel_hash INTEGER NOT NULL,
+    words        INTEGER NOT NULL,
+    tier         INTEGER NOT NULL,
+    concat       INTEGER NOT NULL,          -- 0/1
+    hyphen       INTEGER NOT NULL,          -- 0/1
+    result       TEXT    NOT NULL,          -- 'exhausted' = swept, not found
+    packets_seen INTEGER NOT NULL DEFAULT 0,
+    attempted_at REAL    NOT NULL,
+    PRIMARY KEY (channel_hash, words, tier, concat, hyphen)
+);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -354,6 +373,14 @@ class CollectorStore:
                 (str(11),),
             )
             current = 11
+
+        if current < 12:
+            self._conn.executescript(SCHEMA_V12_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(12),),
+            )
+            current = 12
 
     def close(self):
         if self._is_memory:
@@ -989,6 +1016,70 @@ class CollectorStore:
             (int(channel_hash), charset, int(max_length)),
         ).fetchone()
 
+    def max_exhausted_length(self, channel_hash, charset):
+        """Deepest prior sweep that COVERS this (hash, charset), as
+        (max_length, packets_seen), or None.
+
+        A sweep to length L covers all lengths 1..L, so the highest L is the
+        subsumption key: a later request for length <= L is covered, and L' > L
+        only needs lengths L+1..L'. Coverage is also charset-aware: a sweep over
+        charset S covers a request over charset C iff C is a subset of S (the
+        request searches no character the sweep didn't). So enlarging the charset
+        — e.g. adding the hyphen — correctly re-runs (the bigger space was never
+        searched), while a prior superset sweep still covers a narrower request.
+        """
+        want = set(charset)
+        best = None
+        for row in self._conn.execute(
+            "SELECT charset, max_length, packets_seen FROM crack_attempts "
+            "WHERE channel_hash = ? AND result = 'exhausted'",
+            (int(channel_hash),),
+        ).fetchall():
+            if not want.issubset(set(row["charset"])):
+                continue  # swept charset doesn't cover the requested one
+            cand = (int(row["max_length"]), int(row["packets_seen"]))
+            if best is None or cand[0] > best[0]:
+                best = cand
+        return best
+
+    # --- Multiword (word-combination) exhaustion cache ---
+
+    def record_multiword_attempt(self, channel_hash, words, tier, concat, hyphen,
+                                 result="exhausted", packets_seen=0):
+        """Record that an N-word sweep over (tier, concat, hyphen) was swept."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO multiword_attempts "
+                "(channel_hash, words, tier, concat, hyphen, result, packets_seen, attempted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(channel_hash, words, tier, concat, hyphen) DO UPDATE SET "
+                "result = excluded.result, packets_seen = excluded.packets_seen, "
+                "attempted_at = excluded.attempted_at",
+                (int(channel_hash), int(words), int(tier),
+                 1 if concat else 0, 1 if hyphen else 0, result,
+                 int(packets_seen), time.time()),
+            )
+
+    def multiword_attempt_covering(self, channel_hash, words, tier, concat, hyphen):
+        """A prior exhausted N-word sweep that COVERS the requested params, or None.
+
+        Covering = same word count, a tier >= the requested one (the wordlist is a
+        top-N prefix, so a bigger tier is a superset), and separator patterns that
+        are a superset (concat/hyphen each >= requested, as 0/1). Returns the
+        covering sweep's (tier, packets_seen).
+        """
+        row = self._conn.execute(
+            "SELECT tier, packets_seen FROM multiword_attempts "
+            "WHERE channel_hash = ? AND words = ? AND tier >= ? "
+            "AND concat >= ? AND hyphen >= ? AND result = 'exhausted' "
+            "ORDER BY tier DESC LIMIT 1",
+            (int(channel_hash), int(words), int(tier),
+             1 if concat else 0, 1 if hyphen else 0),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["tier"]), int(row["packets_seen"])
+
     def get_crack_attempts(self):
         """All recorded crack attempts (for the UI's exhausted list)."""
         return self._conn.execute(
@@ -996,13 +1087,19 @@ class CollectorStore:
         ).fetchall()
 
     def clear_crack_attempt(self, channel_hash):
-        """Forget all exhausted marks for a hash so it can be retried."""
+        """Forget all exhausted marks (charset + multiword) for a hash so it can
+        be retried."""
         with self._tx() as conn:
             conn.execute(
                 "DELETE FROM crack_attempts WHERE channel_hash = ?",
+                (int(channel_hash),),
+            )
+            conn.execute(
+                "DELETE FROM multiword_attempts WHERE channel_hash = ?",
                 (int(channel_hash),),
             )
 
     def clear_all_crack_attempts(self):
         with self._tx() as conn:
             conn.execute("DELETE FROM crack_attempts")
+            conn.execute("DELETE FROM multiword_attempts")
