@@ -69,6 +69,7 @@ class CollectorWifi {
   WsStream _ws;
   volatile bool _authed[COLLECTOR_WIFI_LINKS];
   volatile uint32_t _session[COLLECTOR_WIFI_LINKS];
+  portMUX_TYPE _ws_mux;   // guards _ws.client_id + _authed[WS] across the async TCP task and loop()
   bool _services_started;
   bool _ota_active;
   char _host[32];

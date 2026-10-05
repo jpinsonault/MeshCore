@@ -52,15 +52,21 @@ Copy `.env.example` to start. `collector.remote` and the collector both read it;
    ```
    Settings, identity and ACL survive a firmware flash. **Never run `pio run -t uploadfs`**: it replaces the whole
    filesystem, wiping the node's key, settings, ACL and WiFi config.
-2. Join WiFi, either from the config page's WiFi card (below) or in a serial terminal:
+2. Change the admin password from the default. `wifi on` **refuses to start** while the password is unset or
+   still the stock `password`, because the network links grant the full admin CLI plus firmware flashing behind
+   it, in cleartext over the LAN:
+   ```
+   password <new admin password>
+   ```
+3. Join WiFi, either from the config page's WiFi card (below) or in a serial terminal:
    ```
    wifi ssid <network name>
    wifi pass <wifi password>
    wifi on
    wifi status
    ```
-3. Change the admin password from the default (`password`), then `reboot`.
-4. Fill in `.env`. From then on the cable is only needed for power.
+4. `reboot` so the new admin password also applies to network firmware updates (they use the password at boot).
+5. Fill in `.env`. From then on the cable is only needed for power.
 
 ## Day to day
 

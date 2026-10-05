@@ -29,7 +29,9 @@ static char remote_command[COLLECTOR_WIFI_LINKS][160];
 
 // Reads CLI input from one source into buf; returns true once buf holds a complete line ('\r' stripped).
 // Collector host frames (0xC0 ...) on the same stream go to the collector instead, if allowed.
-static bool readCliLine(Stream& s, char* buf, size_t size, bool allow_frames) {
+// echo=false suppresses character echo (network links: the browser/Python client don't need it, and
+// echoing would send the typed "auth <password>" line back over the wire in cleartext).
+static bool readCliLine(Stream& s, char* buf, size_t size, bool allow_frames, bool echo = true) {
   size_t len = strlen(buf);
   while (s.available() && len < size - 1) {
     if ((uint8_t)s.peek() == 0xC0) {
@@ -44,7 +46,7 @@ static bool readCliLine(Stream& s, char* buf, size_t size, bool allow_frames) {
     if (c != '\n') {
       buf[len++] = c;
       buf[len] = 0;
-      s.print(c);
+      if (echo) s.print(c);
     }
     if (c == '\r') break;
   }
@@ -52,7 +54,7 @@ static bool readCliLine(Stream& s, char* buf, size_t size, bool allow_frames) {
     buf[len - 1] = '\r';
   }
   if (len > 0 && buf[len - 1] == '\r') {
-    s.print('\n');
+    if (echo) s.print('\n');
     buf[len - 1] = 0;
     return true;
   }
@@ -185,7 +187,8 @@ void loop() {
       remote_command[i][0] = 0;
     }
     Stream* link = collector_wifi.linkInput(i);
-    if (link && readCliLine(*link, remote_command[i], sizeof(remote_command[i]), collector_wifi.linkAuthed(i))) {
+    if (link && readCliLine(*link, remote_command[i], sizeof(remote_command[i]), collector_wifi.linkAuthed(i),
+                            /*echo=*/false)) {
       char reply[160];
       reply[0] = 0;
       if (!collector_wifi.handleAuth(i, remote_command[i], reply)) {

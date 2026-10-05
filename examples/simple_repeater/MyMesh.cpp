@@ -5,6 +5,10 @@
   #include "esp_system.h"   // esp_reset_reason()
 #endif
 
+#if defined(ESP32) && defined(COLLECTOR_SPOOL_SIZE) && (COLLECTOR_SPOOL_SIZE > 0)
+  #include "CollectorSpoolFs.h"   // flash overflow tier (ESP32 fs::FS-backed)
+#endif
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -1069,6 +1073,21 @@ void MyMesh::begin(FILESYSTEM *fs) {
 #else
   _collector.begin(Serial);
 #endif
+#if defined(ESP32) && defined(COLLECTOR_SPOOL_SIZE) && (COLLECTOR_SPOOL_SIZE > 0)
+  // Attach the flash overflow tier so evicted entries spill to flash instead of being dropped.
+  // Back off the requested size until it fits the filesystem's free space (or give up quietly).
+  {
+    static FsSpoolStore _spool_store;
+    uint32_t want = COLLECTOR_SPOOL_SIZE, got = 0;
+    while (want >= 32768 && (got = _spool_store.begin(*_fs, "/collector_spool", want)) == 0) want /= 2;
+    if (got) {
+      _collector.attachSpool(&_spool_store);
+      MESH_DEBUG_PRINTLN("Collector spool: %u bytes on flash", (unsigned)got);
+    } else {
+      MESH_DEBUG_PRINTLN("Collector spool: disabled (insufficient flash space)");
+    }
+  }
+#endif
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -1456,7 +1475,8 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         getNumRecvFlood(), getNumRecvDirect(),
         getNumSentFlood(), getNumSentDirect(),
         _mgr->getFreeCount(),
-        (uint32_t)(uptime_millis / 1000)
+        (uint32_t)(uptime_millis / 1000),
+        true   // explicit request: answer even if there's a backlog
       );
       sprintf(reply, "collector %s", _collector_enabled ? "running" : "stopped");
     } else if (strcmp(sub, "diag") == 0) {
@@ -1471,7 +1491,8 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         radio_driver.getPacketsRecvErrors(), _err_flags,
         (uint16_t)_mgr->getOutboundCount(millis()),
         (uint16_t)tables->getNumDirectDups(), (uint16_t)tables->getNumFloodDups(),
-        radio_driver.getPacketsRecv(), radio_driver.getPacketsSent()
+        radio_driver.getPacketsRecv(), radio_driver.getPacketsSent(),
+        true   // explicit request: answer even if there's a backlog
       );
       strcpy(reply, "OK");
     } else if (strncmp(sub, "inject ", 7) == 0 || strncmp(sub, "send ", 5) == 0) {
@@ -1544,12 +1565,23 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       int pt_len = 0;
       memcpy(plaintext, &ts, 4); pt_len += 4;
       plaintext[pt_len++] = 0;  // flags = TXT_TYPE_PLAIN
-      pt_len += snprintf((char *)&plaintext[pt_len], sizeof(plaintext) - pt_len, "%s: %s", sender_name, message);
-      pt_len++;  // include null terminator
+      // snprintf returns the length it *would* have written; clamp to what actually fit so
+      // pt_len can never exceed the buffer (guards the encrypt below from over-reading).
+      int avail = (int)sizeof(plaintext) - pt_len;
+      int written = snprintf((char *)&plaintext[pt_len], avail, "%s: %s", sender_name, message);
+      if (written < 0) written = 0;
+      else if (written >= avail) written = avail - 1;  // truncated
+      pt_len += written + 1;  // include null terminator
 
       // Build raw wire bytes for collector echo: [header(1)] [path_len=0(1)] [payload...]
       uint8_t payload[MAX_PACKET_PAYLOAD];
       payload[0] = channel_hash;
+      // encryptThenMAC pads to the AES block and appends a MAC, so the ciphertext is larger than
+      // the plaintext; reject before encrypting if [hash][cipher] wouldn't fit payload[].
+      if (pt_len > (int)(((sizeof(payload) - 1 - CIPHER_MAC_SIZE) / 16) * 16)) {
+        strcpy(reply, "Err - message too long");
+        return;
+      }
       int enc_len = mesh::Utils::encryptThenMAC(secret, &payload[1], plaintext, pt_len);
       int payload_len = 1 + enc_len;
 

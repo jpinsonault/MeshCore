@@ -14,6 +14,18 @@
 CollectorWifi collector_wifi;
 CollectorLinkStream collector_link(collector_wifi, Serial);
 
+// Constant-time string compare: equal length AND equal bytes, without an early-exit that would
+// leak the matched-prefix length through timing. Returns true only on a full match.
+static bool constTimeEquals(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  uint8_t diff = (uint8_t)(la ^ lb);
+  size_t n = la > lb ? la : lb;
+  for (size_t i = 0; i < n; i++) {
+    diff |= (uint8_t)((i < la ? a[i] : 0) ^ (i < lb ? b[i] : 0));
+  }
+  return diff == 0;
+}
+
 // ------------------------------------------------------------------ WsStream
 
 WsStream::WsStream() : _rx_head(0), _rx_tail(0), _tx_len(0), ws(NULL), client_id(0) {
@@ -99,6 +111,7 @@ CollectorWifi::CollectorWifi() {
     _authed[i] = false;
     _session[i] = 0;
   }
+  _ws_mux = portMUX_INITIALIZER_UNLOCKED;
   _services_started = false;
   _ota_active = false;
   _host[0] = 0;
@@ -166,19 +179,23 @@ void CollectorWifi::startWeb() {
   ws->onEvent([this](AsyncWebSocket* server, AsyncWebSocketClient* client, AwsEventType type, void* arg,
                      uint8_t* data, size_t len) {
     if (type == WS_EVT_CONNECT) {
+      portENTER_CRITICAL(&_ws_mux);
       uint32_t old = _ws.client_id;
-      _ws.reset();
       _authed[WIFI_LINK_WS] = false;
       _ws.client_id = client->id();
       _session[WIFI_LINK_WS]++;
+      portEXIT_CRITICAL(&_ws_mux);
+      _ws.reset();                   // takes WsStream's own lock; keep it outside _ws_mux
       if (old) server->close(old);   // a new connection replaces the old one
       client->setCloseClientOnQueueFull(false);
       client->binary(LOGIN_BANNER);
     } else if (type == WS_EVT_DISCONNECT) {
+      portENTER_CRITICAL(&_ws_mux);
       if (client->id() == _ws.client_id) {
         _ws.client_id = 0;
         _authed[WIFI_LINK_WS] = false;
       }
+      portEXIT_CRITICAL(&_ws_mux);
     } else if (type == WS_EVT_DATA) {
       if (client->id() == _ws.client_id) _ws.push(data, len);
     }
@@ -193,11 +210,15 @@ void CollectorWifi::startWeb() {
     request->send(200, "text/plain", page);
   });
 
-  // browser firmware upload; HTTP basic auth, user "admin"
-  static char ota_id[48];
-  snprintf(ota_id, sizeof(ota_id), "%s (collector)", _host);
-  AsyncElegantOTA.setID(ota_id);
-  AsyncElegantOTA.begin(_http, "admin", _ota_pass);
+  // browser firmware upload; HTTP basic auth, user "admin". Only exposed when a password is set —
+  // an empty basic-auth password means unauthenticated flashing. (The 'wifi on' guard already
+  // requires a non-default password, so this is defense-in-depth.)
+  if (_ota_pass[0]) {
+    static char ota_id[48];
+    snprintf(ota_id, sizeof(ota_id), "%s (collector)", _host);
+    AsyncElegantOTA.setID(ota_id);
+    AsyncElegantOTA.begin(_http, "admin", _ota_pass);
+  }
 
   _http->begin();
 }
@@ -265,20 +286,35 @@ void CollectorWifi::loop() {
 
 Stream* CollectorWifi::client() {
   if (_authed[WIFI_LINK_TCP] && _client.connected()) return &_client;
-  if (_authed[WIFI_LINK_WS] && _ws.client_id) return &_ws;
+  portENTER_CRITICAL(&_ws_mux);
+  bool ws_ok = _authed[WIFI_LINK_WS] && _ws.client_id != 0;
+  portEXIT_CRITICAL(&_ws_mux);
+  if (ws_ok) return &_ws;
   return NULL;
 }
 
 Stream* CollectorWifi::linkInput(int link) {
   if (link == WIFI_LINK_TCP) return _client.connected() ? &_client : NULL;
-  if (link == WIFI_LINK_WS) return _ws.client_id ? &_ws : NULL;
+  if (link == WIFI_LINK_WS) {
+    portENTER_CRITICAL(&_ws_mux);
+    bool has = _ws.client_id != 0;
+    portEXIT_CRITICAL(&_ws_mux);
+    return has ? &_ws : NULL;
+  }
   return NULL;
 }
 
 bool CollectorWifi::handleAuth(int link, const char* line, char* reply) {
   if (_authed[link]) return false;
-  if (memcmp(line, "auth ", 5) == 0 && _admin_pass[0] && strcmp(&line[5], _admin_pass) == 0) {
-    _authed[link] = true;
+  // constant-time compare so a wrong password can't be recovered byte-by-byte via timing
+  if (memcmp(line, "auth ", 5) == 0 && _admin_pass[0] && constTimeEquals(&line[5], _admin_pass)) {
+    if (link == WIFI_LINK_WS) {
+      portENTER_CRITICAL(&_ws_mux);
+      _authed[link] = true;
+      portEXIT_CRITICAL(&_ws_mux);
+    } else {
+      _authed[link] = true;
+    }
     strcpy(reply, "OK - authenticated");
   } else {
     strcpy(reply, "Err - auth required: auth <admin password>");
@@ -325,6 +361,10 @@ bool CollectorWifi::handleCommand(const char* command, bool is_local, char* repl
   } else if (strcmp(sub, "on") == 0) {
     if (_cfg.ssid[0] == 0) {
       strcpy(reply, "Err - set wifi ssid first");
+    } else if (_admin_pass[0] == 0 || strcmp(_admin_pass, "password") == 0) {
+      // The network links grant the full admin CLI + OTA flash behind this one password, in
+      // cleartext over the LAN. Refuse to expose them while it's unset or the stock default.
+      strcpy(reply, "Err - set a non-default admin password first (see 'password'), then: wifi on");
     } else {
       _cfg.enabled = 1;
       saveConfig();
@@ -336,9 +376,20 @@ bool CollectorWifi::handleCommand(const char* command, bool is_local, char* repl
     _cfg.enabled = 0;
     saveConfig();
     if (_client) _client.stop();
+    // close the WebSocket client too (previously leaked), and force both links to re-auth
+    portENTER_CRITICAL(&_ws_mux);
+    uint32_t ws_id = _ws.client_id;
+    _ws.client_id = 0;
     _authed[WIFI_LINK_TCP] = _authed[WIFI_LINK_WS] = false;
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    portEXIT_CRITICAL(&_ws_mux);
+    if (ws_id && _ws.ws) _ws.ws->close(ws_id);
+    _ws.reset();
+    _session[WIFI_LINK_TCP]++;
+    _session[WIFI_LINK_WS]++;
+    // Keep STA mode and the netif (and the bound server sockets) alive so a later `wifi on`
+    // works without a reboot; full WIFI_OFF would destroy the listening sockets and
+    // _services_started is never re-armed. loop() stops servicing clients once enabled=0.
+    WiFi.disconnect();
     strcpy(reply, "OK - wifi off");
   } else {
     strcpy(reply, "Err - use: wifi status|on|off|ssid <name>|pass <password>");

@@ -7,6 +7,7 @@
 // COLLECTOR_RING_SIZE=256 is set via build_flags in platformio.ini.
 
 #include "CollectorSerial.h"
+#include "CollectorSpool.h"
 #include <unity.h>
 
 // --- Helpers ---
@@ -998,6 +999,379 @@ void test_head_reset_after_total_eviction() {
 }
 
 // ============================================================
+// Status-frame coalescing (HEARTBEAT/DIAGNOSTICS gated on backlog)
+// ============================================================
+
+static void send_dummy_heartbeat(CollectorSerial &cs) {
+  cs.sendHeartbeat(1234, 4200, 10, 20, 30, 40, 5, 600);
+}
+static void send_dummy_diagnostics(CollectorSerial &cs) {
+  cs.sendDiagnostics(25.5f, 80000, 60000, 300000, -120, -90, 40, 1000, 2000, 3, 0, 1, 2, 3, 100, 50);
+}
+
+// With a backlog present, status frames must NOT be buffered (no new entry, no seq consumed).
+void test_status_skipped_when_backlog() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  uint8_t p[] = {0x01};
+  cs.ringWrite(COLLECTOR_RX_RAW, p, 1);   // creates a backlog
+  TEST_ASSERT_TRUE(cs.hasBacklog());
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getNewestSeq());
+
+  send_dummy_heartbeat(cs);
+  send_dummy_diagnostics(cs);
+
+  // Nothing added, no seq burned — real traffic is untouched.
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getNewestSeq());
+}
+
+// When caught up (no backlog), status frames are buffered normally with a real seq, and
+// drain() emits a well-formed HEARTBEAT frame.
+void test_status_written_when_caught_up() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  TEST_ASSERT_FALSE(cs.hasBacklog());
+
+  send_dummy_heartbeat(cs);
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getNewestSeq());
+
+  ms.written.clear();
+  TEST_ASSERT_TRUE(cs.drain());
+  size_t off = 0;
+  ParsedFrame pf;
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, pf));
+  TEST_ASSERT_TRUE(pf.valid_crc);
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_HEARTBEAT, pf.type);
+  TEST_ASSERT_EQUAL_UINT32(1, pf.seq);
+  TEST_ASSERT_EQUAL_UINT32(27, (uint32_t)pf.payload.size());
+}
+
+// force=true (an explicit `collector status`/`diag`) must answer even under backlog.
+void test_status_forced_when_backlog() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  uint8_t p[] = {0x01};
+  cs.ringWrite(COLLECTOR_RX_RAW, p, 1);   // backlog
+  TEST_ASSERT_TRUE(cs.hasBacklog());
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+
+  cs.sendHeartbeat(1234, 4200, 10, 20, 30, 40, 5, 600, /*force=*/true);
+  TEST_ASSERT_EQUAL_UINT32(2, cs.getTotalEntries());   // buffered despite backlog
+  TEST_ASSERT_EQUAL_UINT32(2, cs.getNewestSeq());
+
+  cs.sendDiagnostics(25.5f, 80000, 60000, 300000, -120, -90, 40, 1000, 2000, 3, 0, 1, 2, 3, 100, 50,
+                     /*force=*/true);
+  TEST_ASSERT_EQUAL_UINT32(3, cs.getTotalEntries());
+}
+
+// Status buffering resumes once the backlog drains, proving the gate is dynamic (not one-shot).
+void test_status_resumes_after_drain() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  uint8_t p[] = {0x01};
+  cs.ringWrite(COLLECTOR_RX_RAW, p, 1);   // backlog
+
+  send_dummy_heartbeat(cs);                // skipped
+  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+
+  TEST_ASSERT_TRUE(cs.drain());            // RX drained -> caught up
+  TEST_ASSERT_FALSE(cs.hasBacklog());
+
+  send_dummy_diagnostics(cs);              // now buffered
+  TEST_ASSERT_EQUAL_UINT32(2, cs.getTotalEntries());
+  TEST_ASSERT_EQUAL_UINT32(2, cs.getNewestSeq());
+}
+
+// Uniform-size entries that align exactly to the wrap boundary used to leave _head resting on a
+// sentinel, and the next ringWrite would overwrite a live entry (corruption / out-of-order drain).
+void test_ring_uniform_wrap_no_corruption() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  const uint16_t plen = 20;   // entry = 27 bytes; ring = 256 -> repeated wraps + exact alignment
+  uint8_t pay[plen];
+  for (uint32_t s = 1; s <= 50; s++) {
+    memset(pay, (uint8_t)s, plen);
+    cs.ringWrite(COLLECTOR_RX_RAW, pay, plen);
+  }
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame pf;
+  uint32_t prev = 0;
+  int n = 0;
+  while (off < ms.written.size()) {
+    TEST_ASSERT_TRUE(parse_frame(ms.written, off, pf));
+    TEST_ASSERT_TRUE(pf.valid_crc);
+    TEST_ASSERT_TRUE(pf.seq > prev);                        // strictly increasing: no corruption
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)pf.seq, pf.payload[0]); // payload tagged with its own seq
+    prev = pf.seq;
+    n++;
+  }
+  TEST_ASSERT_EQUAL_UINT32(50, cs.getNewestSeq());
+  TEST_ASSERT_EQUAL_UINT32(50, prev);   // newest entry always survives
+  TEST_ASSERT_TRUE(n >= 2);
+}
+
+// ============================================================
+// Flash spool (FlashSpool over an in-memory SpoolStore)
+// ============================================================
+
+struct MockSpoolStore : public SpoolStore {
+  std::vector<uint8_t> buf;
+  MockSpoolStore(uint32_t cap) { buf.assign(cap, 0); }
+  bool readAt(uint32_t off, uint8_t *b, uint16_t len) override {
+    if ((size_t)off + len > buf.size()) return false;
+    memcpy(b, &buf[off], len); return true;
+  }
+  bool writeAt(uint32_t off, const uint8_t *b, uint16_t len) override {
+    if ((size_t)off + len > buf.size()) return false;
+    memcpy(&buf[off], b, len); return true;
+  }
+  uint32_t capacity() const override { return (uint32_t)buf.size(); }
+};
+
+// Build a ring-format entry: [len(2)][type(1)][seq(4)][payload(plen) filled with `fill`].
+static std::vector<uint8_t> make_entry(uint8_t type, uint32_t seq, uint8_t fill, uint16_t plen) {
+  uint16_t entry_len = 7 + plen;
+  std::vector<uint8_t> e(entry_len);
+  e[0] = entry_len & 0xFF; e[1] = entry_len >> 8;
+  e[2] = type;
+  memcpy(&e[3], &seq, 4);
+  for (uint16_t i = 0; i < plen; i++) e[7 + i] = fill;
+  return e;
+}
+
+static bool spool_append(FlashSpool &sp, uint8_t type, uint32_t seq, uint8_t fill, uint16_t plen) {
+  std::vector<uint8_t> e = make_entry(type, seq, fill, plen);
+  return sp.append(e.data(), (uint16_t)e.size(), seq);
+}
+
+// Drain one entry; returns its seq (or 0 if none) and sets *fill to its payload[0].
+static uint32_t spool_drain_one(FlashSpool &sp, uint8_t *fill) {
+  uint8_t buf[262];
+  uint16_t len = 0;
+  if (!sp.peekSend(buf, &len)) return 0;
+  uint32_t seq; memcpy(&seq, &buf[3], 4);
+  if (fill) *fill = (len > 7) ? buf[7] : 0;
+  sp.advanceSent();
+  return seq;
+}
+
+void test_spool_append_drain_fifo() {
+  MockSpoolStore store(4096);
+  FlashSpool sp; sp.begin(&store);
+  TEST_ASSERT_TRUE(sp.valid());
+  TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, 1, 0xA1, 20));
+  TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, 2, 0xB2, 30));
+  TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, 3, 0xC3, 10));
+  TEST_ASSERT_EQUAL_UINT32(3, sp.count());
+  TEST_ASSERT_EQUAL_UINT32(3, sp.unsent());
+  TEST_ASSERT_EQUAL_UINT32(1, sp.oldestSeq());
+  TEST_ASSERT_EQUAL_UINT32(3, sp.newestSeq());
+
+  uint8_t fill;
+  TEST_ASSERT_EQUAL_UINT32(1, spool_drain_one(sp, &fill)); TEST_ASSERT_EQUAL_HEX8(0xA1, fill);
+  TEST_ASSERT_EQUAL_UINT32(2, spool_drain_one(sp, &fill)); TEST_ASSERT_EQUAL_HEX8(0xB2, fill);
+  TEST_ASSERT_EQUAL_UINT32(3, spool_drain_one(sp, &fill)); TEST_ASSERT_EQUAL_HEX8(0xC3, fill);
+  TEST_ASSERT_FALSE(sp.hasUnsent());
+  TEST_ASSERT_EQUAL_UINT32(3, sp.count());   // drained != acked
+}
+
+void test_spool_overflow_evicts_oldest() {
+  MockSpoolStore store(64);          // fits two 27-byte entries, not three
+  FlashSpool sp; sp.begin(&store);
+  TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, 1, 0x11, 20));
+  TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, 2, 0x22, 20));
+  TEST_ASSERT_EQUAL_UINT32(2, sp.count());
+  TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, 3, 0x33, 20));   // evicts seq 1
+  TEST_ASSERT_EQUAL_UINT32(2, sp.count());
+  TEST_ASSERT_EQUAL_UINT32(1, sp.dropped());
+  TEST_ASSERT_EQUAL_UINT32(2, sp.oldestSeq());
+
+  uint8_t fill;
+  TEST_ASSERT_EQUAL_UINT32(2, spool_drain_one(sp, &fill)); TEST_ASSERT_EQUAL_HEX8(0x22, fill);
+  TEST_ASSERT_EQUAL_UINT32(3, spool_drain_one(sp, &fill)); TEST_ASSERT_EQUAL_HEX8(0x33, fill);
+}
+
+void test_spool_wraparound_preserves_data() {
+  MockSpoolStore store(100);         // small: forces a sentinel wrap after a few 27B entries
+  FlashSpool sp; sp.begin(&store);
+  // Append 8 entries; capacity ~3 live at a time, so this wraps and evicts repeatedly.
+  for (uint32_t s = 1; s <= 8; s++) TEST_ASSERT_TRUE(spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 20));
+  // Whatever survived must drain in strictly increasing seq with matching payload.
+  uint32_t prev = 0; uint8_t fill; uint32_t seq;
+  int drained = 0;
+  while ((seq = spool_drain_one(sp, &fill)) != 0) {
+    TEST_ASSERT_TRUE(seq > prev);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)seq, fill);   // payload tagged with its seq
+    prev = seq; drained++;
+  }
+  TEST_ASSERT_EQUAL_UINT32(8, sp.newestSeq());
+  TEST_ASSERT_TRUE(drained >= 2);
+  TEST_ASSERT_EQUAL_UINT32(8, prev);              // newest always survives
+}
+
+void test_spool_ack_drops_committed() {
+  MockSpoolStore store(4096);
+  FlashSpool sp; sp.begin(&store);
+  for (uint32_t s = 1; s <= 5; s++) spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 10);
+  bool emptied = sp.handleAck(3);
+  TEST_ASSERT_FALSE(emptied);
+  TEST_ASSERT_EQUAL_UINT32(2, sp.count());
+  TEST_ASSERT_EQUAL_UINT32(4, sp.oldestSeq());
+}
+
+void test_spool_ack_empties_returns_true() {
+  MockSpoolStore store(4096);
+  FlashSpool sp; sp.begin(&store);
+  for (uint32_t s = 1; s <= 3; s++) spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 10);
+  TEST_ASSERT_TRUE(sp.handleAck(3));
+  TEST_ASSERT_EQUAL_UINT32(0, sp.count());
+  TEST_ASSERT_FALSE(sp.hasUnsent());
+}
+
+void test_spool_resume_replays_from() {
+  MockSpoolStore store(4096);
+  FlashSpool sp; sp.begin(&store);
+  for (uint32_t s = 1; s <= 5; s++) spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 10);
+  while (spool_drain_one(sp, nullptr)) {}         // drain all
+  TEST_ASSERT_FALSE(sp.hasUnsent());
+  sp.handleResume(2);                             // replay seq 3,4,5
+  TEST_ASSERT_EQUAL_UINT32(3, sp.unsent());
+  uint8_t fill;
+  TEST_ASSERT_EQUAL_UINT32(3, spool_drain_one(sp, &fill));
+}
+
+void test_spool_resume_zero_replays_all() {
+  MockSpoolStore store(4096);
+  FlashSpool sp; sp.begin(&store);
+  for (uint32_t s = 1; s <= 3; s++) spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 10);
+  while (spool_drain_one(sp, nullptr)) {}
+  sp.handleResume(0);
+  TEST_ASSERT_EQUAL_UINT32(3, sp.unsent());
+  TEST_ASSERT_EQUAL_UINT32(1, spool_drain_one(sp, nullptr));
+}
+
+// ============================================================
+// Two-tier integration: CollectorSerial + attached FlashSpool
+// ============================================================
+
+// Overflow the RAM ring with a spool attached: evicted entries spill to flash (not dropped),
+// and draining yields EVERY entry in strict seq order across both tiers (the capacity win).
+void test_integration_spill_and_drain_in_order() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  MockSpoolStore store(8192);
+  cs.attachSpool(&store);
+  TEST_ASSERT_TRUE(cs.spoolActive());
+
+  const uint16_t plen = 20;         // 27-byte entries; ring is 256 -> most spill to flash
+  const uint32_t N = 40;
+  uint8_t pay[plen];
+  for (uint32_t s = 1; s <= N; s++) {
+    memset(pay, (uint8_t)s, plen);
+    cs.ringWrite(COLLECTOR_RX_RAW, pay, plen);
+  }
+  TEST_ASSERT_TRUE(cs.getSpoolCount() > 0);          // entries were spilled, not dropped
+  TEST_ASSERT_EQUAL_UINT32(0, cs.getDroppedCount()); // 8KB spool holds everything -> zero loss
+
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame pf;
+  uint32_t expect = 1;
+  while (off < ms.written.size()) {
+    TEST_ASSERT_TRUE(parse_frame(ms.written, off, pf));
+    TEST_ASSERT_TRUE(pf.valid_crc);
+    TEST_ASSERT_EQUAL_UINT32(expect, pf.seq);                 // strict 1..N order across tiers
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)expect, pf.payload[0]);
+    expect++;
+  }
+  TEST_ASSERT_EQUAL_UINT32(N + 1, expect);                    // saw exactly 1..N, no gaps
+}
+
+// An ACK whose seq lands in the flash range reclaims flash entries; the rest drains in order.
+void test_integration_ack_across_tiers() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  MockSpoolStore store(8192);
+  cs.attachSpool(&store);
+  uint8_t pay[20];
+  for (uint32_t s = 1; s <= 40; s++) { memset(pay, (uint8_t)s, 20); cs.ringWrite(COLLECTOR_RX_RAW, pay, 20); }
+
+  cs.handleAck(20);                 // commit seqs 1..20 (all in the flash tier)
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame pf;
+  uint32_t expect = 21;
+  while (off < ms.written.size()) {
+    TEST_ASSERT_TRUE(parse_frame(ms.written, off, pf));
+    TEST_ASSERT_EQUAL_UINT32(expect, pf.seq);
+    expect++;
+  }
+  TEST_ASSERT_EQUAL_UINT32(41, expect);   // 21..40 remained
+}
+
+// RESUME(0) after a full drain replays the entire two-tier backlog again, in order.
+void test_integration_resume_replays_all() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  MockSpoolStore store(8192);
+  cs.attachSpool(&store);
+  uint8_t pay[20];
+  for (uint32_t s = 1; s <= 40; s++) { memset(pay, (uint8_t)s, 20); cs.ringWrite(COLLECTOR_RX_RAW, pay, 20); }
+  while (cs.drain()) {}
+  TEST_ASSERT_FALSE(cs.hasBacklog());
+
+  cs.handleResume(0);
+  TEST_ASSERT_TRUE(cs.hasBacklog());
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame pf;
+  uint32_t expect = 1;
+  while (off < ms.written.size()) {
+    TEST_ASSERT_TRUE(parse_frame(ms.written, off, pf));
+    TEST_ASSERT_EQUAL_UINT32(expect, pf.seq);
+    expect++;
+  }
+  TEST_ASSERT_EQUAL_UINT32(41, expect);
+}
+
+// When BOTH tiers overflow, the oldest is truly dropped (counted), the newest always survives,
+// and whatever remains still drains contiguously (no corruption at the true-drop boundary).
+void test_integration_both_tiers_full_drops_oldest() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  MockSpoolStore store(256);        // tiny spool AND tiny ring (256) -> both overflow
+  cs.attachSpool(&store);
+  uint8_t pay[20];
+  const uint32_t N = 60;
+  for (uint32_t s = 1; s <= N; s++) { memset(pay, (uint8_t)s, 20); cs.ringWrite(COLLECTOR_RX_RAW, pay, 20); }
+
+  TEST_ASSERT_TRUE(cs.getDroppedCount() > 0);   // both tiers full -> real drops occurred
+
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame pf;
+  uint32_t prev = 0, first = 0;
+  while (off < ms.written.size()) {
+    TEST_ASSERT_TRUE(parse_frame(ms.written, off, pf));
+    TEST_ASSERT_TRUE(pf.valid_crc);
+    if (first == 0) first = pf.seq;
+    if (prev != 0) TEST_ASSERT_EQUAL_UINT32(prev + 1, pf.seq);   // contiguous survivors
+    prev = pf.seq;
+  }
+  TEST_ASSERT_EQUAL_UINT32(N, prev);     // newest always survives
+  TEST_ASSERT_TRUE(first > 1);           // oldest was dropped (both tiers overflowed)
+}
+
+// ============================================================
 // Unity test runner
 // ============================================================
 
@@ -1069,6 +1443,30 @@ int main(int argc, char **argv) {
   RUN_TEST(test_integration_write_drain_verify);
   RUN_TEST(test_integration_partial_drain_ack_continue);
   RUN_TEST(test_integration_resume_replays_same);
+
+  // Status-frame coalescing
+  RUN_TEST(test_status_skipped_when_backlog);
+  RUN_TEST(test_status_written_when_caught_up);
+  RUN_TEST(test_status_forced_when_backlog);
+  RUN_TEST(test_status_resumes_after_drain);
+
+  // Ring wrap-alignment corruption regression
+  RUN_TEST(test_ring_uniform_wrap_no_corruption);
+
+  // Flash spool
+  RUN_TEST(test_spool_append_drain_fifo);
+  RUN_TEST(test_spool_overflow_evicts_oldest);
+  RUN_TEST(test_spool_wraparound_preserves_data);
+  RUN_TEST(test_spool_ack_drops_committed);
+  RUN_TEST(test_spool_ack_empties_returns_true);
+  RUN_TEST(test_spool_resume_replays_from);
+  RUN_TEST(test_spool_resume_zero_replays_all);
+
+  // Two-tier integration (ring + spool)
+  RUN_TEST(test_integration_spill_and_drain_in_order);
+  RUN_TEST(test_integration_ack_across_tiers);
+  RUN_TEST(test_integration_resume_replays_all);
+  RUN_TEST(test_integration_both_tiers_full_drops_oldest);
 
   // Bug fix regression tests
   RUN_TEST(test_full_ring_drain_works);

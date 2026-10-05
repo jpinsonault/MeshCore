@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <MeshCore.h>
+#include "CollectorSpool.h"
 
 // Frame marker byte — non-printable, won't collide with text CLI output
 #define COLLECTOR_FRAME_START   0xC0
@@ -40,7 +41,14 @@
 #define COLLECTOR_DIAG_INTERVAL      30000  // milliseconds
 
 #ifndef COLLECTOR_RING_SIZE
-#define COLLECTOR_RING_SIZE     (200 * 1024)
+  #ifdef ESP32
+    #define COLLECTOR_RING_SIZE   (200 * 1024)
+  #else
+    // nRF52 / RP2040 / STM32 repeaters have far less RAM (STM32WL: 64KB) and this header is
+    // compiled into every *_repeater env. A 200KB ring would fail to allocate — or worse,
+    // succeed and starve the app/stack. Keep the default small; variants can override upward.
+    #define COLLECTOR_RING_SIZE   (8 * 1024)
+  #endif
 #endif
 // Ring size when PSRAM isn't available (e.g. Heltec V3). WiFi builds need the heap for the network stack.
 #ifndef COLLECTOR_RING_FALLBACK
@@ -67,6 +75,10 @@ class CollectorSerial {
   uint32_t _dropped_count;
   uint32_t _total_entries;
   uint32_t _unsent_entries; // entries written but not yet drained
+
+  // Flash overflow tier: holds entries evicted from the RAM ring (older seqs). No-op until a
+  // SpoolStore is attached via attachSpool() — when absent, the ring drops on overflow as before.
+  FlashSpool _spool;
 
   static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len) {
     uint16_t crc = 0xFFFF;
@@ -103,6 +115,16 @@ class CollectorSerial {
       _head = 0;
       memcpy(&entry_len, &_ring[_head], 2);
     }
+    // Spill the entry we're about to evict to the flash overflow tier (if attached) so a
+    // behind/disconnected host can still recover it. Only a true drop (no spool, or the spool
+    // also overflowed) counts toward _dropped_count; the spool tracks its own overflow drops.
+    if (_spool.valid() && entry_len <= 262) {
+      uint8_t evicted[262];
+      memcpy(evicted, &_ring[_head], entry_len);   // entries never straddle the end: contiguous
+      _spool.append(evicted, entry_len, readSeqAt(_head));
+    } else {
+      _dropped_count++;
+    }
     // Advance send_cursor if it points to the entry being dropped
     if (_send_cursor == _head) {
       _send_cursor = _head + entry_len;
@@ -110,7 +132,17 @@ class CollectorSerial {
     }
     _head += entry_len;
     _total_entries--;
-    _dropped_count++;
+    // Never leave head resting on a trailing sentinel: ringWrite's fits-check reads _head as the
+    // boundary of free space, so a sentinel there would let a new entry overwrite live data.
+    // (Latent corruption when entry sizes align exactly to the wrap boundary.)
+    if (_total_entries > 0 && _head != _tail) {
+      uint16_t next_len;
+      memcpy(&next_len, &_ring[_head], 2);
+      if (next_len == RING_SENTINEL) {
+        if (_send_cursor == _head) _send_cursor = 0;
+        _head = 0;
+      }
+    }
   }
 
   uint32_t readSeqAt(uint32_t pos) {
@@ -136,9 +168,15 @@ public:
       _ring = (uint8_t *)malloc(_ring_size + 2);
     }
 #else
-    _ring = (uint8_t *)malloc(_ring_size + 2);
+    _ring = (uint8_t *)malloc(_ring_size + 2);  // +2 ensures sentinel always fits
 #endif
     _ring_valid = (_ring != nullptr);
+    if (!_ring_valid) {
+      // Reliable delivery (seq/CRC/ACK) is unavailable; ringWrite() degrades to v1
+      // direct writes. Surface it instead of silently dropping to the fallback protocol.
+      MESH_DEBUG_PRINTLN("CollectorSerial: ring alloc of %u bytes failed; reliable delivery disabled",
+                         (unsigned)(_ring_size + 2));
+    }
     _head = 0;
     _tail = 0;
     _send_cursor = 0;
@@ -203,7 +241,26 @@ public:
   }
 
   bool drain() {
-    if (!_ring_valid || _unsent_entries == 0) return false;
+    if (!_ring_valid) return false;
+
+    // Flash overflow tier holds the older seqs — drain it first so the host receives entries in
+    // strict sequence order. One frame per call, same as the RAM path.
+    if (_spool.hasUnsent()) {
+      uint8_t entry[262];
+      uint16_t elen = 0;
+      if (_spool.peekSend(entry, &elen)) {
+        uint16_t scrc = crc16_ccitt(entry + 2, elen - 2);
+        uint8_t shdr[3] = {COLLECTOR_FRAME_START, (uint8_t)(elen & 0xFF), (uint8_t)(elen >> 8)};
+        _serial->write(shdr, 3);
+        _serial->write(entry + 2, elen - 2);
+        uint8_t scrcb[2] = {(uint8_t)(scrc & 0xFF), (uint8_t)(scrc >> 8)};
+        _serial->write(scrcb, 2);
+        _spool.advanceSent();
+        return true;
+      }
+    }
+
+    if (_unsent_entries == 0) return false;
 
     // Skip sentinel
     uint16_t entry_len;
@@ -236,10 +293,19 @@ public:
   }
 
   bool hasBacklog() const {
-    return _ring_valid && _unsent_entries > 0;
+    return _ring_valid && (_unsent_entries > 0 || _spool.hasUnsent());
   }
 
   void handleAck(uint32_t ack_seq) {
+    // Flash tier holds the older seqs: ack it first. RAM entries all carry higher seqs, so the
+    // RAM loop below only reclaims anything once the spool is fully committed.
+    _spool.handleAck(ack_seq);
+
+    // Snapshot the send cursor's seq while it still points at a valid entry, so that
+    // after dropping acked entries we can tell whether head advanced past it.
+    bool cursor_valid = _unsent_entries > 0;
+    uint32_t cursor_seq = cursor_valid ? readSeqAt(_send_cursor) : 0;
+
     while (_total_entries > 0) {
       uint16_t entry_len;
       memcpy(&entry_len, &_ring[_head], 2);
@@ -252,9 +318,23 @@ public:
       _total_entries--;
     }
     _acked_seq = ack_seq;
+
+    // Keep the send cursor from falling behind head. A host that ACKs at or beyond
+    // the cursor (buggy/aggressive host, or an ACK racing ahead of a RESUME) would
+    // otherwise leave the cursor pointing into freed space that the next ringWrite()
+    // overwrites, making drain() emit a garbage-length frame.
+    if (_total_entries == 0) {
+      _send_cursor = _head;
+      _unsent_entries = 0;
+    } else if (cursor_valid && ack_seq >= cursor_seq) {
+      _send_cursor = _head;
+      _unsent_entries = _total_entries;
+    }
   }
 
   void handleResume(uint32_t from_seq) {
+    // Replay the flash tier from from_seq too; drain() serves it before RAM, preserving order.
+    _spool.handleResume(from_seq);
     _send_cursor = _head;
     uint32_t count = _total_entries;
     while (count > 0) {
@@ -275,23 +355,22 @@ public:
     // Consume start byte (0xC0)
     if (s.read() != COLLECTOR_FRAME_START) return;
 
-    unsigned long deadline = millis() + 50;
+    // Host frames are tiny (11B ACK/RESUME) and arrive as a unit. Read only what's
+    // already buffered — never spin waiting on the main loop. If the frame isn't fully
+    // present yet (rare fragmentation, or line noise), drop it; the host's RESUME
+    // handshake recovers any missed ACK. This avoids stalling loop() (and CAD/airtime
+    // scheduling) for tens of ms on a partial or stray 0xC0.
+    if (s.available() < 2) return;
     uint8_t len_buf[2];
-    int idx = 0;
-    while (idx < 2 && millis() < deadline) {
-      if (s.available()) len_buf[idx++] = s.read();
-    }
-    if (idx < 2) return;
+    len_buf[0] = s.read();
+    len_buf[1] = s.read();
 
     uint16_t frame_len = len_buf[0] | ((uint16_t)len_buf[1] << 8);
     if (frame_len < 7 || frame_len > 20) return;  // host frames are small
 
+    if (s.available() < (int)frame_len) return;
     uint8_t data[20];
-    idx = 0;
-    while (idx < (int)frame_len && millis() < deadline) {
-      if (s.available()) data[idx++] = s.read();
-    }
-    if (idx < (int)frame_len) return;
+    for (int idx = 0; idx < (int)frame_len; idx++) data[idx] = s.read();
 
     // Validate CRC (last 2 bytes are CRC of everything before)
     uint16_t crc_len = frame_len - 2;
@@ -313,9 +392,15 @@ public:
     }
   }
 
+  // Attach a flash overflow store (firmware: a preallocated file; tests: in-memory). Optional —
+  // without it, the ring drops on overflow exactly as before.
+  void attachSpool(SpoolStore *store) { _spool.begin(store); }
+
   // --- Accessors ---
 
   uint32_t getOldestSeq() {
+    // The spool holds the oldest seqs when it's non-empty.
+    if (_spool.count() > 0) return _spool.oldestSeq();
     if (_total_entries == 0) return _next_seq > 1 ? _next_seq - 1 : 0;
     uint32_t pos = _head;
     uint16_t entry_len;
@@ -328,8 +413,10 @@ public:
     return _next_seq > 1 ? _next_seq - 1 : 0;
   }
 
-  uint32_t getDroppedCount() const { return _dropped_count; }
+  uint32_t getDroppedCount() const { return _dropped_count + _spool.dropped(); }
   uint32_t getTotalEntries() const { return _total_entries; }
+  uint32_t getSpoolCount() const { return _spool.count(); }
+  bool spoolActive() const { return _spool.valid(); }
 
   // --- Frame senders (buffer payload, then write to ring) ---
 
@@ -337,7 +424,9 @@ public:
     uint8_t buf[260];
     buf[0] = (uint8_t)(int8_t)(snr * 4);
     buf[1] = (uint8_t)(int8_t)(rssi);
-    if (raw_len > 0 && raw_len <= 258) memcpy(buf + 2, raw, raw_len);
+    if (raw_len < 0) raw_len = 0;
+    if (raw_len > 258) raw_len = 258;  // buf = 2 header + 258 payload; clamp drives both copy and length
+    if (raw_len > 0) memcpy(buf + 2, raw, raw_len);
     ringWrite(COLLECTOR_RX_RAW, buf, 2 + raw_len);
   }
 
@@ -358,10 +447,18 @@ public:
     ringWrite(COLLECTOR_ADVERTISEMENT, buf, pos);
   }
 
+  // force=true always buffers (an explicit `collector status` must answer); the periodic
+  // loop() heartbeat leaves it false so it coalesces away under backlog.
   void sendHeartbeat(uint32_t timestamp, uint16_t battery_mv,
                      uint32_t rx_flood, uint32_t rx_direct,
                      uint32_t tx_flood, uint32_t tx_direct,
-                     uint8_t free_pkts, uint32_t uptime_secs) {
+                     uint8_t free_pkts, uint32_t uptime_secs, bool force = false) {
+    // HEARTBEAT is ephemeral status — only the latest matters. While the host is behind
+    // (backlog present) or absent, buffering it would just evict real RX/TX traffic from the
+    // ring; skip it and let the next tick (<=10s) carry fresh status once the client catches up.
+    // Safe vs the host's idle watchdog: a backlog means drain() is actively sending bytes, and an
+    // idle mesh has no backlog so heartbeats still flow every 10s.
+    if (!force && hasBacklog()) return;
     uint8_t buf[27];
     int pos = 0;
     memcpy(buf + pos, &timestamp, 4); pos += 4;
@@ -380,7 +477,10 @@ public:
                        int16_t last_snr_x4, uint32_t tx_airtime_ms, uint32_t rx_airtime_ms,
                        uint32_t recv_errors, uint16_t err_flags, uint16_t tx_queue_len,
                        uint16_t direct_dups, uint16_t flood_dups,
-                       uint32_t n_recv, uint32_t n_sent) {
+                       uint32_t n_recv, uint32_t n_sent, bool force = false) {
+    // Ephemeral status (see sendHeartbeat): don't bury real traffic behind stale diagnostics.
+    // force=true for an explicit `collector diag`; the periodic loop() diag coalesces under backlog.
+    if (!force && hasBacklog()) return;
     uint8_t buf[50];
     int pos = 0;
     memcpy(buf + pos, &mcu_temp, 4); pos += 4;
