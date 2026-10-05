@@ -116,6 +116,37 @@ class TestExtractGroupPayload:
         assert result is not None
         assert result["channel_hash"] == ch.hash
 
+    def test_packed_path_len_multibyte_hops(self):
+        # path_len is PACKED: low 6 bits = hop count, high 2 bits = bytes/hop - 1.
+        # Here: 3 hops x 2 bytes/hop = 6 path bytes, encoded as 0x43 (not 6).
+        # A naive "skip path_len bytes" parser would skip 67 bytes and mangle the
+        # ciphertext; the correct parser skips 6 and recovers a valid message.
+        ch = _make_channel()
+        plaintext = struct.pack("<I", 1700000000) + b"\x00" + b"alice: hi\x00"
+        mac_and_data = encrypt_then_mac(ch.secret, plaintext)
+        payload = bytes([ch.hash]) + mac_and_data
+        path = b"\xaa\xbb\xcc\xdd\xee\xff"           # 3 hops x 2 bytes
+        packed = ((2 - 1) << 6) | 3                  # size=2, count=3 -> 0x43
+        header = (PAYLOAD_TYPE_GRP_TXT << 2) | ROUTE_TYPE_FLOOD
+        raw = bytes([header, packed]) + path + payload
+
+        result = extract_group_payload(raw)
+        assert result is not None
+        assert result["channel_hash"] == ch.hash
+        assert result["mac_and_data"] == mac_and_data   # exact ciphertext, not mis-sliced
+        # and it decodes end-to-end
+        msg = try_decode_group_message(raw, [ch], received_at=0.0)
+        assert msg is not None and msg.sender == "alice" and msg.text == "hi"
+
+    def test_reserved_path_hash_size_rejected(self):
+        # high 2 bits == 0b11 -> hash_size 4, reserved (Packet::isValidPathLen).
+        ch = _make_channel()
+        payload = bytes([ch.hash]) + encrypt_then_mac(
+            ch.secret, struct.pack("<I", 1) + b"\x00" + b"x: y\x00")
+        header = (PAYLOAD_TYPE_GRP_TXT << 2) | ROUTE_TYPE_FLOOD
+        raw = bytes([header, 0xC0]) + payload          # size-1 == 3 -> size 4
+        assert extract_group_payload(raw) is None
+
     def test_non_grp_returns_none(self):
         # Header with payload_type=TXT_MSG (0x02)
         header = (0x02 << 2) | ROUTE_TYPE_FLOOD

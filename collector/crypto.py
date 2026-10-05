@@ -122,9 +122,18 @@ def extract_group_payload(raw_packet: bytes) -> Optional[dict]:
     if i >= len(raw_packet):
         return None
 
+    # `path_len` is a PACKED byte, not a raw length (see Packet.cpp): the low 6
+    # bits are the hop count and the high 2 bits are (bytes-per-hop - 1), so the
+    # on-wire path is hash_count * hash_size bytes. Treating the whole byte as a
+    # length mis-slices every packet whose path uses >1 byte per hop, turning a
+    # real message into garbage "ciphertext".
     path_len = raw_packet[i]
     i += 1
-    i += path_len  # skip path bytes
+    hash_count = path_len & 0x3F
+    hash_size = (path_len >> 6) + 1
+    if hash_size == 4:
+        return None  # reserved encoding (Packet::isValidPathLen) — not a real packet
+    i += hash_count * hash_size  # skip path bytes
 
     if i >= len(raw_packet):
         return None
