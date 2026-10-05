@@ -10,14 +10,14 @@
 <div class="app">
 
   <header class="topbar">
-    <div class="brand"><span class="logo">&#9741;</span> MeshCore Channel Cracker</div>
+    <div class="brand"><span class="logo">&#9741;</span> <span class="brand-name">MeshCore</span> <span class="brand-sub">Channel Cracker</span></div>
     <div class="spacer"></div>
     <div class="meta">
       <span id="mode-badge" class="badge offline"><span class="dot"></span>…</span>
       <span id="fresh-badge" class="badge" style="display:none" title="How fresh the capture is"></span>
       <span id="engine-badge" class="badge">…</span>
       <span id="db-path" class="db-path" title=""></span>
-      <button id="theme-btn" class="icon-btn" title="Toggle theme (t)">&#9728;</button>
+      <button id="theme-btn" class="icon-btn" title="Toggle theme (t)" aria-label="Toggle theme">&#9728;</button>
     </div>
   </header>
 
@@ -26,15 +26,17 @@
     <!-- Sidebar -->
     <nav class="sidebar" aria-label="Navigation">
       <div class="nav-section">
-        <div class="nav-title">View</div>
         <button id="nav-channels" class="nav-item">
+          <span class="nav-ico">&#9783;</span>
           <span class="nm">Channels</span>
           <span id="nav-channels-count" class="count">0</span>
         </button>
         <button id="nav-config" class="nav-item">
+          <span class="nav-ico">&#9881;</span>
           <span class="nm">Cracker config</span>
         </button>
         <button id="nav-health" class="nav-item">
+          <span class="nav-ico">&#9741;</span>
           <span class="nm">Device &amp; link</span>
         </button>
       </div>
@@ -42,28 +44,27 @@
       <div class="nav-section">
         <div class="nav-title">At a glance</div>
         <div class="glance">
-          <div class="glance-row"><span class="g-k">Named</span><span id="g-named" class="g-v">0</span></div>
-          <div class="glance-row"><span class="g-k">Unknown</span><span id="g-unknown" class="g-v">0</span></div>
-          <div class="glance-row"><span class="g-k">Cracking</span><span id="g-cracking" class="g-v">0</span></div>
-          <div class="glance-row"><span class="g-k">Exhausted</span><span id="g-exhausted" class="g-v">0</span></div>
+          <div class="glance-row named"><span class="g-dot"></span><span class="g-k">Named</span><span id="g-named" class="g-v">0</span></div>
+          <div class="glance-row unknown"><span class="g-dot"></span><span class="g-k">Unknown</span><span id="g-unknown" class="g-v">0</span></div>
+          <div class="glance-row cracking"><span class="g-dot"></span><span class="g-k">Cracking</span><span id="g-cracking" class="g-v">0</span></div>
+          <div class="glance-row exhausted"><span class="g-dot"></span><span class="g-k">Exhausted</span><span id="g-exhausted" class="g-v">0</span></div>
         </div>
       </div>
 
       <div class="nav-section">
-        <div class="nav-title">About a channel hash</div>
+        <div class="nav-title">What's a channel hash?</div>
         <p class="hint-copy">
-          A <b>channel hash</b> is a single cleartext byte (0–255) — the only part of an
-          encrypted packet visible without the key. Many channels can share one byte, so a
-          hash is an <i>identifier</i>, not an identity. Recovering the name turns an
-          <b>Unknown</b> hash into a <b>Named</b> channel.
+          The <b>hash</b> is the single cleartext byte (0–255) visible on an encrypted
+          packet — an <i>identifier</i>, not an identity, since many channels can share a
+          byte. Recovering the name turns an <b>Unknown</b> hash into a <b>Named</b> channel.
         </p>
       </div>
 
-      <div class="nav-section faint" style="font-size:11px; margin-top:auto">
-        <span class="kbd">g</span> channels ·
-        <span class="kbd">c</span> config ·
-        <span class="kbd">s</span> sweep ·
-        <span class="kbd">/</span> search ·
+      <div class="nav-section kbd-hints">
+        <span class="kbd">g</span> channels
+        <span class="kbd">c</span> config
+        <span class="kbd">s</span> sweep
+        <span class="kbd">/</span> search
         <span class="kbd">t</span> theme
       </div>
     </nav>
@@ -75,96 +76,97 @@
         <!-- Channels view (unified list) -->
         <section id="view-channels">
           <div class="view-head">
-            <h1>Channels</h1>
-            <span class="sub-inline">One row per channel. The hash is the only cleartext byte; packets are encrypted, messages are decoded.</span>
+            <div>
+              <h1>Channels</h1>
+              <p class="view-sub">One row per channel. The hash is the only cleartext byte — packets are encrypted, messages are decoded.</p>
+            </div>
           </div>
 
-          <!-- Queue / progress -->
-          <div class="panel" id="queue-panel">
-            <div class="row" style="align-items:center; justify-content:space-between">
-              <h2 style="margin:0">Crack queue</h2>
-              <button id="q-cancel-all" style="display:none">Cancel all</button>
+          <!-- Action toolbar -->
+          <div class="toolbar">
+            <div class="toolbar-primary">
+              <button class="primary big" id="sweep-go">Crack all pending</button>
+              <span id="sweep-note" class="sub">Grinds every <b>Unknown</b> channel in one batched sweep.</span>
             </div>
-            <div id="progress" class="progress">Idle.</div>
+            <div class="toolbar-tools">
+              <details class="tool">
+                <summary><span class="tool-title">Crack a specific hash or packet</span></summary>
+                <div class="tool-body">
+                  <div class="row" style="align-items:flex-end">
+                    <div style="flex:0 0 160px">
+                      <label for="m-hash">channel hash (0–255)</label>
+                      <input id="m-hash" type="number" min="0" max="255" placeholder="e.g. 42">
+                    </div>
+                    <div style="flex:0 0 auto">
+                      <button id="m-go">Crack hash</button>
+                    </div>
+                  </div>
+                  <div style="margin-top:12px">
+                    <label for="p-hex">…or a raw GRP_TXT packet (hex)</label>
+                    <textarea id="p-hex" placeholder="1500ab…"></textarea>
+                    <div class="row" style="margin-top:10px">
+                      <button id="p-go">Crack packet</button>
+                    </div>
+                  </div>
+                </div>
+              </details>
+              <details class="tool mw-panel" id="multiword-panel">
+                <summary>
+                  <span class="tool-title">Word-combo crack</span>
+                  <span id="mw-gpu-badge" class="badge mini" title="GPU required">GPU</span>
+                </summary>
+                <div class="tool-body mw-body">
+                  <p class="sub">Combine common English words (hyphenated and/or run-together) and grind
+                    them on the GPU — for names like <code>#north-sound</code> or <code>#campfire</code>.
+                    Tier and word count are the feasibility knob; watch the estimate.</p>
+                  <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:18px">
+                    <div style="flex:0 0 220px">
+                      <label for="mw-words">words to combine: <b id="mw-words-val">2</b></label>
+                      <input id="mw-words" type="range" min="1" max="4" step="1" value="2">
+                    </div>
+                    <div style="flex:0 0 160px">
+                      <label for="mw-tier">wordlist tier</label>
+                      <select id="mw-tier">
+                        <option value="10000">top 10,000</option>
+                        <option value="50000">top 50,000</option>
+                      </select>
+                    </div>
+                    <label class="toggle" style="flex:0 0 auto">
+                      <span class="switch"><input type="checkbox" id="mw-hyphen" checked><span class="track"></span></span>
+                      <span>hyphenated</span>
+                    </label>
+                    <label class="toggle" style="flex:0 0 auto">
+                      <span class="switch"><input type="checkbox" id="mw-concat" checked><span class="track"></span></span>
+                      <span>run-together</span>
+                    </label>
+                  </div>
+                  <div class="field-hint" style="margin-top:12px">
+                    Candidates (fit 30 chars): <b id="mw-estimate">—</b> · est. <b id="mw-eta">—</b>
+                    <span id="mw-raw" class="faint"></span>
+                  </div>
+                  <div id="mw-warn" class="warn-note" style="display:none">
+                    &#9888; This run is very large — dial the tier or word count down, or expect a long grind
+                    (it's cancelable, and tries the most common words first).
+                  </div>
+                  <div id="mw-nogpu" class="warn-note" style="display:none">
+                    &#9888; Word-combo cracking needs a GPU; this host is CPU-only.
+                  </div>
+                  <div class="row" style="margin-top:14px">
+                    <button class="primary" id="mw-go">Crack pending with word combos</button>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <!-- Queue / progress status strip (quiet when idle) -->
+          <div class="queue-panel" id="queue-panel">
+            <div class="queue-head">
+              <span id="progress" class="progress">Idle.</span>
+              <button id="q-cancel-all" class="sm ghost" style="display:none">Cancel all</button>
+            </div>
             <div id="queue"></div>
           </div>
-
-          <!-- Primary actions -->
-          <div class="panel actions-panel">
-            <div class="actions-main">
-              <button class="primary big" id="sweep-go">Crack all pending (sweep)</button>
-              <span id="sweep-note" class="sub">Cracks every <b>Unknown</b> channel in one batched GPU sweep.</span>
-            </div>
-            <details class="more-actions">
-              <summary>Crack a specific hash or pasted packet</summary>
-              <div class="more-body">
-                <div class="row" style="align-items:flex-end">
-                  <div style="flex:0 0 160px">
-                    <label for="m-hash">channel hash (0–255)</label>
-                    <input id="m-hash" type="number" min="0" max="255" placeholder="e.g. 42">
-                  </div>
-                  <div style="flex:0 0 auto">
-                    <button id="m-go">Crack hash</button>
-                  </div>
-                </div>
-                <div style="margin-top:12px">
-                  <label for="p-hex">…or a raw GRP_TXT packet (hex)</label>
-                  <textarea id="p-hex" placeholder="1500ab…"></textarea>
-                  <div class="row" style="margin-top:10px">
-                    <button id="p-go">Crack packet</button>
-                  </div>
-                </div>
-              </div>
-            </details>
-          </div>
-
-          <!-- Word-combo (multiword) crack -->
-          <details class="panel mw-panel" id="multiword-panel">
-            <summary>
-              <span class="mw-sum-title">Word-combo crack</span>
-              <span id="mw-gpu-badge" class="badge" title="GPU required">GPU</span>
-              <span class="sub">— multi-word names like <code>#north-sound</code>, <code>#campfire</code></span>
-            </summary>
-            <div class="mw-body">
-              <p class="sub">Combine common English words (hyphenated and/or run-together) and grind
-                them on the GPU. The tier and word count are the feasibility knob — watch the estimate.</p>
-              <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:18px">
-                <div style="flex:0 0 220px">
-                  <label for="mw-words">words to combine: <b id="mw-words-val">2</b></label>
-                  <input id="mw-words" type="range" min="1" max="4" step="1" value="2">
-                </div>
-                <div style="flex:0 0 160px">
-                  <label for="mw-tier">wordlist tier</label>
-                  <select id="mw-tier">
-                    <option value="10000">top 10,000</option>
-                    <option value="50000">top 50,000</option>
-                  </select>
-                </div>
-                <label class="toggle" style="flex:0 0 auto">
-                  <span class="switch"><input type="checkbox" id="mw-hyphen" checked><span class="track"></span></span>
-                  <span>hyphenated</span>
-                </label>
-                <label class="toggle" style="flex:0 0 auto">
-                  <span class="switch"><input type="checkbox" id="mw-concat" checked><span class="track"></span></span>
-                  <span>run-together</span>
-                </label>
-              </div>
-              <div class="field-hint" style="margin-top:10px">
-                Candidates (fit 30 chars): <b id="mw-estimate">—</b> · est. <b id="mw-eta">—</b>
-                <span id="mw-raw" class="faint"></span>
-              </div>
-              <div id="mw-warn" class="warn-note" style="display:none">
-                &#9888; This run is very large — dial the tier or word count down, or expect a long grind
-                (it's cancelable, and tries the most common words first).
-              </div>
-              <div id="mw-nogpu" class="warn-note" style="display:none">
-                &#9888; Word-combo cracking needs a GPU; this host is CPU-only.
-              </div>
-              <div class="row" style="margin-top:12px">
-                <button class="primary" id="mw-go">Crack pending with word combos</button>
-              </div>
-            </div>
-          </details>
 
           <!-- Filter chips + sort -->
           <div class="list-controls">
@@ -172,7 +174,7 @@
             <div class="sort">
               <label for="sort-by" class="inline-label">Sort</label>
               <select id="sort-by">
-                <option value="packets">Packets (activity)</option>
+                <option value="packets">Activity (packets)</option>
                 <option value="recent">Last activity</option>
               </select>
             </div>
@@ -193,25 +195,24 @@
               <span id="d-method" class="method-badge" style="display:none"></span>
               <span id="d-state" class="state-pill"></span>
             </div>
-            <div id="d-collision" class="collision-note" style="display:none"></div>
             <div class="detail-stats" id="d-stats"></div>
           </div>
 
           <!-- Crack controls for Unknown / Exhausted -->
           <div class="panel" id="d-crack-panel" style="display:none">
-            <h2>This channel is still encrypted</h2>
+            <h2>Still encrypted</h2>
             <p class="sub" id="d-crack-sub"></p>
             <div id="d-attempt" class="attempt-info" style="display:none"></div>
             <div class="row" style="align-items:center">
               <button class="primary" id="d-crack-go">Crack this hash</button>
-              <button id="d-retry-go" style="display:none">Retry (clear exhausted)</button>
+              <button id="d-retry-go" class="ghost" style="display:none">Retry (clear exhausted)</button>
             </div>
           </div>
 
           <!-- Message stream -->
           <div id="d-msg-wrap">
             <div class="msg-toolbar">
-              <input id="msg-search" class="search" type="search" placeholder="Search messages & senders  (press /)">
+              <input id="msg-search" class="search" type="search" placeholder="Search messages &amp; senders  (press /)">
               <button id="msg-search-btn">Search</button>
             </div>
             <div id="msg-scroll" class="msg-scroll" style="height: calc(100vh - 300px); min-height: 260px">
@@ -222,12 +223,12 @@
 
         <!-- Config view -->
         <section id="view-config" style="display:none">
-          <div class="view-head"><h1>Cracker config</h1></div>
+          <div class="view-head"><div><h1>Cracker config</h1><p class="view-sub">How the cracker spends its effort when it tries to recover a channel name.</p></div></div>
 
           <div class="panel">
             <h2>Engine</h2>
             <div class="row">
-              <div style="flex:0 0 220px">
+              <div style="flex:0 0 240px">
                 <label for="cfg-engine">brute-force engine</label>
                 <select id="cfg-engine">
                   <option value="auto">Auto (GPU if present)</option>
@@ -241,7 +242,7 @@
 
           <div class="panel">
             <h2>Brute-force parameters</h2>
-            <p class="sub">Only used when a name isn't in the dictionary/catalog. Longer charset × length grows the search fast.</p>
+            <p class="sub">Used only when a name isn't in the dictionary/catalog. Longer charset × length grows the search fast.</p>
             <div class="row">
               <div>
                 <label for="cfg-charset">charset</label>
@@ -263,7 +264,7 @@
 
           <div class="panel">
             <h2>Dictionary, catalog &amp; rules</h2>
-            <div class="stat-row" style="margin-bottom:14px">
+            <div class="stat-row" style="margin-bottom:16px">
               <div class="stat"><span class="v" id="wl-total">0</span><span class="k">total candidates</span></div>
               <div class="stat"><span class="v" id="wl-builtin">0</span><span class="k">built-in</span></div>
               <div class="stat"><span class="v" id="wl-catalog">0</span><span class="k">catalog</span></div>
@@ -277,7 +278,7 @@
               <span class="switch"><input type="checkbox" id="cfg-rules"><span class="track"></span></span>
               <span>Apply rule-based mangling to candidates <span id="cfg-rules-hint" class="faint"></span></span>
             </label>
-            <div style="margin:14px 0 6px"><label>custom wordlists</label><div id="wl-custom"></div></div>
+            <div style="margin:16px 0 6px"><label>custom wordlists</label><div id="wl-custom"></div></div>
             <div class="row" style="margin-top:12px; align-items:flex-start">
               <div>
                 <label for="wl-text">add words (one per line)</label>
@@ -307,6 +308,7 @@
 
         <!-- Device & link health -->
         <section id="view-health" style="display:none">
+          <div class="view-head"><div><h1>Device &amp; link</h1><p class="view-sub">Whether the collector is hearing the device, and why it last restarted.</p></div></div>
           <div class="panel">
             <h2>Link status</h2>
             <p class="sub" id="health-summary">Loading…</p>

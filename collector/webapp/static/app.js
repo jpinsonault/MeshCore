@@ -421,13 +421,17 @@ function channelRow(e) {
   const row = document.createElement("div");
   row.className = "chrow " + e.kind + (e.cracking ? " cracking" : "");
 
-  // Identifier / identity column.
+  // Identifier / identity column. Named channels lead with their name and carry
+  // the hash byte only as a faint secondary identifier (not a cross-reference to
+  // whatever else happens to share the byte); encrypted channels are identified
+  // by the byte itself.
   let ident;
   if (e.kind === "unknown" || e.kind === "exhausted") {
     ident = `<span class="ident hash-ident">hash <code>${hex2(e.hash)}</code>`
       + `<span class="faint dec">(${e.hash})</span></span>`;
   } else {
-    ident = `<span class="ident name-ident">${esc(e.name)}</span>`;
+    ident = `<span class="ident name-ident">${esc(e.name)}</span>`
+      + `<span class="hash-tag" title="hash byte ${e.hash}">${hex2(e.hash)}</span>`;
   }
 
   // State / method tag.
@@ -455,21 +459,9 @@ function channelRow(e) {
     ? `<span class="num">${fmtInt(e.messages)}</span><span class="col-k">messages</span>`
     : `<span class="num">~${fmtInt(e.undecoded_distinct)}</span><span class="col-k">unknown msgs</span>`;
 
-  // Collision note. A named channel never has "undecodable" messages of its
-  // own; if its 1-byte hash also carries unknown traffic, that is a *different*
-  // channel on the same byte. Surface it as a crackable cross-reference, not as
-  // this channel's failure. On an unknown byte, name the known channel(s) it
-  // collides with.
-  let collision = "";
-  if (named && e.shares_hash) {
-    collision = `<div class="collision-note">Hash byte <code>${hex2(e.hash)}</code> also carries `
-      + `<b>~${fmtInt(e.undecoded_distinct)}</b> message(s) from another, un-cracked channel · `
-      + `<a href="#" class="go-unknown">crack that channel &#8594;</a></div>`;
-  } else if (!named && e.collides_with && e.collides_with.length) {
-    collision = `<div class="collision-note faint">Shares hash byte with `
-      + `${e.collides_with.map((n) => `<b>${esc(n)}</b>`).join(", ")} `
-      + `<span class="faint">(different channel, same 1-byte hash)</span></div>`;
-  }
+  // Hash collisions (many channels can share one cleartext byte) are an
+  // implementation detail, not a UI theme: each channel stands on its own, so no
+  // cross-linking between a named channel and the un-cracked traffic on its byte.
 
   // Per-row action.
   let action = "";
@@ -493,8 +485,7 @@ function channelRow(e) {
         <div class="col meta-col when"><span class="when-v">${e.last_activity ? fmtAgo(e.last_activity) : "—"}</span><span class="col-k">activity</span></div>
         <div class="col action-col">${action}</div>
       </div>
-    </div>
-    ${collision}`;
+    </div>`;
 
   // Clicks: open detail (except the action button).
   row.onclick = (ev) => {
@@ -505,9 +496,6 @@ function channelRow(e) {
   if (cb) cb.onclick = (ev) => { ev.stopPropagation(); startCrack(e.hash); };
   const rb = row.querySelector(".row-retry");
   if (rb) rb.onclick = (ev) => { ev.stopPropagation(); retryCrack(e.hash); };
-  // "crack that channel" jumps to the Unknown row for this byte.
-  const gu = row.querySelector(".go-unknown");
-  if (gu) gu.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); openHash(e.hash); };
   return row;
 }
 
@@ -637,6 +625,9 @@ function renderQueue(st) {
   for (const j of recent.slice(0, 4)) rows.push(jobRow(j, false, st));
   el.innerHTML = rows.length ? `<div class="queue-list">${rows.join("")}</div>` : "";
   $("q-cancel-all").style.display = (active || queued.length) ? "" : "none";
+  // Collapse the strip to a quiet idle line when nothing is happening.
+  const idle = !active && !queued.length && !recent.length && !st.running && !st.result;
+  $("queue-panel").classList.toggle("idle", idle);
   for (const b of el.querySelectorAll("[data-cancel]")) {
     b.onclick = () => cancelJob(parseInt(b.getAttribute("data-cancel"), 10));
   }
@@ -778,15 +769,6 @@ function openEntry(e) {
   }
 }
 
-// Open the Unknown/Exhausted entry for a hash byte (the crack target), e.g. from
-// a named channel's "crack that channel" collision cross-reference.
-function openHash(hash) {
-  const target = state.entries.find(
-    (x) => x.hash === hash && (x.kind === "unknown" || x.kind === "exhausted"));
-  if (target) openEntry(target);
-  else startCrack(hash);  // not yet in the list — just queue it
-}
-
 // Re-locate the active entry in fresh data (its state may have changed after a crack).
 async function refreshDetailState() {
   if (!state.active) return;
@@ -830,26 +812,9 @@ function renderDetail(e) {
   sp.textContent = e.cracking ? "cracking…" : stateLabel;
   sp.className = "state-pill " + (e.cracking ? "cracking" : e.kind);
 
-  // Collision cross-reference. A named channel decodes all of its own traffic;
-  // leftover undecoded packets on its 1-byte hash are a *different*, un-cracked
-  // channel. Offer to crack that one instead of implying this channel failed.
-  // On an unknown byte, name the known channel(s) it collides with.
-  const col = $("d-collision");
-  if (!encrypted && e.shares_hash) {
-    col.style.display = "";
-    col.innerHTML = `Hash byte <code>${hex2(e.hash)}</code> also carries `
-      + `<b>~${fmtInt(e.undecoded_distinct)}</b> message(s) from another, un-cracked channel. `
-      + `<a href="#" id="d-go-unknown">Crack that channel &#8594;</a>`;
-    const g = $("d-go-unknown");
-    if (g) g.onclick = (ev) => { ev.preventDefault(); openHash(e.hash); };
-  } else if (encrypted && e.collides_with && e.collides_with.length) {
-    col.style.display = "";
-    col.innerHTML = `Shares this hash byte with `
-      + `${e.collides_with.map((n) => `<b>${esc(n)}</b>`).join(", ")} — `
-      + `a different channel on the same 1-byte hash.`;
-  } else {
-    col.style.display = "none";
-  }
+  // No hash-collision cross-reference: each channel is presented independently.
+  // A named channel shows only its own traffic; the un-cracked channel sharing
+  // its byte is simply its own Unknown entry in the list.
 
   // Stats row. For a named channel the figures are its own decoded traffic; for
   // an unknown byte, the still-encrypted packets and a distinct-message estimate.
