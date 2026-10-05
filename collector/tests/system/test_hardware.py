@@ -13,7 +13,6 @@ import time
 import pytest
 
 from collector.crypto import Channel
-from collector.cracker import ChannelCracker
 from collector.protocol import (
     FRAME_TYPE_HEARTBEAT,
     FRAME_TYPE_DIAGNOSTICS,
@@ -162,47 +161,3 @@ class TestSequencing:
             )
 
 
-class TestCracker:
-    """Cracker test — runs last since it modifies core state heavily."""
-
-    def test_cracker_discovers_injected_channel(self, hw, unique_tag):
-        """Inject on #hiking (in builtin wordlist, NOT pre-configured) — cracker should find it."""
-        core, fc = hw
-        # No channels configured — forces packets through the cracker path
-        core.set_channels([])
-
-        cracker = ChannelCracker(core.store)
-        discovered = []
-
-        def on_discovered(name, count):
-            discovered.append((name, count))
-
-        cracker.on_channel_discovered = on_discovered
-        core.set_cracker(cracker)
-        cracker.start()
-
-        try:
-            core.send_command(f"collector inject #hiking sysbot {unique_tag}\r")
-
-            # Wait for cracker to discover the channel
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                if any(name == "#hiking" for name, _ in discovered):
-                    break
-                time.sleep(0.5)
-
-            assert any(name == "#hiking" for name, _ in discovered), (
-                f"Cracker did not discover #hiking. Pending: {cracker.pending_hashes}"
-            )
-
-            # Verify retroactive decode stored the message
-            rows = core.store.get_channel_messages(channel_name="#hiking", limit=50)
-            matching = [r for r in rows if unique_tag in (r.get("text") or "")]
-            assert len(matching) >= 1, "Cracker did not retroactively decode the message"
-        finally:
-            # Stop cracker thread first, then detach from core
-            cracker.stop()
-            # Direct attribute set avoids the race in set_cracker() —
-            # by this point the cracker thread is joined and there are
-            # no GRP_TXT packets in flight from our inject
-            core._cracker = None

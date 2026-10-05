@@ -9,7 +9,6 @@ from pyos.Service import Service
 
 from .core import CollectorCore
 from .events import (
-    ChannelDiscovered,
     ChannelMessage,
     CollectorConnected,
     CollectorDisconnected,
@@ -59,7 +58,6 @@ class MeshCollectorService(Service):
         self._core.on_disconnected = self._on_disconnected
         self._core.on_error = self._on_error
         self._core.on_channel_message = self._on_channel_message
-        self._core.on_channel_discovered = self._on_channel_discovered
         self._core.on_undecryptable = self._on_undecryptable
 
         # Load channels from config
@@ -91,9 +89,6 @@ class MeshCollectorService(Service):
 
     def _on_channel_message(self, msg):
         self.dispatch_event(ChannelMessage(msg))
-
-    def _on_channel_discovered(self, name, decoded_count):
-        self.dispatch_event(ChannelDiscovered(name, decoded_count))
 
     def send_message(self, channel_name, sender_name, text):
         """Send a group message on a channel. Returns True if command was sent."""

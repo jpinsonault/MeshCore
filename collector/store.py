@@ -843,7 +843,7 @@ class CollectorStore:
         return row is not None
 
     def get_grp_txt_packets(self, limit=10000):
-        """Return RX raw_packets with payload_type=5 (GRP_TXT) for cracker scanning."""
+        """Return RX raw_packets with payload_type=5 (GRP_TXT) for channel decode/back-fill scanning."""
         rows = self._conn.execute(
             "SELECT id, timestamp, raw_hex FROM raw_packets "
             "WHERE payload_type = 5 AND direction = 'rx' "
@@ -955,7 +955,7 @@ class CollectorStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # --- Settings persistence (durable UI / cracker config) ---
+    # --- Settings persistence (durable UI / tooling config) ---
 
     def get_setting(self, key, default=None):
         """Return a JSON-decoded setting value, or ``default`` if absent."""

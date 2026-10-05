@@ -135,12 +135,10 @@ class CollectorCore:
         self.on_disconnected: Callable = None
         self.on_error: Callable = None
         self.on_channel_message: Callable = None
-        self.on_channel_discovered: Callable = None
         self.on_undecryptable: Callable = None
 
         self._channels = []
         self._undecryptable_count = 0
-        self._cracker = None
         self._ser = None
         self._store = None
         self._reader = None
@@ -188,10 +186,6 @@ class CollectorCore:
     def remove_channel(self, name):
         """Remove a channel by name from the live decode list."""
         self._channels = [ch for ch in self._channels if ch.name != name]
-
-    def set_cracker(self, cracker):
-        """Attach a ChannelCracker instance for passive channel discovery."""
-        self._cracker = cracker
 
     def start(self):
         """Start the collector on a background thread."""
@@ -526,8 +520,6 @@ class CollectorCore:
                     self._undecryptable_count += 1
                     if self.on_undecryptable:
                         self.on_undecryptable(self._undecryptable_count)
-                    if self._cracker and extracted:
-                        self._cracker.notify_unknown_hash(extracted["channel_hash"])
 
     def _send_ack(self, seq):
         """Send HOST_ACK frame and persist last committed seq."""

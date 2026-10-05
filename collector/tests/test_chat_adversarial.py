@@ -1,7 +1,7 @@
 """Adversarial and edge-case tests for ChatActivity.
 
 Covers: message edge cases, rapid-fire events, room scaling, command edge
-cases, multi-activity navigation, and ChannelDiscovered events.
+cases and multi-activity navigation.
 """
 
 import time
@@ -12,7 +12,6 @@ from pyos.testing import MockScreen, HarnessApplication
 
 from collector.activities.chat import ChatActivity
 from collector.events import (
-    ChannelDiscovered,
     ChannelMessage,
     CollectorConnected,
     CollectorFrame,
@@ -296,30 +295,6 @@ class TestCommandEdgeCases:
         # Channel name should be trimmed
         assert any(ch["name"] == "#trimtest" for ch in activity._channels)
 
-    def test_crack_without_service(self, app, mock_screen):
-        activity = _make_chat()
-        app.start_activity(activity)
-        activity.display_state["command_input"]["text"] = "/crack status"
-        activity._on_text_submit(None)
-        app.drain()
-        assert any("not available" in m["text"].lower() for m in activity._system_messages)
-
-    def test_crack_unknown_subcommand(self, app, mock_screen):
-        # We need a mock cracker — easiest is to test the dispatch path
-        activity = _make_chat()
-        app.start_activity(activity)
-        # Without a collector service, crack is "not available"
-        activity.display_state["command_input"]["text"] = "/crack banana"
-        activity._on_text_submit(None)
-        app.drain()
-        # Should say not available (no service) or usage
-        has_msg = any(
-            "not available" in m["text"].lower() or "usage" in m["text"].lower()
-            for m in activity._system_messages
-        )
-        assert has_msg
-
-
 # ---------------------------------------------------------------------------
 # TestMultiActivityNavigation
 # ---------------------------------------------------------------------------
@@ -386,51 +361,3 @@ class TestMultiActivityNavigation:
         assert any(ch["name"] == "#persist" for ch in activity._channels)
 
 
-# ---------------------------------------------------------------------------
-# TestChannelDiscoveredEvent
-# ---------------------------------------------------------------------------
-
-class TestChannelDiscoveredEvent:
-    """ChannelDiscovered events from the cracker."""
-
-    def test_rapid_discoveries(self, app, mock_screen):
-        activity = _make_chat()
-        app.start_activity(activity)
-        activity._channels = []
-        for i in range(5):
-            app.dispatch_event(ChannelDiscovered(f"#disc{i}", decoded_count=i + 1))
-        app.drain()
-
-        for i in range(5):
-            matches = [ch for ch in activity._channels if ch["name"] == f"#disc{i}"]
-            assert len(matches) == 1
-            assert matches[0]["msg_count"] == i + 1
-
-    def test_discovered_while_viewing_all(self, app, mock_screen):
-        activity = _make_chat()
-        app.start_activity(activity)
-        assert activity._selected_channel is None  # viewing "All"
-        app.dispatch_event(ChannelDiscovered("#found_all", decoded_count=3))
-        app.drain()
-        assert any("Cracked channel #found_all" in m["text"] for m in activity._system_messages)
-
-    def test_discovered_for_selected_channel(self, app, mock_screen):
-        activity = _make_chat()
-        app.start_activity(activity)
-        activity._channels = [{"name": "#existing", "msg_count": 2}]
-        activity._selected_channel = "#existing"
-        app.dispatch_event(ChannelDiscovered("#existing", decoded_count=5))
-        app.drain()
-        existing = [ch for ch in activity._channels if ch["name"] == "#existing"]
-        assert existing[0]["msg_count"] == 7  # 2 + 5
-
-    def test_duplicate_discovery_no_dup_sidebar(self, app, mock_screen):
-        activity = _make_chat()
-        app.start_activity(activity)
-        activity._channels = []
-        app.dispatch_event(ChannelDiscovered("#dup_disc", decoded_count=1))
-        app.dispatch_event(ChannelDiscovered("#dup_disc", decoded_count=2))
-        app.drain()
-        matches = [ch for ch in activity._channels if ch["name"] == "#dup_disc"]
-        assert len(matches) == 1
-        assert matches[0]["msg_count"] == 3  # 1 + 2

@@ -153,7 +153,6 @@ def hw(hw_session):
 
     # Reset core state safely between tests (no frames in flight right now)
     core._channels = []
-    core._cracker = None
     time.sleep(0.1)
 
     fc.clear()
