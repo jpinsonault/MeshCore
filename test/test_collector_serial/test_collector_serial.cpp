@@ -1009,33 +1009,34 @@ static void send_dummy_diagnostics(CollectorSerial &cs) {
   cs.sendDiagnostics(25.5f, 80000, 60000, 300000, -120, -90, 40, 1000, 2000, 3, 0, 1, 2, 3, 100, 50);
 }
 
-// With a backlog present, status frames must NOT be buffered (no new entry, no seq consumed).
-void test_status_skipped_when_backlog() {
+// Assign n unacked entries (seqs climb, nothing ACKed) so unackedDepth() exceeds the coalesce
+// threshold — the real "client behind" condition (independent of physical ring occupancy).
+static void make_unacked(CollectorSerial &cs, uint32_t n) {
+  uint8_t p[] = {0x01};
+  for (uint32_t i = 0; i < n; i++) cs.ringWrite(COLLECTOR_RX_RAW, p, 1);
+}
+
+// When the client is behind (unacked > threshold), periodic status must NOT be buffered.
+void test_status_skipped_when_behind() {
   CollectorSerial cs;
   setup_cs(cs);
-  uint8_t p[] = {0x01};
-  cs.ringWrite(COLLECTOR_RX_RAW, p, 1);   // creates a backlog
-  TEST_ASSERT_TRUE(cs.hasBacklog());
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getNewestSeq());
+  make_unacked(cs, COLLECTOR_STATUS_COALESCE_MIN + 1);   // 65 unacked > threshold
+  TEST_ASSERT_TRUE(cs.statusCoalesce());
+  uint32_t before = cs.getNewestSeq();
 
   send_dummy_heartbeat(cs);
   send_dummy_diagnostics(cs);
 
-  // Nothing added, no seq burned — real traffic is untouched.
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getNewestSeq());
+  TEST_ASSERT_EQUAL_UINT32(before, cs.getNewestSeq());   // no seq burned — status skipped
 }
 
-// When caught up (no backlog), status frames are buffered normally with a real seq, and
-// drain() emits a well-formed HEARTBEAT frame.
+// When the client is keeping up (few unacked), status is buffered normally with a real seq.
 void test_status_written_when_caught_up() {
   CollectorSerial cs;
   setup_cs(cs);
-  TEST_ASSERT_FALSE(cs.hasBacklog());
+  TEST_ASSERT_FALSE(cs.statusCoalesce());
 
   send_dummy_heartbeat(cs);
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
   TEST_ASSERT_EQUAL_UINT32(1, cs.getNewestSeq());
 
   ms.written.clear();
@@ -1049,40 +1050,33 @@ void test_status_written_when_caught_up() {
   TEST_ASSERT_EQUAL_UINT32(27, (uint32_t)pf.payload.size());
 }
 
-// force=true (an explicit `collector status`/`diag`) must answer even under backlog.
-void test_status_forced_when_backlog() {
+// force=true (an explicit `collector status`/`diag`) must answer even when the client is behind.
+void test_status_forced_when_behind() {
   CollectorSerial cs;
   setup_cs(cs);
-  uint8_t p[] = {0x01};
-  cs.ringWrite(COLLECTOR_RX_RAW, p, 1);   // backlog
-  TEST_ASSERT_TRUE(cs.hasBacklog());
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+  make_unacked(cs, COLLECTOR_STATUS_COALESCE_MIN + 1);
+  TEST_ASSERT_TRUE(cs.statusCoalesce());
+  uint32_t before = cs.getNewestSeq();
 
   cs.sendHeartbeat(1234, 4200, 10, 20, 30, 40, 5, 600, /*force=*/true);
-  TEST_ASSERT_EQUAL_UINT32(2, cs.getTotalEntries());   // buffered despite backlog
-  TEST_ASSERT_EQUAL_UINT32(2, cs.getNewestSeq());
-
-  cs.sendDiagnostics(25.5f, 80000, 60000, 300000, -120, -90, 40, 1000, 2000, 3, 0, 1, 2, 3, 100, 50,
-                     /*force=*/true);
-  TEST_ASSERT_EQUAL_UINT32(3, cs.getTotalEntries());
+  TEST_ASSERT_EQUAL_UINT32(before + 1, cs.getNewestSeq());   // buffered despite being behind
 }
 
-// Status buffering resumes once the backlog drains, proving the gate is dynamic (not one-shot).
-void test_status_resumes_after_drain() {
+// Status resumes once the host ACKs (unacked drops back under the threshold) — gate is dynamic.
+void test_status_resumes_after_ack() {
   CollectorSerial cs;
   setup_cs(cs);
-  uint8_t p[] = {0x01};
-  cs.ringWrite(COLLECTOR_RX_RAW, p, 1);   // backlog
+  make_unacked(cs, COLLECTOR_STATUS_COALESCE_MIN + 1);
 
-  send_dummy_heartbeat(cs);                // skipped
-  TEST_ASSERT_EQUAL_UINT32(1, cs.getTotalEntries());
+  send_dummy_heartbeat(cs);                      // skipped (behind)
+  uint32_t n1 = cs.getNewestSeq();
+  TEST_ASSERT_EQUAL_UINT32(COLLECTOR_STATUS_COALESCE_MIN + 1, n1);
 
-  TEST_ASSERT_TRUE(cs.drain());            // RX drained -> caught up
-  TEST_ASSERT_FALSE(cs.hasBacklog());
+  cs.handleAck(n1);                              // host catches up
+  TEST_ASSERT_FALSE(cs.statusCoalesce());
 
-  send_dummy_diagnostics(cs);              // now buffered
-  TEST_ASSERT_EQUAL_UINT32(2, cs.getTotalEntries());
-  TEST_ASSERT_EQUAL_UINT32(2, cs.getNewestSeq());
+  send_dummy_diagnostics(cs);                    // now buffered
+  TEST_ASSERT_EQUAL_UINT32(n1 + 1, cs.getNewestSeq());
 }
 
 // Uniform-size entries that align exactly to the wrap boundary used to leave _head resting on a
@@ -1601,10 +1595,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_integration_resume_replays_same);
 
   // Status-frame coalescing
-  RUN_TEST(test_status_skipped_when_backlog);
+  RUN_TEST(test_status_skipped_when_behind);
   RUN_TEST(test_status_written_when_caught_up);
-  RUN_TEST(test_status_forced_when_backlog);
-  RUN_TEST(test_status_resumes_after_drain);
+  RUN_TEST(test_status_forced_when_behind);
+  RUN_TEST(test_status_resumes_after_ack);
 
   // Ring wrap-alignment corruption regression
   RUN_TEST(test_ring_uniform_wrap_no_corruption);

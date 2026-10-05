@@ -23,6 +23,15 @@
 #define COLLECTOR_DEDUP_SLOTS   48
 #endif
 
+// Status coalescing kicks in once this many entries are unacked (client behind / stalled / absent,
+// or a reconnecting client still catching up). Below it the client is keeping up, so periodic
+// HEARTBEAT/DIAGNOSTICS flow normally (the host's liveness watchdog needs them on an idle mesh).
+// Keyed on unacked depth, not drain progress: drain() advances even when the transport drops the
+// bytes, so "unsent" collapses to ~0 under a stalled link and can't signal a behind client.
+#ifndef COLLECTOR_STATUS_COALESCE_MIN
+#define COLLECTOR_STATUS_COALESCE_MIN   64
+#endif
+
 // Reset causes reported in BOOT_INFO (stable wire values, mapped from the
 // platform's reset-reason API so the host doesn't depend on IDF enum numbering).
 #define COLLECTOR_RESET_UNKNOWN   0
@@ -459,6 +468,15 @@ public:
   uint32_t getSpoolCount() const { return _spool.count(); }
   bool spoolActive() const { return _spool.valid(); }
 
+  // Entries assigned but not yet ACKed by the host — grows unbounded when the client stalls/leaves.
+  uint32_t unackedDepth() const {
+    uint32_t newest = _next_seq > 1 ? _next_seq - 1 : 0;
+    return newest > _acked_seq ? newest - _acked_seq : 0;
+  }
+  // Whether ephemeral status should be dropped (client behind). Not when the ring is invalid
+  // (v1 fallback: no ACK/seq tracking, so always send).
+  bool statusCoalesce() const { return _ring_valid && unackedDepth() > COLLECTOR_STATUS_COALESCE_MIN; }
+
   // --- Frame senders (buffer payload, then write to ring) ---
 
   void sendRxRaw(float snr, float rssi, const uint8_t *raw, int raw_len) {
@@ -526,12 +544,11 @@ public:
                      uint32_t rx_flood, uint32_t rx_direct,
                      uint32_t tx_flood, uint32_t tx_direct,
                      uint8_t free_pkts, uint32_t uptime_secs, bool force = false) {
-    // HEARTBEAT is ephemeral status — only the latest matters. While the host is behind
-    // (backlog present) or absent, buffering it would just evict real RX/TX traffic from the
-    // ring; skip it and let the next tick (<=10s) carry fresh status once the client catches up.
-    // Safe vs the host's idle watchdog: a backlog means drain() is actively sending bytes, and an
-    // idle mesh has no backlog so heartbeats still flow every 10s.
-    if (!force && hasBacklog()) return;
+    // HEARTBEAT is ephemeral status — only the latest matters. While the client is behind (many
+    // unacked entries) or absent, buffering it would just evict real RX/TX traffic; skip it and let
+    // the next tick (<=10s) carry fresh status once the client catches up. A keeping-up client has
+    // few unacked entries, so heartbeats still flow for the host's liveness watchdog.
+    if (!force && statusCoalesce()) return;
     uint8_t buf[27];
     int pos = 0;
     memcpy(buf + pos, &timestamp, 4); pos += 4;
@@ -552,8 +569,8 @@ public:
                        uint16_t direct_dups, uint16_t flood_dups,
                        uint32_t n_recv, uint32_t n_sent, bool force = false) {
     // Ephemeral status (see sendHeartbeat): don't bury real traffic behind stale diagnostics.
-    // force=true for an explicit `collector diag`; the periodic loop() diag coalesces under backlog.
-    if (!force && hasBacklog()) return;
+    // force=true for an explicit `collector diag`; the periodic loop() diag coalesces when behind.
+    if (!force && statusCoalesce()) return;
     uint8_t buf[50];
     int pos = 0;
     memcpy(buf + pos, &mcu_temp, 4); pos += 4;
