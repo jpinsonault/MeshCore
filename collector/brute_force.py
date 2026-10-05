@@ -42,7 +42,12 @@ CIPHER_KEY_SIZE = 16
 CIPHER_MAC_SIZE = 2
 CIPHER_BLOCK_SIZE = 16
 
-DEFAULT_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
+# Lowercase + digits + hyphen: the full alphabet observed in real hashtag channel
+# names (the community catalog uses only [a-z0-9-]). The hyphen adds ~1 char to
+# the radix (37 vs 36), a negligible ~3%/char keyspace growth, but lets a single
+# brute-force pass reach hyphenated names like #bot-tacoma without relying on the
+# rules engine's hyphenated-connector mangling.
+DEFAULT_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789-"
 
 
 def _crack_chunk(args):

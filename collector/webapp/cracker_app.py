@@ -100,6 +100,14 @@ class CrackerApp:
         except Exception:
             pass
 
+        # Migrate a charset saved before the hyphen was added to the default. Only
+        # upgrades the exact old default (lowercase+digits) so a user's custom
+        # charset is never touched; closes the gap for hyphenated names on an
+        # existing install without them having to re-edit the field.
+        if self._settings.get("charset") == "abcdefghijklmnopqrstuvwxyz0123456789":
+            self._settings["charset"] = brute_force.DEFAULT_CHARSET
+            self._persist_settings()
+
         # Apply wordlist choices (catalog toggle / custom lists) on startup only
         # when they differ from the already-built default table.
         if not self._settings["use_catalog"] or self._settings["custom_wordlists"]:
