@@ -57,6 +57,10 @@ SEARCH_SIZE_WARN = 5_000_000_000
 # sweep — a likely sign a different channel now shares the 1-byte hash byte.
 EXHAUST_RETRY_PACKET_DELTA = 30
 
+# How many distinct undecoded ciphertext blobs to retain per hash for crack
+# targeting (a crack needs one blob plus a few siblings to corroborate a hit).
+UNDECODED_BLOB_CAP = 8
+
 
 class CrackerApp:
     """Cracker operations over a store, optionally attached to a live core.
@@ -337,24 +341,37 @@ class CrackerApp:
 
     # --- pending unknown channels -------------------------------------------
 
-    def pending_channels(self) -> list:
-        """Hashes seen in stored GRP_TXT packets that still have undecoded
-        packets, each with its packet counts. Unioned with the live cracker's
-        pending set so freshly-seen hashes show up before they hit the DB."""
-        by_hash = self._hash_packet_stats()
+    def pending_channels(self, buckets: Optional[dict] = None) -> list:
+        """Hash bytes with still-undecoded GRP_TXT packets — i.e. one or more
+        un-cracked channels live on that byte. Each entry carries the byte's
+        packet counts and, when a *known* channel also sits on the byte, the
+        names it collides with (so the UI can show the relationship instead of
+        blaming the known channel for the leftover traffic). Unioned with the
+        live cracker's pending set so freshly-seen hashes show up before they
+        hit the DB.
+
+        Pass ``buckets`` (a prior :meth:`_scan_buckets` result) to reuse one scan.
+        """
+        if buckets is None:
+            buckets = self._scan_buckets()
 
         charset = self._settings["charset"]
         max_length = self._settings["max_length"]
         pending = []
-        for h, counts in by_hash.items():
-            if counts["undecoded"] > 0:
+        for h, b in buckets.items():
+            if b["undecoded"] > 0:
                 pending.append({
                     "hash": h,
-                    "packet_count": counts["total"],
-                    "undecoded_count": counts["undecoded"],
+                    "packet_count": b["total"],
+                    "undecoded_count": b["undecoded"],
+                    # distinct undecoded messages (relay floods collapsed) — a
+                    # truer "how much unknown traffic" than raw packet count.
+                    "undecoded_distinct": b["undecoded_distinct"],
+                    # known channels sharing this byte (a collision, if any).
+                    "collides_with": sorted(b["decoded_by_name"].keys()),
                     # already swept at the current params without a hit?
                     "exhausted": self.is_exhausted(
-                        h, charset, max_length, current_packets=counts["total"]),
+                        h, charset, max_length, current_packets=b["total"]),
                 })
 
         # Union with the live cracker's pending set (may include hashes whose
@@ -364,7 +381,8 @@ class CrackerApp:
             for h in self._cracker.pending_hashes:
                 if h not in seen:
                     pending.append({"hash": h, "packet_count": 0,
-                                    "undecoded_count": 0, "exhausted": False})
+                                    "undecoded_count": 0, "undecoded_distinct": 0,
+                                    "collides_with": [], "exhausted": False})
                     seen.add(h)
 
         pending.sort(key=lambda p: (-p["undecoded_count"], p["hash"]))
@@ -378,8 +396,8 @@ class CrackerApp:
 
     def _packet_count_for_hash(self, target_hash: int) -> int:
         """Count stored GRP_TXT packets with this channel hash."""
-        st = self._hash_packet_stats().get(int(target_hash))
-        return st["total"] if st else 0
+        b = self._scan_buckets().get(int(target_hash))
+        return b["total"] if b else 0
 
     def _known_by_hash(self) -> dict:
         """{hash_byte: [Channel]} for every channel we can currently decrypt."""
@@ -388,17 +406,34 @@ class CrackerApp:
             idx[ch.hash].append(ch)
         return idx
 
-    def _hash_packet_stats(self) -> dict:
-        """One scan: {channel_hash: {"total": n, "undecoded": m}}.
+    def _scan_buckets(self) -> dict:
+        """Single authoritative scan of stored GRP_TXT packets, grouped by the
+        1-byte channel hash. Returns::
 
-        `undecoded` = packets no known channel can decrypt (the real
-        still-encrypted count). This is decryptability-based, not row-based:
-        the live path stores one row per *logical* message (relay copies share
-        it) while retroactive decode stores one per packet, so counting rows
-        would miscount. Relay duplicates decrypt fine, so they're not undecoded.
+            {hash_byte: {
+                "total": int,                     # packets on this byte
+                "decoded_by_name": {name: count}, # per known channel, precise
+                "undecoded": int,                 # no known key verifies these
+                "undecoded_distinct": int,        # distinct ciphertext blobs
+                "undecoded_blobs": [bytes],       # capped, for crack targeting
+            }}
+
+        The hash byte is a *bucket*, not an identity: it is shared by many real
+        channels, so leftover packets on a byte that already has a known channel
+        belong to a *different*, un-cracked channel — they are the bucket's
+        undecoded traffic, never the known channel's. Each decoded packet is
+        attributed to the specific key that verifies it, so two known channels
+        on one byte are each credited with only their own packets (not a shared
+        ``total - undecoded``, which double-counts).
+
+        Counts are decryptability-based, not row-based: the live path stores one
+        row per *logical* message (relay copies share it) while retroactive
+        decode stores one per packet, so counting rows would miscount. Relay
+        duplicates decrypt fine, so they are decoded, not undecoded.
         """
         known = self._known_by_hash()
-        stats = defaultdict(lambda: {"total": 0, "undecoded": 0})
+        buckets = {}
+        seen_undecoded = defaultdict(set)  # hash -> set of distinct undecoded blobs
         for pkt in self.store.get_grp_txt_packets():
             raw_hex = pkt.get("raw_hex", "")
             if not raw_hex:
@@ -411,13 +446,32 @@ class CrackerApp:
             if not extracted:
                 continue
             h = extracted["channel_hash"]
-            st = stats[h]
-            st["total"] += 1
+            b = buckets.get(h)
+            if b is None:
+                b = buckets[h] = {
+                    "total": 0, "decoded_by_name": defaultdict(int),
+                    "undecoded": 0, "undecoded_distinct": 0, "undecoded_blobs": [],
+                }
+            b["total"] += 1
             mad = extracted["mac_and_data"]
-            if not any(mac_then_decrypt(ch.secret, mad) is not None
-                       for ch in known.get(h, ())):
-                st["undecoded"] += 1
-        return stats
+            decrypter = None
+            for ch in known.get(h, ()):
+                if mac_then_decrypt(ch.secret, mad) is not None:
+                    decrypter = ch
+                    break
+            if decrypter is not None:
+                b["decoded_by_name"][decrypter.name] += 1
+            else:
+                b["undecoded"] += 1
+                blobs = seen_undecoded[h]
+                if mad not in blobs:
+                    blobs.add(mad)
+                    if len(b["undecoded_blobs"]) < UNDECODED_BLOB_CAP:
+                        b["undecoded_blobs"].append(mad)
+        for h, b in buckets.items():
+            b["undecoded_distinct"] = len(seen_undecoded[h])
+            b["decoded_by_name"] = dict(b["decoded_by_name"])
+        return buckets
 
     def is_exhausted(self, target_hash, charset, max_length, current_packets=None) -> bool:
         """True if (hash, charset, max_length) was already swept without a hit
@@ -432,7 +486,8 @@ class CrackerApp:
             current_packets = self._packet_count_for_hash(target_hash)
         return current_packets < (row["packets_seen"] + EXHAUST_RETRY_PACKET_DELTA)
 
-    def _mac_and_data_for_hash(self, target_hash: int, limit: int = 4) -> list:
+    def _mac_and_data_for_hash(self, target_hash: int, limit: int = 4,
+                               buckets: Optional[dict] = None) -> list:
         """Up to `limit` distinct mac_and_data blobs from *undecoded* stored
         GRP_TXT packets whose channel_hash matches.
 
@@ -443,29 +498,15 @@ class CrackerApp:
         Siblings (blobs[1:]) corroborate a brute-force hit; on a collision hash
         the foreign-channel siblings simply won't decrypt, so they don't help
         or harm (see the verify step).
+
+        Pass ``buckets`` (a prior :meth:`_scan_buckets` result) to reuse one scan
+        across many hashes — the sweep/auto loops do this to avoid rescanning per
+        hash.
         """
-        known = self._known_by_hash().get(int(target_hash), [])
-        blobs = []
-        for pkt in self.store.get_grp_txt_packets():
-            raw_hex = pkt.get("raw_hex", "")
-            if not raw_hex:
-                continue
-            try:
-                raw = bytes.fromhex(raw_hex)
-            except ValueError:
-                continue
-            extracted = extract_group_payload(raw)
-            if extracted and extracted["channel_hash"] == target_hash:
-                blob = extracted["mac_and_data"]
-                # Skip packets a known channel already decrypts (this or another
-                # channel sharing the hash byte) so we target the unrecovered one.
-                if any(mac_then_decrypt(ch.secret, blob) is not None for ch in known):
-                    continue
-                if blob not in blobs:
-                    blobs.append(blob)
-                    if len(blobs) >= limit:
-                        break
-        return blobs
+        if buckets is None:
+            buckets = self._scan_buckets()
+        b = buckets.get(int(target_hash))
+        return list(b["undecoded_blobs"])[:limit] if b else []
 
     # --- cracking ------------------------------------------------------------
 
@@ -876,11 +917,14 @@ class CrackerApp:
 
         solved_fast = []
         targets = {}
-        for p in self.pending_channels():
+        # One scan feeds the whole loop; cracking one byte never changes another
+        # byte's undecoded blobs, so the snapshot stays valid across iterations.
+        buckets = self._scan_buckets()
+        for p in self.pending_channels(buckets):
             if cancel.is_set():
                 break
             h = p["hash"]
-            blobs = self._mac_and_data_for_hash(h, limit=4)
+            blobs = self._mac_and_data_for_hash(h, limit=4, buckets=buckets)
             if not blobs:
                 continue
             fast_ch, method = self._fast_match(h, blobs[0])
@@ -1021,9 +1065,10 @@ class CrackerApp:
         charset = self._settings["charset"]
         max_length = self._settings["max_length"]
         remaining = False
-        for p in self.pending_channels():
+        buckets = self._scan_buckets()  # one scan for the whole pass
+        for p in self.pending_channels(buckets):
             h = p["hash"]
-            blobs = self._mac_and_data_for_hash(h, limit=2)  # undecoded packets
+            blobs = self._mac_and_data_for_hash(h, limit=2, buckets=buckets)  # undecoded packets
             if not blobs:
                 continue
             fast_ch, method = self._fast_match(h, blobs[0])
@@ -1095,7 +1140,9 @@ class CrackerApp:
             rows = self.store.get_named_channel_summaries()
         except Exception:
             rows = []
-        stats = self._hash_packet_stats()
+        buckets = self._scan_buckets()
+        empty = {"total": 0, "decoded_by_name": {}, "undecoded": 0,
+                 "undecoded_distinct": 0}
         out = []
         for row in rows:
             name = row["channel_name"]
@@ -1109,7 +1156,11 @@ class CrackerApp:
                     hb = None
             method = row.get("method") or ("public" if is_public else "?")
             messages = row.get("msg_count") or 0
-            st = stats.get(hb, {"total": 0, "undecoded": 0}) if hb is not None else {"total": 0, "undecoded": 0}
+            b = buckets.get(hb, empty) if hb is not None else empty
+            # Packets this channel's *own* key decrypts — not the byte's total
+            # minus undecoded, which would credit it with a co-located channel's
+            # packets when two known channels share the byte.
+            decoded_packets = b["decoded_by_name"].get(name, 0)
             out.append({
                 "channel_name": name,
                 "channel_hash": hb,
@@ -1117,11 +1168,15 @@ class CrackerApp:
                 "method": method,
                 "messages": messages,
                 "msg_count": messages,          # legacy alias
-                "packets": st["total"],
-                "decoded_packets": st["total"] - st["undecoded"],
-                # still-encrypted packets on this hash = a different channel
-                # sharing the byte (relay duplicates are decoded, not counted).
-                "undecoded": st["undecoded"],
+                "packets": b["total"],
+                "decoded_packets": decoded_packets,
+                # Undecoded packets on this byte belong to a *different*,
+                # un-cracked channel sharing the 1-byte hash — not to this one.
+                # Surfaced as a collision relationship, not as this channel's
+                # own failure. The Unknown row for this byte owns the crack.
+                "shares_hash": b["undecoded"] > 0,
+                "undecoded": b["undecoded"],              # (collision traffic on the byte)
+                "undecoded_distinct": b["undecoded_distinct"],
                 "unique_senders": row.get("unique_senders") or 0,
                 "last_activity": row.get("last_activity"),
                 "discovered_at": row.get("discovered_at"),
