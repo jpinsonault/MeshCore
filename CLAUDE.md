@@ -182,7 +182,7 @@ CLI command, enabling full chat participation from the TUI.
 - SQLite storage: raw_packets, advertisements, nodes, heartbeats, diagnostics
 - pyos-based TUI with port selection and live dashboard
 - JSON HTTP API for browser access from another machine
-- 740 automated tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels, send, brute force, public channel, undecryptable tracking, node list)
+- Automated host tests (protocol, store, TUI activities, diagnostics, reliable delivery, split view, hashtag channels, send, public channel, undecryptable tracking, node list)
 
 ### Current Status
 
@@ -212,37 +212,26 @@ CLI command, enabling full chat participation from the TUI.
 - [x] Side-by-side split panel layout (SplitView component) for dashboard and channel browser
 - [x] Hashtag channel support: `#name` entries auto-derive encryption key via SHA-256
 - [x] IRC-style chat interface (ChatActivity) as new main screen with /commands
-- [x] Channel cracker: passive dictionary attack on hashtag channels, retroactive decrypt, /crack command
-- [x] Hardware-in-the-loop system tests (7 tests: inject pipeline, CLI commands, sequencing, cracker)
-- [x] Two-board over-the-air radio tests (6 tests: send echo, send+crack, intercept+crack, RX_RAW capture, decryption, advertisement)
+- [x] Channel-name recovery: recover a public channel's key from its name, then retroactive decode of its stored backlog
+- [x] Hardware-in-the-loop system tests (inject pipeline, CLI commands, sequencing, channel decode)
+- [x] Two-board over-the-air radio tests (send echo, name recovery + decode, RX_RAW capture, decryption, advertisement)
 - [x] Send capability: `collector send` CLI command, bare-text chat, /nick, /send commands
 - [x] OLED display control: `collector screen <text>` shows test status / messages on device display
-- [x] Brute-force channel cracker: multicore SHA-256 grinding, ~9M candidates/sec on Apple Silicon
 - [x] Default public channel auto-decode (hardcoded MeshCore PSK, no config needed)
 - [x] Undecryptable message tracking with sidebar count
 - [x] Node list activity: filterable by type (repeaters, rooms, all nodes)
 - [x] Restructured sidebar: channels + network nav + status sections
 - [x] Type-specific node detail sections (repeater/room server info)
-- [x] GPU brute-force cracker: CUDA SHA-256 kernel via CuPy (`brute_force_gpu.py`), ~2.2G candidates/s on an RTX 5060 Ti (~240x the CPU path); auto-detects, CPU fallback
-- [x] Collision guard: strict GRP_TXT plaintext validation + multi-packet cross-check so brute-force returns None instead of a 2-byte-MAC false positive when the name is outside the search space
-- [x] Catalog wordlist: `data/meshcore_channels.txt` (~2.7K community hashtag channels, CC0) auto-loaded by the passive cracker on top of its built-in list
-- [x] Cracker web app (`collector/webapp/`): stdlib HTTP server + vanilla-JS page; GPU status, pending unknown channels, per-hash crack (dictionary-first, then GPU brute-force), raw-packet paste, live progress, decoded results. Offline mode cracks a stored DB without hardware; `--live`/Portico mode collects + serves
-- [x] Crack queue: FIFO worker processing manual/pasted/auto jobs one at a time, each cancelable (`/api/crack/cancel`); brute-forcers take a `should_stop` callback so a running grind aborts
-- [x] Auto-crack: when on, pending channels are cracked automatically — dictionary first, then queued for GPU brute-force on a miss (CPU hosts stay dictionary-only; `auto_dict_only` to force it)
+- [x] Channel-name discovery tooling (recovers a public channel's key from its human-readable name; names derive the key via SHA-256). Lives under `collector/` with a small web UI; **slated to move to a separate `meshcore-channel-tools` repo** so this firmware repo stays focused. Details intentionally kept out of here.
 - [x] Core auto-reconnect: `core._run` reconnects with backoff after a dropped/failed link (firmware ring buffer replays the gap); `reconnect=False` for one-shot use
-- [x] Rules engine (`rules.py`): hashcat-style mangling of the catalog+built-in list (word+digits/years, hyphenated connectors), ~225K candidates indexed by hash byte; tried after exact dictionary, before brute-force (recovers #weather2024, #bot-tacoma, …)
-- [x] Batched multi-target GPU sweep (`brute_force_batch_gpu` / `crack_batch` kernel): one pass cracks every pending channel (shared double-SHA filter, per-wanted HMAC), ~26x vs separate sweeps on a live 100-channel mesh; cancelable "sweep" queue job (`/api/crack/sweep`); kernel hot path uses streaming HMAC + ripple-carry name increment
-- [x] Exhausted-attempt cache (schema v7, `crack_attempts`): a fully-swept-not-found (hash, charset, max_length) is remembered so auto-crack doesn't re-grind it; packet-count heuristic re-tries on a likely collision; `/api/crack/retry` clears it
-- [x] Channel model + UI restructure: cracked_channels.method (schema v8); one unified Channels list with state chips (Named/Unknown/Cracking/Exhausted/Public), identifier-vs-identity, packets-vs-messages, method badges, hash-collision display, channel detail, exhausted+retry
+- [x] Unified Channels list UI with state chips (Named/Unknown/Public), identifier-vs-identity, packets-vs-messages, hash-collision display, channel detail (schema v8)
 - [x] Thread-local SQLite connections (store.py): per-thread connections (WAL) so the webapp's worker + HTTP threads don't corrupt a shared cursor; `:memory:` keeps one shared connection
 - [x] Relay-duplicate collapse: the same message floods in on multiple paths (many raw packets); channel reads dedup by (channel, msg_timestamp, sender, text) so each logical message shows once (retroactive decode stored one row per packet; live decode dedups at store)
-- [x] Decryptability-based decoded/undecoded counts: a packet is "decoded" if a known channel's key decrypts it (not row-based, which miscounts since the two decode paths store differently); drives the packets-vs-messages + hash-collision display and which packets a crack targets
+- [x] Decryptability-based decoded/undecoded counts: a packet is "decoded" if a known channel's key decrypts it (not row-based, which miscounts since the two decode paths store differently); drives the packets-vs-messages + hash-collision display and which packets are still undecoded
 - [x] Resilient link: idle-link watchdog (`core.LINK_IDLE_TIMEOUT`, 45s) forces a reconnect when a `socket://` peer vanishes off WiFi without a FIN (read() would otherwise return empty forever — this was a real silent 3.5h stall); TCP keepalive on network links; backoff resets on any *established* session drop. Durable `connection_events` log (schema v9) so link up/down history survives a host/service restart
 - [x] Durable device boot/crash log: firmware BOOT_INFO frame (0xD5) sent each (re)connect reports the reset cause (`esp_reset_reason()` → power-on/panic/task+int watchdog/brownout/…) plus the last-known-alive stats (uptime, min heap, WiFi RSSI) kept in RTC RAM (`RTC_NOINIT_ATTR`, survives watchdog/panic/SW-reset, zero flash wear). Host stores them deduped in `device_boots` (schema v10). "Device & link" webapp view + a topbar freshness badge (fresh / stale Nm / LINK DOWN) make a dropped device obvious at a glance
-- [x] Hash-bucket vs channel-identity model: undecoded packets belong to the 1-byte hash *bucket* (a different, un-cracked channel sharing the byte), not to the named channel on it. One `_scan_buckets()` attributes each decoded packet to the specific key that verifies it (fixes a latent double-count when two known channels share a byte); the webapp stops showing a cracked channel's collision traffic as its own "undecodable" and surfaces it as a crackable cross-reference (`shares_hash`, `collides_with`, `undecoded_distinct`)
-- [x] Hyphen in the brute-force charset: real names use `[a-z0-9-]` (the catalog is all lowercase/digits/hyphen), so `DEFAULT_CHARSET` includes `-` (saved charsets migrated if still the old default); a single pass now reaches `#bot-tacoma` without the rules engine
-- [x] Multiword cracker: combines common English words (hyphenated and/or run-together) for multi-word names (#north-sound, #campfire, #catsincutedresses) that single-word dictionary/catalog and charset brute-force miss. GPU `crack_words` kernel enumerates ordered N-tuples × separator-pattern bitmasks from a GPU wordlist blob, assembles "#"+name inline and prunes >31-char (on-device field limit) in the hot loop; ~1.1G cand/s. `multiword.py` gives the EXACT in-cap count via n-fold convolution of the word-length histogram, so the UI shows the (often enormous) size before a run. Bundled `data/english_frequency.txt` (~46.7K words, MIT, descending frequency → tiers are top-N prefixes). GPU-only, explicitly-triggered `multiword` queue job (never in the default/auto sweep), with a Channels-view panel: word-count slider (1–4), tier picker (10K/50K), concat/hyphen toggles, live estimate + ETA + feasibility warning
-- [x] Depth-aware exhaustion (subsume + incremental): the exhausted cache now records the deepest work done, not an exact tuple. Charset — `max_exhausted_length` returns a covering prior sweep (length-cumulative: a sweep to L covers 1..L; and charset-subset aware: a sweep over S covers a request over C⊆S, so adding the hyphen correctly re-runs the enlarged space). Re-running ≤ the swept depth is a no-op, and a run only grinds lengths above what's done (`min_length` / `min_length_by_hash`). Words — separate `multiword_attempts` cache (schema v12) keyed by (hash, words, tier, concat, hyphen); a covering prior sweep (same word count, tier ≥, patterns ⊇) is skipped, so bumping 2→3 words or 10K→50K tier runs only the new case
+- [x] Hash-bucket vs channel-identity model: undecoded packets are attributed to the 1-byte hash bucket (a different channel sharing the byte), not the named channel on it — `_scan_buckets()` attributes each decoded packet to the key that verifies it (fixes a double-count when two known channels share a byte)
+- [x] Name-list / phrase-based channel-name recovery, with a depth-aware "already-searched" cache (schema v12) so prior work isn't repeated (details in the channel-tools repo, not here)
 - [ ] Analysis queries / richer dashboard views
 
 ### Key Files
@@ -257,7 +246,6 @@ CLI command, enabling full chat participation from the TUI.
 - `collector/activities/port_select.py` — Serial port picker with remembered selection
 - `collector/crypto.py` — Channel decryption (AES-128-ECB, HMAC-SHA256 MAC), hashtag key derivation
 - `collector/split_view.py` — Reusable side-by-side split panel component (SplitView)
-- `collector/cracker.py` — Passive channel cracker: dictionary attack, hash table, retroactive decrypt, cache
 - `collector/activities/chat.py` — IRC-style main screen with /commands, rooms sidebar, message panel
 - `collector/activities/dashboard.py` — Live mesh traffic dashboard (secondary, via /nodes or /packets)
 - `collector/activities/channels.py` — Channel message browser with live updates and search
@@ -269,19 +257,11 @@ CLI command, enabling full chat participation from the TUI.
 - `collector/activities/help_overlay.py` — Context-aware help screen (? key)
 - `collector/activities/system_diag.py` — OS diagnostics screen (MCU temp, heap, radio, errors)
 - `collector/activities/debug_log.py` — Live firmware debug log viewer
-- `collector/brute_force.py` — Multicore CPU brute-force channel cracker (ProcessPoolExecutor, SHA-256 + HMAC + AES); strict GRP_TXT validation + optional sibling-packet cross-check
-- `collector/brute_force_gpu.py` — GPU brute-force cracker: custom CUDA SHA-256 RawKernel via CuPy, on-GPU hash + 2-byte-MAC filter, CPU verify of survivors; same signature as the CPU path, `is_available()`/`gpu_name()` gate it. Needs `cupy-cuda12x` (installed in `collector/.venv`)
-- `collector/data/meshcore_channels.txt` — bundled hashtag-channel catalog (~2.7K names, CC0, from github.com/marcelverdult/meshcore-channels); auto-loaded by `cracker.py`
-- `collector/rules.py` — rule-based candidate mangling (hashcat-style) + `RulesMatcher` (hash-indexed, ~225K candidates); tried after the exact dictionary, before brute-force
-- `collector/multiword.py` — multiword candidate model: `iter_candidates` (CPU reference / small-space path), `count_candidates`/`estimate` (EXACT in-cap count via n-fold length-histogram convolution — no enumeration), tiered `load_words` over the bundled frequency list. Generated name capped at 30 chars (31-char `ChannelDetails.name` incl. '#')
-- `collector/data/english_frequency.txt` — bundled common-English wordlist (~46.7K words, MIT, from github.com/hermitdave/FrequencyWords 2018 en_50k), filtered to `^[a-z]{2,}$`, descending frequency so a top-N slice is the N most common (tier slider + frequency-first enumeration)
-- `collector/brute_force_gpu.py` — adds `crack_words` CUDA kernel + `brute_force_words_batch_gpu` for the multiword GPU sweep (mixed-radix word enumeration, separator-pattern bitmasks, inline length-cap prune); shares the double-SHA filter + per-wanted HMAC with `crack_batch`
-- `collector/webapp/` — cracker web app: `cracker_app.py` (mode-agnostic logic), `server.py` (stdlib HTTP), `static/index.html` (vanilla-JS UI), `__main__.py` (`python -m collector.webapp --db <path>` offline, or `--port COMx` live; `--cpu` forces CPU). `--http-port` defaults to `$PORT` when set (Portico) else 8090
-- `collector/cracker.portico.toml` — Portico manifest: registers the web app as `http://cracker.localhost/` (autostart on logon, never idle-stops), offline mode against the durable DB `~/.config/meshcore-collector/collector.db`. Runs via the GPU venv (`collector\.venv\Scripts\python.exe`). The porticod daemon (repos/portico) is already a logon task, so the service comes back on Windows start. Dev loop: edit code, then `curl -X POST -H "Content-Type: application/json" -d '{}' http://portico.localhost/api/apps/cracker/restart` (static-asset edits just need a browser refresh)
+- Channel-name recovery tooling — the name-search modules, `collector/webapp/`, bundled name lists under `collector/data/`, and the `cracker.portico.toml` Portico service (`http://cracker.localhost/`, offline against `~/.config/meshcore-collector/collector.db`). **Slated to move to a separate `meshcore-channel-tools` repo**; kept out of this file on purpose. These import only `collector`'s `crypto`/`store`/`config`.
 - `collector/activities/node_list.py` — Scrollable node list filtered by adv_type (repeaters, rooms, all)
-- `collector/tests/` — automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, channel cracker, send, brute force [CPU + GPU], webapp, public channel, undecryptable, node list)
+- `collector/tests/` — automated tests (protocol, store, crypto, config, core integration, TUI activities, server, search, diagnostics, reliable delivery, split view, hashtag channels, chat interface, send, public channel, undecryptable, node list)
 - `collector/tests/system/` — 14 hardware-in-the-loop system tests (require MESHCORE_PORT env var)
-- `collector/tests/system/test_radio.py` — 7 tests: single-board send echo, single-board send+crack, two-board dictionary intercept+crack, two-board brute-force crack (no wordlist), two-board RX_RAW capture, two-board decrypt, two-board advertisement (two-board tests require MESHCORE_SENDER_PORT)
+- `collector/tests/system/test_radio.py` — two-board over-the-air tests: send echo, name recovery + decode, RX_RAW capture, decrypt, advertisement (two-board tests require MESHCORE_SENDER_PORT)
 - `collector/collector_test.py` — Device-to-PC API validation test
 
 ### Hardware Test Ports
