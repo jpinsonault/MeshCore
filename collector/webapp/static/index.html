@@ -118,6 +118,54 @@
             </details>
           </div>
 
+          <!-- Word-combo (multiword) crack -->
+          <details class="panel mw-panel" id="multiword-panel">
+            <summary>
+              <span class="mw-sum-title">Word-combo crack</span>
+              <span id="mw-gpu-badge" class="badge" title="GPU required">GPU</span>
+              <span class="sub">— multi-word names like <code>#north-sound</code>, <code>#campfire</code></span>
+            </summary>
+            <div class="mw-body">
+              <p class="sub">Combine common English words (hyphenated and/or run-together) and grind
+                them on the GPU. The tier and word count are the feasibility knob — watch the estimate.</p>
+              <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:18px">
+                <div style="flex:0 0 220px">
+                  <label for="mw-words">words to combine: <b id="mw-words-val">2</b></label>
+                  <input id="mw-words" type="range" min="1" max="4" step="1" value="2">
+                </div>
+                <div style="flex:0 0 160px">
+                  <label for="mw-tier">wordlist tier</label>
+                  <select id="mw-tier">
+                    <option value="10000">top 10,000</option>
+                    <option value="50000">top 50,000</option>
+                  </select>
+                </div>
+                <label class="toggle" style="flex:0 0 auto">
+                  <span class="switch"><input type="checkbox" id="mw-hyphen" checked><span class="track"></span></span>
+                  <span>hyphenated</span>
+                </label>
+                <label class="toggle" style="flex:0 0 auto">
+                  <span class="switch"><input type="checkbox" id="mw-concat" checked><span class="track"></span></span>
+                  <span>run-together</span>
+                </label>
+              </div>
+              <div class="field-hint" style="margin-top:10px">
+                Candidates (fit 30 chars): <b id="mw-estimate">—</b> · est. <b id="mw-eta">—</b>
+                <span id="mw-raw" class="faint"></span>
+              </div>
+              <div id="mw-warn" class="warn-note" style="display:none">
+                &#9888; This run is very large — dial the tier or word count down, or expect a long grind
+                (it's cancelable, and tries the most common words first).
+              </div>
+              <div id="mw-nogpu" class="warn-note" style="display:none">
+                &#9888; Word-combo cracking needs a GPU; this host is CPU-only.
+              </div>
+              <div class="row" style="margin-top:12px">
+                <button class="primary" id="mw-go">Crack pending with word combos</button>
+              </div>
+            </div>
+          </details>
+
           <!-- Filter chips + sort -->
           <div class="list-controls">
             <div class="chips" id="chips"></div>

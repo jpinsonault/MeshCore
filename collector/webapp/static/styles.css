@@ -440,7 +440,25 @@ button.big { padding: 11px 20px; font-size: 14.5px; }
 .method-badge.rules { color: var(--warn); border-color: var(--warn); }
 .method-badge.brute { color: var(--ok); border-color: var(--ok); }
 .method-badge.public { color: var(--accent); border-color: var(--accent); }
+.method-badge.multiword { color: var(--accent2); border-color: var(--accent2); }
 .method-badge.unk { color: var(--faint); }
+
+/* ---- Word-combo (multiword) panel ---- */
+.mw-panel > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; font-weight: 600;
+}
+.mw-panel > summary::-webkit-details-marker { display: none; }
+.mw-panel > summary::before { content: "▸ "; color: var(--faint); }
+.mw-panel[open] > summary::before { content: "▾ "; }
+.mw-panel .mw-sum-title { font-size: 15px; }
+.mw-panel .mw-body { margin-top: 14px; }
+.mw-panel input[type="range"] { width: 100%; }
+.badge.off { opacity: .45; text-decoration: line-through; }
+.progress .bar.indet > span {
+  width: 35%; animation: indet 1.1s ease-in-out infinite;
+}
+@keyframes indet { 0% { margin-left: 0; } 50% { margin-left: 65%; } 100% { margin-left: 0; } }
 
 .state-pill {
   font-size: 11px; padding: 2px 9px; border-radius: 999px; white-space: nowrap;

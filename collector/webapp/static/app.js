@@ -45,11 +45,22 @@ function fmtAgo(ts) {
   return Math.round(s / 86400) + "d ago";
 }
 function fmtBig(n) {
+  if (n >= 1e18) return (n / 1e18).toFixed(1) + "E";
+  if (n >= 1e15) return (n / 1e15).toFixed(1) + "P";
   if (n >= 1e12) return (n / 1e12).toFixed(1) + "T";
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return String(n);
+  return String(Math.round(n));
+}
+function fmtEta(s) {
+  if (!isFinite(s)) return "∞";
+  if (s < 1) return "<1s";
+  if (s < 90) return s.toFixed(0) + "s";
+  if (s < 5400) return (s / 60).toFixed(0) + " min";
+  if (s < 172800) return (s / 3600).toFixed(1) + " h";
+  if (s < 3.15e7) return (s / 86400).toFixed(0) + " days";
+  return (s / 3.15e7).toFixed(1) + " yr";
 }
 
 let toastTimer = null;
@@ -69,6 +80,7 @@ function methodBadge(method) {
     case "dictionary": return { label: "catalog", cls: "dict" };
     case "rules":      return { label: "rules", cls: "rules" };
     case "bruteforce": return { label: "GPU brute-force", cls: "brute" };
+    case "multiword":  return { label: "word-combo", cls: "multiword" };
     case "public":     return { label: "public PSK", cls: "public" };
     default:           return { label: "recovered", cls: "unk" };
   }
@@ -512,6 +524,80 @@ async function startSweep() {
   pollStatus();
 }
 
+/* ---------------- Word-combo (multiword) crack ---------------- */
+
+const SEARCH_WARN = 5e11;   // flag runs beyond ~this many candidates as a long grind
+let _mwInited = false;
+let _mwEstTimer = null;
+
+function mwParams() {
+  return {
+    n: parseInt($("mw-words").value, 10),
+    tier: parseInt($("mw-tier").value, 10),
+    hyphen: $("mw-hyphen").checked,
+    concat: $("mw-concat").checked,
+  };
+}
+
+function initMultiword() {
+  if (_mwInited) return;
+  _mwInited = true;
+  const cfg = (state.config && state.config.settings) || {};
+  if (cfg.multiword_words) $("mw-words").value = cfg.multiword_words;
+  if (cfg.multiword_tier) $("mw-tier").value = String(cfg.multiword_tier);
+  if (cfg.multiword_hyphen != null) $("mw-hyphen").checked = !!cfg.multiword_hyphen;
+  if (cfg.multiword_concat != null) $("mw-concat").checked = !!cfg.multiword_concat;
+  $("mw-words-val").textContent = $("mw-words").value;
+
+  const onChange = (persist) => {
+    $("mw-words-val").textContent = $("mw-words").value;
+    refreshMwEstimate();
+    if (persist) {
+      const p = mwParams();
+      postJSON("/api/config", {
+        multiword_words: p.n, multiword_tier: p.tier,
+        multiword_hyphen: p.hyphen, multiword_concat: p.concat,
+      });
+    }
+  };
+  $("mw-words").oninput = () => onChange(false);
+  $("mw-words").onchange = () => onChange(true);
+  $("mw-tier").onchange = () => onChange(true);
+  $("mw-hyphen").onchange = () => onChange(true);
+  $("mw-concat").onchange = () => onChange(true);
+  $("mw-go").onclick = startMultiword;
+  refreshMwEstimate();
+}
+
+function refreshMwEstimate() {
+  clearTimeout(_mwEstTimer);
+  _mwEstTimer = setTimeout(async () => {
+    const p = mwParams();
+    const q = `?n=${p.n}&tier=${p.tier}&concat=${p.concat ? 1 : 0}&hyphen=${p.hyphen ? 1 : 0}`;
+    let e;
+    try { e = await getJSON("/api/multiword" + q); } catch (_) { return; }
+    $("mw-estimate").textContent = fmtBig(e.under_cap) + " candidates";
+    $("mw-eta").textContent = fmtEta(e.eta_seconds) + " on GPU";
+    $("mw-raw").textContent = e.patterns
+      ? ` (${fmtBig(e.raw)} before the 30-char cap)` : "";
+    $("mw-warn").style.display = e.under_cap > SEARCH_WARN ? "" : "none";
+    const noGpu = !e.gpu;
+    $("mw-nogpu").style.display = noGpu ? "" : "none";
+    $("mw-go").disabled = noGpu;
+    $("mw-gpu-badge").classList.toggle("off", noGpu);
+  }, 120);
+}
+
+async function startMultiword() {
+  const p = mwParams();
+  const res = await postJSON("/api/crack/multiword", {
+    n: p.n, tier: p.tier, concat: p.concat, hyphen: p.hyphen,
+  });
+  if (res.queued === false) { toast(res.reason || res.error || "could not queue", true); return; }
+  toast(`Word-combo crack queued (${p.n} words, top ${fmtBig(p.tier)})`);
+  pollStatus();
+}
+
 async function startCrackHash() {
   const h = parseInt($("m-hash").value, 10);
   if (isNaN(h) || h < 0 || h > 255) { toast("Enter a hash 0–255", true); return; }
@@ -555,6 +641,13 @@ function jobLabel(j, st) {
     }
     return `Sweep all pending channels`;
   }
+  if (j.kind === "multiword") {
+    const scope = j.target_hash != null ? `hash ${hex2(j.target_hash)}` : "all pending";
+    if (j.status === "running" && st && st.running) {
+      return `Word-combo crack (${scope}) <span class="muted">(${fmtInt(st.total || 0)} tried · ${(st.elapsed || 0).toFixed(0)}s)</span>`;
+    }
+    return `Word-combo crack (${scope})`;
+  }
   // Single hash.
   const h = j.target_hash;
   return `Crack hash ${h != null ? hex2(h) : ""}`;
@@ -565,7 +658,8 @@ function jobRow(j, cancelable, st) {
   let right = `<span class="qstate ${j.status}">${esc(j.status)}</span>`;
   const r = j.result;
   if (j.status === "done" && r) {
-    if (j.kind === "sweep" && r.method === "sweep") {
+    if ((j.kind === "sweep" && r.method === "sweep") ||
+        (j.kind === "multiword" && r.method === "multiword")) {
       const names = (r.names || []).map(esc).join(", ");
       right = `<span class="qstate done">✅ ${fmtInt(r.found || 0)} found${names ? " · " + names : ""}</span>`;
     } else if (r.cracked) {
@@ -582,21 +676,30 @@ function jobRow(j, cancelable, st) {
 
 function renderProgress(st) {
   const el = $("progress");
+  const activeKind = st.active && st.active.kind;
   if (st.running) {
     el.className = "progress running";
     const total = fmtInt(st.total || 0);
-    const who = st.target_hash != null ? "hash " + hex2(st.target_hash) : "sweep";
-    el.innerHTML = `<span class="spin">◐</span>`
-      + `<div class="bar"><span style="width:${st.max_length ? Math.min(100, (st.length / st.max_length) * 100) : 0}%"></span></div>`
-      + `<span class="nowrap">${(st.engine || "").toUpperCase()} · ${who} · len ${st.length}/${st.max_length || "?"} · ${total} tried · ${(st.elapsed || 0).toFixed(1)}s</span>`;
+    if (activeKind === "multiword") {
+      // No meaningful length/total ratio for a word sweep; show tried + elapsed.
+      el.innerHTML = `<span class="spin">◐</span>`
+        + `<div class="bar indet"><span></span></div>`
+        + `<span class="nowrap">${(st.engine || "").toUpperCase()} · word-combo · ${total} tried · ${(st.elapsed || 0).toFixed(1)}s</span>`;
+    } else {
+      const who = st.target_hash != null ? "hash " + hex2(st.target_hash) : "sweep";
+      el.innerHTML = `<span class="spin">◐</span>`
+        + `<div class="bar"><span style="width:${st.max_length ? Math.min(100, (st.length / st.max_length) * 100) : 0}%"></span></div>`
+        + `<span class="nowrap">${(st.engine || "").toUpperCase()} · ${who} · len ${st.length}/${st.max_length || "?"} · ${total} tried · ${(st.elapsed || 0).toFixed(1)}s</span>`;
+    }
   } else if (st.result) {
     const r = st.result;
-    if (r.method === "sweep") {
+    if (r.method === "sweep" || r.method === "multiword") {
+      const kindWord = r.method === "multiword" ? "Word-combo crack" : "Sweep";
       el.className = r.found ? "progress ok" : "progress";
       const names = (r.names || []).map(esc).join(", ");
       el.innerHTML = r.found
-        ? `✅ Sweep recovered <b>${fmtInt(r.found)}</b> channel${r.found === 1 ? "" : "s"}${names ? ` — ${names}` : ""}.`
-        : `Sweep finished — no new channels recovered.`;
+        ? `✅ ${kindWord} recovered <b>${fmtInt(r.found)}</b> channel${r.found === 1 ? "" : "s"}${names ? ` — ${names}` : ""}.`
+        : (r.error ? `${kindWord} failed — ${esc(r.error)}` : `${kindWord} finished — no new channels recovered.`);
     } else if (r.cracked) {
       el.className = "progress ok";
       const mb = methodBadge(r.method);
@@ -1057,6 +1160,7 @@ async function init() {
   document.addEventListener("keydown", onKey);
 
   await refreshConfig();
+  initMultiword();
   await refreshData();
   await refreshHealth();
   setView("channels");
