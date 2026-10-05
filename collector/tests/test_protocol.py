@@ -189,6 +189,18 @@ class TestRxInvariantHash:
         result = parse_rx_raw(payload)
         assert result["inv_hash"] == rx_invariant_hash(raw)
 
+    def test_packed_multibyte_path(self):
+        # path_len is packed: 0x42 = size 2, count 2 -> 4 path bytes; 0x43 = size 2,
+        # count 3 -> 6 path bytes. Two relay copies (different hop counts) of the same
+        # payload must hash equal — the packed path must be skipped by count*size.
+        def pkt(packed, pathbytes, payload):
+            return bytes([0x15, packed]) + bytes(pathbytes) + bytes(payload)
+        a = rx_invariant_hash(pkt(0x42, [1, 2, 3, 4], [9, 8, 7]))        # 2 hops x 2
+        b = rx_invariant_hash(pkt(0x43, [1, 2, 3, 4, 5, 6], [9, 8, 7]))  # 3 hops x 2
+        assert a is not None and a == b
+        # a different payload still differs
+        assert a != rx_invariant_hash(pkt(0x42, [1, 2, 3, 4], [9, 8, 6]))
+
 
 class TestParseRxDup:
     def test_valid_rx_dup(self):

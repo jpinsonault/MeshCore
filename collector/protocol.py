@@ -156,14 +156,26 @@ def fnv1a32(data, h=2166136261):
     return h
 
 
+def path_byte_len(path_len):
+    """On-wire path length in bytes from the packed path_len byte (Packet.cpp):
+    low 6 bits = hop count, high 2 bits = bytes-per-hop - 1."""
+    hash_count = path_len & 0x3F
+    hash_size = (path_len >> 6) + 1
+    return hash_count * hash_size
+
+
 def rx_invariant_hash(raw):
     """Hash the part of a received packet that's identical across relay paths: header byte +
     payload, SKIPPING [path_len][path]. Must match the firmware so an RX_DUP ties back to its
-    RX_RAW. Packet layout: [header(1)][path_len(1)][path(path_len)][payload...]."""
+    RX_RAW. Packet layout: [header(1)][path_len(1)][path(path_bytes)][payload...].
+
+    path_len is a PACKED byte, not a raw length (see path_byte_len / Packet.cpp); the on-wire
+    path is hash_count*hash_size bytes. The firmware (CollectorSerial.h) must use the same
+    formula — for the ~1/3 of packets with >1-byte-per-hop paths, the old raw-byte assumption
+    pointed past the real payload, so they were never flood-deduped (and arrived as full RX_RAW)."""
     if raw is None or len(raw) < 2:
         return None
-    path_len = raw[1]
-    payload_off = 2 + path_len
+    payload_off = 2 + path_byte_len(raw[1])
     if payload_off > len(raw):
         return None
     return fnv1a32(bytes([raw[0]]) + raw[payload_off:])
@@ -199,8 +211,9 @@ def parse_rx_dup(payload):
     snr_x4 = struct.unpack("b", payload[0:1])[0]
     rssi = struct.unpack("b", payload[1:2])[0]
     inv_hash = struct.unpack("<I", payload[2:6])[0]
-    path_len = payload[6]
-    path = payload[7:7 + path_len]
+    path_len = payload[6]                      # packed byte (size|count), as on the wire
+    nbytes = path_byte_len(path_len)
+    path = payload[7:7 + nbytes]
     return {
         "snr": snr_x4 / 4.0,
         "rssi": rssi,

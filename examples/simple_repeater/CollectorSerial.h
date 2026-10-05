@@ -488,13 +488,18 @@ public:
     // [path_len][path]); a recent match becomes a compact RX_DUP (keeps the path for topology, drops
     // the redundant payload). Packet layout: [header(1)][path_len(1)][path(path_len)][payload...].
     if (_dedup_enabled && raw_len >= 2) {
+      // path_len is PACKED (Packet.h): low 6 bits = hop count, high 2 bits =
+      // bytes-per-hop - 1, so the on-wire path is hash_count*hash_size bytes.
+      // Using the raw byte as a length skipped past the real payload for the
+      // ~1/3 of packets with >1-byte-per-hop paths, so they were never deduped.
       uint8_t path_len = raw[1];
-      uint16_t payload_off = (uint16_t)2 + path_len;
+      uint16_t path_bytes = (uint16_t)(path_len & 63) * ((path_len >> 6) + 1);
+      uint16_t payload_off = (uint16_t)2 + path_bytes;
       if (payload_off <= (uint16_t)raw_len) {
         uint32_t h = fnv1a(raw, 1, 2166136261u);                              // header
         h = fnv1a(raw + payload_off, (uint16_t)raw_len - payload_off, h);     // payload (after path)
         if (dedupSeenOrInsert(h)) {
-          sendRxDup(snr, rssi, h, path_len, raw + 2);
+          sendRxDup(snr, rssi, h, path_len, raw + 2, path_bytes);
           return;
         }
       }
@@ -507,16 +512,17 @@ public:
     ringWrite(COLLECTOR_RX_RAW, buf, 2 + raw_len);
   }
 
-  // Compact duplicate: [snr(1)][rssi(1)][inv_hash(4 LE)][path_len(1)][path(path_len)].
-  void sendRxDup(float snr, float rssi, uint32_t inv_hash, uint8_t path_len, const uint8_t *path) {
-    if (path_len > 64) path_len = 64;   // MeshCore MAX_PATH_SIZE
+  // Compact duplicate: [snr(1)][rssi(1)][inv_hash(4 LE)][path_len(1)][path(path_bytes)].
+  // path_len is the PACKED byte (size|count); path_bytes = count*size is the actual length.
+  void sendRxDup(float snr, float rssi, uint32_t inv_hash, uint8_t path_len, const uint8_t *path, uint16_t path_bytes) {
+    if (path_bytes > 64) path_bytes = 64;   // MeshCore MAX_PATH_SIZE
     uint8_t buf[72];
     buf[0] = (uint8_t)(int8_t)(snr * 4);
     buf[1] = (uint8_t)(int8_t)(rssi);
     memcpy(buf + 2, &inv_hash, 4);
-    buf[6] = path_len;
-    if (path_len > 0) memcpy(buf + 7, path, path_len);
-    ringWrite(COLLECTOR_RX_DUP, buf, 7 + path_len);
+    buf[6] = path_len;                       // packed byte, so the host can decode size+count
+    if (path_bytes > 0) memcpy(buf + 7, path, path_bytes);
+    ringWrite(COLLECTOR_RX_DUP, buf, 7 + path_bytes);
   }
 
   void setDedup(bool on) { _dedup_enabled = on; }
