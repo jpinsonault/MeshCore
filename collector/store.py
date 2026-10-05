@@ -16,11 +16,12 @@ from .protocol import (
     FRAME_TYPE_ADVERTISEMENT,
     FRAME_TYPE_DIAGNOSTICS,
     FRAME_TYPE_HEARTBEAT,
+    FRAME_TYPE_RX_DUP,
     FRAME_TYPE_RX_RAW,
     FRAME_TYPE_TX_RAW,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -203,6 +204,24 @@ CREATE TABLE IF NOT EXISTS device_boots (
 CREATE INDEX IF NOT EXISTS idx_device_boots_ts ON device_boots(timestamp);
 """
 
+# v11: flood-duplicate sightings. Each RX_RAW gets an invariant hash (header+payload, path-excluded);
+# a compact RX_DUP from the firmware is another sighting of that same packet on a different path.
+SCHEMA_V11_SQL = """
+ALTER TABLE raw_packets ADD COLUMN inv_hash INTEGER;
+CREATE INDEX IF NOT EXISTS idx_raw_packets_inv ON raw_packets(inv_hash);
+CREATE TABLE IF NOT EXISTS rx_dup_sightings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     REAL    NOT NULL,
+    inv_hash      INTEGER NOT NULL,       -- ties back to raw_packets.inv_hash
+    raw_packet_id INTEGER,                -- resolved original, if seen
+    snr           REAL,
+    rssi          INTEGER,
+    path_hex      TEXT,
+    seq           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_rx_dup_inv ON rx_dup_sightings(inv_hash);
+"""
+
 
 class CollectorStore:
     """SQLite storage for captured mesh data."""
@@ -328,6 +347,14 @@ class CollectorStore:
             )
             current = 10
 
+        if current < 11:
+            self._conn.executescript(SCHEMA_V11_SQL)
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(11),),
+            )
+            current = 11
+
     def close(self):
         if self._is_memory:
             if self._shared is not None:
@@ -372,6 +399,8 @@ class CollectorStore:
 
         if ft == FRAME_TYPE_RX_RAW:
             return self._store_rx(now, parsed, seq=seq)
+        elif ft == FRAME_TYPE_RX_DUP:
+            self._store_rx_dup(now, parsed, seq=seq)
         elif ft == FRAME_TYPE_TX_RAW:
             return self._store_tx(now, parsed, seq=seq)
         elif ft == FRAME_TYPE_ADVERTISEMENT:
@@ -386,11 +415,41 @@ class CollectorStore:
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""
         with self._tx() as conn:
             cursor = conn.execute(
-                "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len, seq) "
-                "VALUES (?, 'rx', ?, ?, ?, ?, ?, ?, ?)",
-                (now, p.get("snr"), p.get("rssi"), p.get("route_type"), p.get("payload_type"), raw_hex, p.get("raw_len", 0), seq),
+                "INSERT INTO raw_packets (timestamp, direction, snr, rssi, route_type, payload_type, raw_hex, raw_len, seq, inv_hash) "
+                "VALUES (?, 'rx', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now, p.get("snr"), p.get("rssi"), p.get("route_type"), p.get("payload_type"),
+                 raw_hex, p.get("raw_len", 0), seq, p.get("inv_hash")),
             )
             return cursor.lastrowid
+
+    def _store_rx_dup(self, now, p, seq=None):
+        """A compact RX_DUP: record it as an additional sighting of the packet whose invariant hash
+        matches, resolving the original raw_packets row by inv_hash when it's already stored."""
+        inv_hash = p.get("inv_hash")
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT id FROM raw_packets WHERE inv_hash = ? ORDER BY id DESC LIMIT 1",
+                (inv_hash,),
+            ).fetchone()
+            raw_packet_id = row["id"] if row else None
+            conn.execute(
+                "INSERT INTO rx_dup_sightings (timestamp, inv_hash, raw_packet_id, snr, rssi, path_hex, seq) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now, inv_hash, raw_packet_id, p.get("snr"), p.get("rssi"), p.get("path"), seq),
+            )
+
+    def get_dup_sightings(self, inv_hash):
+        """All RX_DUP sightings recorded for a given invariant hash (for topology/path analysis)."""
+        rows = self._conn.execute(
+            "SELECT timestamp, snr, rssi, path_hex, raw_packet_id, seq FROM rx_dup_sightings "
+            "WHERE inv_hash = ? ORDER BY id",
+            (inv_hash,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_dup_sightings(self):
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM rx_dup_sightings").fetchone()
+        return row["n"] if row else 0
 
     def _store_tx(self, now, p, seq=None):
         raw_hex = p.get("raw", b"").hex() if isinstance(p.get("raw"), bytes) else ""

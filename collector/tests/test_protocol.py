@@ -22,6 +22,7 @@ from collector.protocol import (
     parse_heartbeat,
     parse_rx_raw,
     parse_rx_dup,
+    rx_invariant_hash,
     parse_tx_raw,
     parse_advertisement,
     parse_boot_info,
@@ -165,6 +166,28 @@ class TestParseRxRaw:
     def test_too_short(self):
         result = parse_rx_raw(b"\x00\x00")
         assert "error" in result
+
+
+class TestRxInvariantHash:
+    def _pkt(self, header, path, payload):
+        return bytes([header, len(path)]) + bytes(path) + bytes(payload)
+
+    def test_ignores_path_and_len(self):
+        # Same header+payload on different paths -> identical invariant hash (the dedup key).
+        h1 = rx_invariant_hash(self._pkt(0x15, [0xAA], [1, 2, 3, 4]))
+        h2 = rx_invariant_hash(self._pkt(0x15, [0xBB, 0xCC], [1, 2, 3, 4]))
+        assert h1 == h2 and h1 is not None
+
+    def test_sensitive_to_payload_and_header(self):
+        base = rx_invariant_hash(self._pkt(0x15, [0xAA], [1, 2, 3, 4]))
+        assert base != rx_invariant_hash(self._pkt(0x15, [0xAA], [1, 2, 3, 5]))  # payload differs
+        assert base != rx_invariant_hash(self._pkt(0x16, [0xAA], [1, 2, 3, 4]))  # header differs
+
+    def test_parse_rx_raw_includes_inv_hash(self):
+        raw = self._pkt(0x15, [0xAA], [9, 9])
+        payload = struct.pack("b", 20) + struct.pack("b", -80) + raw
+        result = parse_rx_raw(payload)
+        assert result["inv_hash"] == rx_invariant_hash(raw)
 
 
 class TestParseRxDup:

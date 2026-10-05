@@ -148,6 +148,27 @@ def parse_packet_header(raw):
     }
 
 
+def fnv1a32(data, h=2166136261):
+    """32-bit FNV-1a, matching CollectorSerial.h's fnv1a (uint32 wraparound)."""
+    for b in data:
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def rx_invariant_hash(raw):
+    """Hash the part of a received packet that's identical across relay paths: header byte +
+    payload, SKIPPING [path_len][path]. Must match the firmware so an RX_DUP ties back to its
+    RX_RAW. Packet layout: [header(1)][path_len(1)][path(path_len)][payload...]."""
+    if raw is None or len(raw) < 2:
+        return None
+    path_len = raw[1]
+    payload_off = 2 + path_len
+    if payload_off > len(raw):
+        return None
+    return fnv1a32(bytes([raw[0]]) + raw[payload_off:])
+
+
 def parse_rx_raw(payload):
     """Parse an RX_RAW frame payload."""
     if len(payload) < 3:
@@ -160,6 +181,7 @@ def parse_rx_raw(payload):
         "rssi": rssi,
         "raw_len": len(raw),
         "raw": raw,
+        "inv_hash": rx_invariant_hash(raw),   # ties RX_DUP sightings back to this packet
     }
     result.update(parse_packet_header(raw))
     return result

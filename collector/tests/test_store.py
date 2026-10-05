@@ -8,10 +8,43 @@ from collector.store import CollectorStore
 from collector.tests.packet_helpers import temp_file
 from collector.protocol import (
     FRAME_TYPE_RX_RAW,
+    FRAME_TYPE_RX_DUP,
     FRAME_TYPE_TX_RAW,
     FRAME_TYPE_ADVERTISEMENT,
     FRAME_TYPE_HEARTBEAT,
 )
+
+
+def _rx_dup_frame(inv_hash, snr=4.0, rssi=-85, path="aabb", seq=None):
+    frame = {
+        "type": FRAME_TYPE_RX_DUP,
+        "received_at": time.time(),
+        "parsed": {"snr": snr, "rssi": rssi, "inv_hash": inv_hash,
+                   "path_len": len(path) // 2, "path": path},
+    }
+    if seq is not None:
+        frame["seq"] = seq
+    return frame
+
+
+class TestRxDup:
+    def test_dup_recorded_and_linked_to_original(self, store):
+        f = _rx_frame()
+        f["parsed"]["inv_hash"] = 0x12345678
+        rid = store.store_frame(f)
+        assert rid is not None
+
+        store.store_frame(_rx_dup_frame(0x12345678, path="ccdd"))
+        assert store.count_dup_sightings() == 1
+        sightings = store.get_dup_sightings(0x12345678)
+        assert len(sightings) == 1
+        assert sightings[0]["raw_packet_id"] == rid   # tied back to the original packet
+        assert sightings[0]["path_hex"] == "ccdd"
+
+    def test_dup_without_original_still_recorded(self, store):
+        store.store_frame(_rx_dup_frame(0xAAAA0000))
+        assert store.count_dup_sightings() == 1
+        assert store.get_dup_sightings(0xAAAA0000)[0]["raw_packet_id"] is None
 
 
 @pytest.fixture
