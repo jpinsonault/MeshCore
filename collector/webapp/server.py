@@ -89,6 +89,10 @@ def make_handler(app: CrackerApp):
                 self._call(lambda: self._messages(qs))
                 return
 
+            if path == "/api/multiword":
+                self._call(lambda: self._multiword_estimate(qs))
+                return
+
             get_routes = {
                 "/api/gpu": app.gpu_status,
                 "/api/config": app.config,
@@ -117,6 +121,12 @@ def make_handler(app: CrackerApp):
                 self._call(lambda: app.enqueue_sweep(
                     charset=body.get("charset") or None,
                     max_length=int(body["max_length"]) if body.get("max_length") else None))
+            elif path == "/api/crack/multiword":
+                self._call(lambda: app.enqueue_multiword(
+                    target_hash=body.get("hash"),
+                    n=body.get("n"), tier=body.get("tier"),
+                    include_concat=body.get("concat"),
+                    include_hyphen=body.get("hyphen")))
             elif path == "/api/crack/cancel":
                 self._call(lambda: self._cancel(body))
             elif path == "/api/crack/retry":
@@ -143,6 +153,19 @@ def make_handler(app: CrackerApp):
             return app.channel_messages(
                 channel, limit=limit, before_id=before_id,
                 after_id=after_id, search=search,
+            )
+
+        def _multiword_estimate(self, qs):
+            def _bool(key):
+                v = _str_or_none(qs.get(key))
+                if v is None:
+                    return None
+                return v.lower() in ("1", "true", "yes", "on")
+            return app.multiword_estimate(
+                n=_int_or_none(qs.get("n")),
+                tier=_int_or_none(qs.get("tier")),
+                include_concat=_bool("concat"),
+                include_hyphen=_bool("hyphen"),
             )
 
         # --- POST handlers ---

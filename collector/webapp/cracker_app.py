@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-from .. import brute_force, brute_force_gpu
+from .. import brute_force, brute_force_gpu, multiword
 from ..config import DEFAULT_CONFIG_DIR
 from ..cracker import BUILTIN_WORDLIST, ChannelCracker, load_catalog
 from ..rules import RulesMatcher
@@ -47,7 +47,18 @@ CRACKER_DEFAULTS = {
     "auto_crack": False,      # auto-crack pending channels (dictionary, then queue brute-force)
     "auto_dict_only": False,  # restrict auto-crack to dictionary (skip brute-force) for low-power hosts
     "custom_wordlists": [],   # durable paths added via add_wordlist
+    # Multiword combiner (GPU-only, explicitly triggered — never in the default/
+    # auto sweep, since it's a separate, far larger search).
+    "multiword_words": 2,     # N words to combine (1..4)
+    "multiword_tier": 10_000, # top-N of the frequency wordlist (the feasibility knob)
+    "multiword_concat": True, # try run-together names (#campfire)
+    "multiword_hyphen": True, # try hyphenated names (#camp-fire)
 }
+
+# Measured throughput of the multiword GPU kernel (~half the charset kernel: per-
+# candidate div/mod + variable-length name assembly vs ripple-carry). Used only
+# for the UI's wall-clock ETA estimate.
+MULTIWORD_HASHRATE = 1.1e9
 
 # A charset x max_length search bigger than this (candidate count) is flagged as
 # slow/infeasible in the config UI.
@@ -225,6 +236,20 @@ class CrackerApp:
             s["auto_crack"] = bool(patch["auto_crack"])
         if "auto_dict_only" in patch:
             s["auto_dict_only"] = bool(patch["auto_dict_only"])
+        if "multiword_words" in patch:
+            try:
+                s["multiword_words"] = max(1, min(int(patch["multiword_words"]), 4))
+            except (TypeError, ValueError):
+                pass
+        if "multiword_tier" in patch:
+            try:
+                s["multiword_tier"] = max(1, int(patch["multiword_tier"]))
+            except (TypeError, ValueError):
+                pass
+        if "multiword_concat" in patch:
+            s["multiword_concat"] = bool(patch["multiword_concat"])
+        if "multiword_hyphen" in patch:
+            s["multiword_hyphen"] = bool(patch["multiword_hyphen"])
 
         self._settings = s
         self._persist_settings()
@@ -807,6 +832,84 @@ class CrackerApp:
             self._queue_cv.notify_all()
         return {"queued": True, "job_id": job["id"], "position": position}
 
+    def _mw_params(self, n, tier, include_concat, include_hyphen):
+        """Resolve multiword params, falling back to persisted settings."""
+        s = self._settings
+        return (
+            int(n if n is not None else s["multiword_words"]),
+            int(tier if tier is not None else s["multiword_tier"]),
+            s["multiword_concat"] if include_concat is None else bool(include_concat),
+            s["multiword_hyphen"] if include_hyphen is None else bool(include_hyphen),
+        )
+
+    def multiword_estimate(self, n=None, tier=None,
+                           include_concat=None, include_hyphen=None) -> dict:
+        """Exact in-cap candidate count + wall-clock ETA for a multiword run.
+
+        Drives the UI's live estimate so the user sees the (often enormous) size
+        before committing — the tier/word-count are the feasibility knob.
+        """
+        n, tier, include_concat, include_hyphen = self._mw_params(
+            n, tier, include_concat, include_hyphen)
+        words = multiword.load_words(limit=tier)
+        est = multiword.estimate(
+            words, n, hashrate=MULTIWORD_HASHRATE,
+            include_concat=include_concat, include_hyphen=include_hyphen)
+        est.update({
+            "n": n, "tier": tier, "tier_available": len(words),
+            "include_concat": include_concat, "include_hyphen": include_hyphen,
+            "gpu": brute_force_gpu.is_available(),
+            "tiers": list(multiword.TIERS),
+            "max_words": 4,
+        })
+        return est
+
+    def enqueue_multiword(self, target_hash=None, n=None, tier=None,
+                          include_concat=None, include_hyphen=None,
+                          source="manual") -> dict:
+        """Enqueue a multiword (word-combination) crack. GPU-only.
+
+        With ``target_hash`` it targets one pending byte; otherwise it sweeps
+        every pending byte. Deduped so only one multiword job runs/queues at once.
+        """
+        n, tier, include_concat, include_hyphen = self._mw_params(
+            n, tier, include_concat, include_hyphen)
+        with self._lock:
+            if self._current is not None and self._current.get("kind") == "multiword":
+                return {"queued": False, "reason": "multiword already running",
+                        "job_id": self._current["id"]}
+            for j in self._queue:
+                if j.get("kind") == "multiword":
+                    return {"queued": False, "reason": "multiword already queued",
+                            "job_id": j["id"]}
+            self._job_seq += 1
+            th = None if target_hash is None else int(target_hash)
+            job = {
+                "id": self._job_seq,
+                "kind": "multiword",
+                "target_hash": th,
+                "mac_and_data": None,
+                "charset": None,
+                "max_length": None,
+                "mw_n": n, "mw_tier": tier,
+                "mw_concat": include_concat, "mw_hyphen": include_hyphen,
+                "source": source,
+                "allow_bruteforce": True,
+                "label": (f"words 0x{th:02x} ({n}w)" if th is not None
+                          else f"word-combo sweep ({n}w)"),
+                "status": "queued",
+                "result": None,
+                "enqueued_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+                "cancel": threading.Event(),
+            }
+            self._queue.append(job)
+            position = len(self._queue)
+            self._ensure_worker()
+            self._queue_cv.notify_all()
+        return {"queued": True, "job_id": job["id"], "position": position}
+
     def start_crack(self, target_hash, mac_and_data=None,
                     charset=None, max_length=None) -> dict:
         """Enqueue a manual crack (dictionary-first, then brute-force).
@@ -880,6 +983,8 @@ class CrackerApp:
                        "channel_hash": job["target_hash"]}
             elif job.get("kind") == "sweep":
                 res = self._run_sweep(job)
+            elif job.get("kind") == "multiword":
+                res = self._run_multiword(job)
             else:
                 res = self.crack(
                     job["target_hash"], mac_and_data=job["mac_and_data"],
@@ -989,6 +1094,75 @@ class CrackerApp:
             "cracked": bool(names), "method": "sweep",
             "swept": len(targets), "found": len(solved),
             "fast": len(solved_fast), "names": names,
+            "canceled": cancel.is_set(),
+        })
+
+    def _run_multiword(self, job) -> dict:
+        """Crack pending channels by combining dictionary words (GPU-only).
+
+        Targets one byte (``job['target_hash']``) or sweeps all pending. Unlike
+        the charset sweep it does NOT touch the exhausted cache — the multiword
+        space is a different search with its own (tier/word-count) parameters, so
+        a miss here says nothing about the charset sweep's exhaustion.
+        """
+        cancel = job["cancel"]
+        n, tier = job["mw_n"], job["mw_tier"]
+        include_concat, include_hyphen = job["mw_concat"], job["mw_hyphen"]
+
+        if self.engine() != "gpu" or not brute_force_gpu.is_available():
+            return self._finish({"cracked": False, "method": "multiword",
+                                 "error": "multiword cracking requires a GPU"})
+        words = multiword.load_words(limit=tier)
+        if not words:
+            return self._finish({"cracked": False, "method": "multiword",
+                                 "error": "wordlist unavailable"})
+
+        with self._lock:
+            self._status.update({
+                "running": True, "engine": "gpu", "target_hash": job["target_hash"],
+                "charset": f"{len(words)} words x{n}", "max_length": n,
+                "length": 0, "total": 0, "elapsed": 0.0, "result": None,
+                "error": None, "started_at": time.time(),
+            })
+
+        buckets = self._scan_buckets()
+        only = job["target_hash"]
+        targets = {}
+        for p in self.pending_channels(buckets):
+            h = p["hash"]
+            if only is not None and h != only:
+                continue
+            blobs = self._mac_and_data_for_hash(h, limit=4, buckets=buckets)
+            if len(blobs) < 2:
+                continue  # need a sibling to corroborate a brute-force hit
+            targets[h] = {"mac_and_data": blobs[0], "extras": blobs[1:]}
+
+        if not targets:
+            return self._finish({"cracked": False, "method": "multiword",
+                                 "swept": 0, "found": 0, "names": []})
+
+        def on_progress(length, pos, elapsed):
+            with self._lock:
+                self._status["length"] = length
+                self._status["total"] = pos
+                self._status["elapsed"] = elapsed
+
+        try:
+            solved = brute_force_gpu.brute_force_words_batch_gpu(
+                targets, words, n,
+                include_concat=include_concat, include_hyphen=include_hyphen,
+                on_progress=on_progress, should_stop=lambda: cancel.is_set())
+        except Exception as e:
+            return self._finish({"cracked": False, "method": "multiword",
+                                 "error": str(e)})
+
+        names = []
+        for hb, name in solved.items():
+            self._on_cracked(name, hb, "multiword")
+            names.append(name)
+        return self._finish({
+            "cracked": bool(names), "method": "multiword",
+            "swept": len(targets), "found": len(solved), "names": names,
             "canceled": cancel.is_set(),
         })
 
