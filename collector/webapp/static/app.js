@@ -250,7 +250,12 @@ function buildEntries() {
       packets: c.packets,
       messages: c.messages,
       decoded_packets: c.decoded_packets != null ? c.decoded_packets : c.packets,
+      // Undecoded traffic belongs to the hash byte (a different channel), not to
+      // this channel. shares_hash flags that the byte also carries unknown
+      // traffic; the Unknown row for the byte owns the crack.
+      shares_hash: !!c.shares_hash,
       undecoded: c.undecoded || 0,
+      undecoded_distinct: c.undecoded_distinct || 0,
       unique_senders: c.unique_senders || 0,
       last_activity: c.last_activity,
       cracking: crackingHashes.has(c.channel_hash),
@@ -270,6 +275,10 @@ function buildEntries() {
       packets: p.packet_count,
       messages: 0,
       undecoded: p.undecoded_count || 0,
+      undecoded_distinct: p.undecoded_distinct || 0,
+      // Known channel(s) on the same byte, if any — this unknown traffic is a
+      // *different* channel colliding with them on the 1-byte hash.
+      collides_with: p.collides_with || [],
       unique_senders: 0,
       last_activity: null,
       cracking: isCracking,
@@ -411,18 +420,33 @@ function channelRow(e) {
   }
   if (e.cracking) tag += `<span class="state-pill cracking"><span class="spin">◐</span> cracking</span>`;
 
-  // packets vs messages columns. The % is packet coverage (how much of this
-  // hash's traffic is readable) = decoded packets / total packets.
-  const ratio = e.packets ? Math.round((e.decoded_packets / e.packets) * 100) : 0;
-  const msgCol = (e.kind === "named" || e.kind === "public")
-    ? `<span class="num">${fmtInt(e.messages)}</span><span class="col-k">messages</span><span class="pct">${ratio}%</span>`
-    : `<span class="num zero">0</span><span class="col-k">messages</span>`;
+  const named = e.kind === "named" || e.kind === "public";
 
-  // Collision note (named channel with leftover undecodable packets on its byte).
+  // Packets + messages columns. For a named channel these count only its OWN
+  // traffic (the key's decoded packets); for an unknown byte, the still-
+  // encrypted packet count and a distinct-message estimate (relay floods
+  // collapsed) of how much unknown traffic sits on the byte.
+  const pktNum = named ? e.decoded_packets : e.undecoded;
+  const pktCol = `<span class="num">${fmtInt(pktNum)}</span>`
+    + `<span class="col-k">${named ? "packets" : "encrypted"}</span>`;
+  const msgCol = named
+    ? `<span class="num">${fmtInt(e.messages)}</span><span class="col-k">messages</span>`
+    : `<span class="num">~${fmtInt(e.undecoded_distinct)}</span><span class="col-k">unknown msgs</span>`;
+
+  // Collision note. A named channel never has "undecodable" messages of its
+  // own; if its 1-byte hash also carries unknown traffic, that is a *different*
+  // channel on the same byte. Surface it as a crackable cross-reference, not as
+  // this channel's failure. On an unknown byte, name the known channel(s) it
+  // collides with.
   let collision = "";
-  if ((e.kind === "named" || e.kind === "public") && e.undecoded > 0) {
-    collision = `<div class="collision-note">${esc(e.name)} · ${fmtInt(e.decoded_packets)}/${fmtInt(e.packets)} packets decoded · `
-      + `${fmtInt(e.undecoded)} still undecodable <span class="faint">(another channel on this hash?)</span></div>`;
+  if (named && e.shares_hash) {
+    collision = `<div class="collision-note">Hash byte <code>${hex2(e.hash)}</code> also carries `
+      + `<b>~${fmtInt(e.undecoded_distinct)}</b> message(s) from another, un-cracked channel · `
+      + `<a href="#" class="go-unknown">crack that channel &#8594;</a></div>`;
+  } else if (!named && e.collides_with && e.collides_with.length) {
+    collision = `<div class="collision-note faint">Shares hash byte with `
+      + `${e.collides_with.map((n) => `<b>${esc(n)}</b>`).join(", ")} `
+      + `<span class="faint">(different channel, same 1-byte hash)</span></div>`;
   }
 
   // Per-row action.
@@ -439,7 +463,7 @@ function channelRow(e) {
     <div class="chrow-top">
       <div class="chrow-id">${ident} ${tag}</div>
       <div class="chrow-cols">
-        <div class="col"><span class="num">${fmtInt(e.packets)}</span><span class="col-k">packets</span></div>
+        <div class="col">${pktCol}</div>
         <div class="col">${msgCol}</div>
         <div class="col meta-col">
           <span class="num small">${e.unique_senders ? fmtInt(e.unique_senders) : "—"}</span><span class="col-k">senders</span>
@@ -459,6 +483,9 @@ function channelRow(e) {
   if (cb) cb.onclick = (ev) => { ev.stopPropagation(); startCrack(e.hash); };
   const rb = row.querySelector(".row-retry");
   if (rb) rb.onclick = (ev) => { ev.stopPropagation(); retryCrack(e.hash); };
+  // "crack that channel" jumps to the Unknown row for this byte.
+  const gu = row.querySelector(".go-unknown");
+  if (gu) gu.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); openHash(e.hash); };
   return row;
 }
 
@@ -638,6 +665,15 @@ function openEntry(e) {
   }
 }
 
+// Open the Unknown/Exhausted entry for a hash byte (the crack target), e.g. from
+// a named channel's "crack that channel" collision cross-reference.
+function openHash(hash) {
+  const target = state.entries.find(
+    (x) => x.hash === hash && (x.kind === "unknown" || x.kind === "exhausted"));
+  if (target) openEntry(target);
+  else startCrack(hash);  // not yet in the list — just queue it
+}
+
 // Re-locate the active entry in fresh data (its state may have changed after a crack).
 async function refreshDetailState() {
   if (!state.active) return;
@@ -681,25 +717,39 @@ function renderDetail(e) {
   sp.textContent = e.cracking ? "cracking…" : stateLabel;
   sp.className = "state-pill " + (e.cracking ? "cracking" : e.kind);
 
-  // Collision note.
+  // Collision cross-reference. A named channel decodes all of its own traffic;
+  // leftover undecoded packets on its 1-byte hash are a *different*, un-cracked
+  // channel. Offer to crack that one instead of implying this channel failed.
+  // On an unknown byte, name the known channel(s) it collides with.
   const col = $("d-collision");
-  if ((e.kind === "named" || e.kind === "public") && e.undecoded > 0) {
+  if (!encrypted && e.shares_hash) {
     col.style.display = "";
-    col.innerHTML = `${esc(e.name)} · ${fmtInt(e.decoded_packets)}/${fmtInt(e.packets)} packets decoded · `
-      + `${fmtInt(e.undecoded)} still undecodable <span class="faint">(another channel sharing this hash?)</span>`;
+    col.innerHTML = `Hash byte <code>${hex2(e.hash)}</code> also carries `
+      + `<b>~${fmtInt(e.undecoded_distinct)}</b> message(s) from another, un-cracked channel. `
+      + `<a href="#" id="d-go-unknown">Crack that channel &#8594;</a>`;
+    const g = $("d-go-unknown");
+    if (g) g.onclick = (ev) => { ev.preventDefault(); openHash(e.hash); };
+  } else if (encrypted && e.collides_with && e.collides_with.length) {
+    col.style.display = "";
+    col.innerHTML = `Shares this hash byte with `
+      + `${e.collides_with.map((n) => `<b>${esc(n)}</b>`).join(", ")} — `
+      + `a different channel on the same 1-byte hash.`;
   } else {
     col.style.display = "none";
   }
 
-  // Stats row (packets vs messages explicit).
-  const ratio = e.packets ? Math.round((e.decoded_packets / e.packets) * 100) : 0;
-  $("d-stats").innerHTML = [
-    stat(fmtInt(e.packets), "packets (encrypted)"),
-    stat(encrypted ? "0" : fmtInt(e.messages), "messages (decoded)"),
-    encrypted ? "" : stat(ratio + "%", "decoded"),
+  // Stats row. For a named channel the figures are its own decoded traffic; for
+  // an unknown byte, the still-encrypted packets and a distinct-message estimate.
+  $("d-stats").innerHTML = (encrypted ? [
+    stat(fmtInt(e.undecoded), "packets (encrypted)"),
+    stat("~" + fmtInt(e.undecoded_distinct), "unknown messages"),
+    stat(e.last_activity ? fmtAgo(e.last_activity) : "—", "last activity"),
+  ] : [
+    stat(fmtInt(e.decoded_packets), "packets (decoded)"),
+    stat(fmtInt(e.messages), "messages"),
     stat(e.unique_senders ? fmtInt(e.unique_senders) : "—", "unique senders"),
     stat(e.last_activity ? fmtAgo(e.last_activity) : "—", "last activity"),
-  ].filter(Boolean).join("");
+  ]).filter(Boolean).join("");
 
   // Crack controls for encrypted channels.
   const panel = $("d-crack-panel");
@@ -707,7 +757,7 @@ function renderDetail(e) {
     panel.style.display = "";
     $("d-crack-sub").textContent = e.kind === "exhausted"
       ? "Already swept at the current parameters without a hit. Retry clears the exhausted mark and tries again."
-      : "Recover the name to decode every stored packet on this hash. Dictionary/catalog/rules first, then brute-force.";
+      : "Recover the name to decode this channel's traffic on the hash byte. Dictionary/catalog/rules first, then brute-force.";
     const attempt = $("d-attempt");
     if (e.kind === "exhausted" && e.attempt) {
       attempt.style.display = "";

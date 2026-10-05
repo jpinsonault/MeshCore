@@ -460,6 +460,15 @@ button.big { padding: 11px 20px; font-size: 14.5px; }
   border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
   border-radius: 7px; padding: 6px 10px; line-height: 1.5;
 }
+.collision-note code { font-family: var(--mono); }
+.collision-note a { color: var(--accent); text-decoration: none; font-weight: 600; white-space: nowrap; }
+.collision-note a:hover { text-decoration: underline; }
+/* Muted variant: a plain "shares a byte with …" note on an unknown row — not an
+   action, so it doesn't use the amber attention treatment. */
+.collision-note.faint {
+  color: var(--muted); background: var(--panel2);
+  border-color: var(--border);
+}
 
 /* ---- Channel detail ---- */
 .back-btn {
