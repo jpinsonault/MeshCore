@@ -53,3 +53,18 @@ def backfill_channel(store, channel):
             store.store_channel_message(msg, raw_packet_id=raw_packet_id)
             decoded += 1
     return decoded
+
+
+def backfill_known_channels(store):
+    """Re-decode stored packets under EVERY already-known channel key and store the
+    results (idempotent via backfill_channel). Returns the total count of newly
+    decoded messages. Run this once after a decode change — e.g. the packed
+    path_len parse fix, which had mis-sliced packets with >1-byte-per-hop paths so
+    they never decoded even on channels we already hold keys for."""
+    total = 0
+    for channel in load_known_channels(store):
+        try:
+            total += backfill_channel(store, channel)
+        except Exception:
+            continue
+    return total

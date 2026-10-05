@@ -154,6 +154,17 @@ def extract_group_payload(raw_packet: bytes) -> Optional[dict]:
     }
 
 
+def is_group_ciphertext_wellformed(mac_and_data: bytes) -> bool:
+    """True if ``mac_and_data`` has the shape of a real GRP payload: a 2-byte MAC
+    followed by a non-empty AES ciphertext whose length is a positive multiple of
+    the 16-byte block size. A non-block-aligned "ciphertext" can't be genuine AES
+    output, so the frame is corrupt/mis-captured — not a channel message. Lets
+    callers that count channels ignore corruption instead of treating each corrupt
+    frame as an undecodable 'unknown channel'."""
+    ct = len(mac_and_data) - CIPHER_MAC_SIZE
+    return ct > 0 and ct % CIPHER_BLOCK_SIZE == 0
+
+
 def mac_then_decrypt(secret: bytes, mac_and_data: bytes) -> Optional[bytes]:
     """Python port of Utils::MACThenDecrypt.
 

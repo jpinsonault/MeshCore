@@ -147,6 +147,20 @@ class TestExtractGroupPayload:
         raw = bytes([header, 0xC0]) + payload          # size-1 == 3 -> size 4
         assert extract_group_payload(raw) is None
 
+
+class TestIsGroupCiphertextWellformed:
+    def test_block_aligned_ok(self):
+        from collector.crypto import is_group_ciphertext_wellformed
+        assert is_group_ciphertext_wellformed(b"\xaa\xbb" + b"\x00" * 16) is True   # 1 block
+        assert is_group_ciphertext_wellformed(b"\xaa\xbb" + b"\x00" * 48) is True   # 3 blocks
+
+    def test_non_aligned_or_empty_rejected(self):
+        from collector.crypto import is_group_ciphertext_wellformed
+        assert is_group_ciphertext_wellformed(b"\xaa\xbb" + b"\x00" * 5) is False   # not a multiple of 16
+        assert is_group_ciphertext_wellformed(b"\xaa\xbb" + b"\x00" * 17) is False
+        assert is_group_ciphertext_wellformed(b"\xaa\xbb") is False                 # empty ciphertext
+        assert is_group_ciphertext_wellformed(b"\xaa") is False                     # too short for a MAC
+
     def test_non_grp_returns_none(self):
         # Header with payload_type=TXT_MSG (0x02)
         header = (0x02 << 2) | ROUTE_TYPE_FLOOD
