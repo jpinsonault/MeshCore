@@ -308,6 +308,81 @@ __global__ void crack_batch(
   }
 }
 
+// ---- multiword sweep ----
+// Each candidate is an ordered N-tuple of words from a wordlist blob, joined by a
+// separator pattern (a bitmask: bit w set => a hyphen after word w). The linear
+// index decodes as: pattern = patterns[idx % Peff]; the remaining digits (base W)
+// select the words. The "#"+name is assembled inline and skipped if it exceeds
+// max_name_chars (incl. the '#') — the on-device field limit, so an over-length
+// name can never match. Same shared double-SHA filter + per-wanted HMAC as crack_batch.
+__global__ void crack_words(
+    const unsigned char* blob, const int* woff, const int* wlen, int W, int n,
+    const unsigned int* patterns, int Peff, int max_name_chars,
+    unsigned long long start, unsigned long long count, unsigned long long threads_total,
+    const unsigned char* wanted, const unsigned char* macs,
+    const int* ct_off, const int* ct_len, const unsigned char* ct_blob,
+    unsigned long long* out_idx, unsigned char* out_hash,
+    unsigned int* out_cnt, unsigned int out_max)
+{
+  unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= threads_total) return;
+  unsigned long long per = (count + threads_total - 1) / threads_total;
+  unsigned long long lo = start + tid * per;
+  unsigned long long end = start + count;
+  if (lo >= end) return;
+  unsigned long long hi = lo + per; if (hi > end) hi = end;
+
+  for (unsigned long long idx = lo; idx < hi; idx++) {
+    unsigned int pattern = patterns[idx % (unsigned long long)Peff];
+    unsigned long long rest = idx / (unsigned long long)Peff;
+    int wi[8];
+    for (int pos = n - 1; pos >= 0; pos--) {
+      wi[pos] = (int)(rest % (unsigned long long)W);
+      rest /= (unsigned long long)W;
+    }
+
+    unsigned char buf[48];
+    buf[0] = '#';
+    int plen = 1;
+    int over = 0;
+    for (int w = 0; w < n; w++) {
+      int o = woff[wi[w]], L = wlen[wi[w]];
+      if (plen + L > max_name_chars) { over = 1; break; }
+      for (int k = 0; k < L; k++) buf[plen + k] = blob[o + k];
+      plen += L;
+      if (w < n - 1 && ((pattern >> w) & 1u)) {
+        if (plen + 1 > max_name_chars) { over = 1; break; }
+        buf[plen++] = '-';
+      }
+    }
+    if (over) continue;
+
+    unsigned char d1[32];
+    sha256(buf, plen, d1);                 // psk = d1[:16]
+    unsigned char d2[32];
+    sha256(d1, 16, d2);
+    unsigned char hb = d2[0];
+
+    if (wanted[hb]) {
+      unsigned char ipad[64], opad[64];
+      #pragma unroll
+      for (int k = 0; k < 64; k++) {
+        unsigned char kb = (k < 16) ? d1[k] : 0;
+        ipad[k] = kb ^ 0x36; opad[k] = kb ^ 0x5c;
+      }
+      Sha c;
+      unsigned char innerd[32], macd[32];
+      int off = ct_off[hb], clen = ct_len[hb];
+      sha_init(&c); sha_update(&c, ipad, 64); sha_update(&c, ct_blob + off, clen); sha_final(&c, innerd);
+      sha_init(&c); sha_update(&c, opad, 64); sha_update(&c, innerd, 32); sha_final(&c, macd);
+      if (macd[0] == macs[2*hb] && macd[1] == macs[2*hb + 1]) {
+        unsigned int slot = atomicAdd(out_cnt, 1u);
+        if (slot < out_max) { out_idx[slot] = idx; out_hash[slot] = hb; }
+      }
+    }
+  }
+}
+
 }  // extern "C"
 """
 
@@ -451,17 +526,15 @@ def _index_to_name(idx: int, charset: bytes, length: int) -> bytes:
     return bytes(out)
 
 
-def _verify(idx, charset, length, mac_and_data, extra=()):
-    """Reconstruct the name for a GPU survivor and fully verify on CPU.
+def _verify_name(full_name: str, mac_and_data, extra=()):
+    """Fully verify a reconstructed "#name" on CPU (shared by charset + words).
 
     A 2-byte MAC collision over a huge search space can pass the single-packet
     check, so a survivor must (a) decrypt to a strictly-valid GRP_TXT plaintext
     and (b) also MAC-verify every `extra` packet of the same channel. A true
     key decrypts them all; a collision will not.
     """
-    name = _index_to_name(idx, charset, length)
-    full = b"#" + name
-    ch = Channel.from_hashtag(full.decode())
+    ch = Channel.from_hashtag(full_name)
     plaintext = mac_then_decrypt(ch.secret, mac_and_data)
     if plaintext is None or not grp_txt_plaintext_ok(plaintext):
         return None
@@ -473,7 +546,176 @@ def _verify(idx, charset, length, mac_and_data, extra=()):
     if extra:
         if not any(_strict_decodes(ch.secret, e) for e in extra):
             return None
-    return full.decode()
+    return full_name
+
+
+def _verify(idx, charset, length, mac_and_data, extra=()):
+    """Reconstruct a charset survivor's name and verify it."""
+    name = _index_to_name(idx, charset, length)
+    return _verify_name((b"#" + name).decode(), mac_and_data, extra)
+
+
+def _patterns_for(n: int, include_concat: bool, include_hyphen: bool) -> list:
+    """Separator-pattern bitmasks (bit w set => hyphen after word w).
+
+    Both allowed -> every mask 0..2**(n-1)-1; hyphen-only -> all-ones (every gap
+    hyphenated); concat-only -> 0. Mirrors multiword._separator_patterns as masks.
+    """
+    gaps = max(0, n - 1)
+    if include_concat and include_hyphen:
+        return list(range(1 << gaps))
+    if include_hyphen:
+        return [(1 << gaps) - 1]
+    if include_concat:
+        return [0]
+    return []
+
+
+def _words_index_to_name(idx: int, words, n: int, patterns: list, peff: int) -> str:
+    """Reconstruct a words survivor's generated name (no '#'), matching the kernel."""
+    w = len(words)
+    pattern = patterns[idx % peff]
+    rest = idx // peff
+    wi = [0] * n
+    for pos in range(n - 1, -1, -1):
+        wi[pos] = rest % w
+        rest //= w
+    parts = [words[wi[0]]]
+    for k in range(1, n):
+        if (pattern >> (k - 1)) & 1:
+            parts.append("-")
+        parts.append(words[wi[k]])
+    return "".join(parts)
+
+
+def brute_force_words_batch_gpu(
+    targets,
+    words,
+    n: int,
+    *,
+    include_concat: bool = True,
+    include_hyphen: bool = True,
+    max_name_chars: int = 31,
+    on_progress: Optional[Callable] = None,
+    should_stop: Optional[Callable] = None,
+    threads_per_block: int = 256,
+    chunk_bits: int = 28,
+) -> dict:
+    """Crack many channels in one sweep by combining words from ``words``.
+
+    Candidates are ordered N-tuples of words joined by separator patterns
+    (concat and/or hyphen per gap); see :mod:`collector.multiword`. ``words``
+    should be the chosen frequency tier (a top-N slice). ``max_name_chars`` is
+    the on-device field size incl. the '#'. Same ``targets`` shape and return
+    (``{hash_byte: "#name"}``) as :func:`brute_force_batch_gpu`.
+    """
+    cp = _load_cupy()
+    if cp is None:
+        raise RuntimeError(f"CuPy unavailable: {_import_error}")
+
+    w = len(words)
+    patterns = _patterns_for(n, include_concat, include_hyphen)
+    if w == 0 or n < 1 or not patterns:
+        return {}
+    peff = len(patterns)
+
+    kernel = _get_module().get_function("crack_words")
+
+    # Wordlist blob + offset/length tables on the GPU.
+    encoded = [x.encode() for x in words]
+    blob = b"".join(encoded)
+    offs = []
+    lens = []
+    o = 0
+    for b in encoded:
+        offs.append(o)
+        lens.append(len(b))
+        o += len(b)
+    d_blob = cp.asarray(bytearray(blob or b"\x00"), dtype=cp.uint8)
+    d_off = cp.asarray(offs, dtype=cp.int32)
+    d_len = cp.asarray(lens, dtype=cp.int32)
+    d_pat = cp.asarray(patterns, dtype=cp.uint32)
+
+    # Targets -> wanted/macs/ct tables (identical to the charset batch sweep).
+    wanted = bytearray(256)
+    macs = bytearray(512)
+    ct_off = [0] * 256
+    ct_len = [0] * 256
+    ct_parts = []
+    off = 0
+    active = {}
+    for hb, t in targets.items():
+        hb = int(hb)
+        mad = t["mac_and_data"]
+        mac, ct = mad[:2], mad[2:]
+        if len(ct) == 0 or len(ct) % CIPHER_BLOCK_SIZE != 0 or len(ct) > 256:
+            continue
+        wanted[hb] = 1
+        macs[2 * hb] = mac[0]
+        macs[2 * hb + 1] = mac[1]
+        ct_off[hb] = off
+        ct_len[hb] = len(ct)
+        ct_parts.append(ct)
+        off += len(ct)
+        active[hb] = t
+    if not active:
+        return {}
+
+    d_wanted = cp.asarray(bytearray(wanted), dtype=cp.uint8)
+    d_macs = cp.asarray(bytearray(macs), dtype=cp.uint8)
+    d_ct_off = cp.asarray(ct_off, dtype=cp.int32)
+    d_ct_len = cp.asarray(ct_len, dtype=cp.int32)
+    d_ct_blob = cp.asarray(bytearray(b"".join(ct_parts) or b"\x00"), dtype=cp.uint8)
+
+    OUT_MAX = 1 << 20
+    d_out_idx = cp.zeros(OUT_MAX, dtype=cp.uint64)
+    d_out_hash = cp.zeros(OUT_MAX, dtype=cp.uint8)
+    d_out_cnt = cp.zeros(1, dtype=cp.uint32)
+
+    solved = {}
+    total = (w ** n) * peff
+    chunk = 1 << chunk_bits
+    tpb = threads_per_block
+    t0 = time.monotonic()
+
+    pos = 0
+    while pos < total:
+        if should_stop is not None and should_stop():
+            return solved
+        if not active:
+            return solved
+        count = min(chunk, total - pos)
+        d_out_cnt.fill(0)
+        threads_total = min(int(count), 1 << 22)
+        blocks = (threads_total + tpb - 1) // tpb
+        kernel(
+            (blocks,), (tpb,),
+            (d_blob, d_off, d_len, cp.int32(w), cp.int32(n),
+             d_pat, cp.int32(peff), cp.int32(max_name_chars),
+             cp.uint64(pos), cp.uint64(count), cp.uint64(threads_total),
+             d_wanted, d_macs, d_ct_off, d_ct_len, d_ct_blob,
+             d_out_idx, d_out_hash, d_out_cnt, cp.uint32(OUT_MAX)),
+        )
+        cnt = int(d_out_cnt.get()[0])
+        if cnt:
+            m = min(cnt, OUT_MAX)
+            idxs = d_out_idx.get()[:m].tolist()
+            hbs = d_out_hash.get()[:m].tolist()
+            for idx, hb in zip(idxs, hbs):
+                if hb not in active:
+                    continue
+                t = active[hb]
+                full = "#" + _words_index_to_name(int(idx), words, n, patterns, peff)
+                name = _verify_name(full, t["mac_and_data"], tuple(t.get("extras") or ()))
+                if name is not None:
+                    solved[hb] = name
+                    del active[hb]
+                    d_wanted[hb] = 0
+        pos += count
+        if on_progress:
+            on_progress(n, pos, time.monotonic() - t0)
+
+    return solved
 
 
 def _strict_decodes(secret, mac_and_data) -> bool:
