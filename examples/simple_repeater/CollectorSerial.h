@@ -14,7 +14,14 @@
 #define COLLECTOR_HEARTBEAT     0xD3
 #define COLLECTOR_DIAGNOSTICS   0xD4
 #define COLLECTOR_BOOT_INFO     0xD5
+#define COLLECTOR_RX_DUP        0xD6   // compact duplicate of a recent RX_RAW (flood seen on another path)
 #define COLLECTOR_HANDSHAKE     0xDF
+
+// Number of recent RX invariant-hashes tracked for flood-duplicate collapse. A flood arriving on
+// several paths hashes identically (path/SNR/RSSI excluded), so repeats become compact RX_DUP frames.
+#ifndef COLLECTOR_DEDUP_SLOTS
+#define COLLECTOR_DEDUP_SLOTS   48
+#endif
 
 // Reset causes reported in BOOT_INFO (stable wire values, mapped from the
 // platform's reset-reason API so the host doesn't depend on IDF enum numbering).
@@ -79,6 +86,26 @@ class CollectorSerial {
   // Flash overflow tier: holds entries evicted from the RAM ring (older seqs). No-op until a
   // SpoolStore is attached via attachSpool() — when absent, the ring drops on overflow as before.
   FlashSpool _spool;
+
+  // Flood-duplicate collapse: FIFO window of recent RX invariant-hashes. Off unless setDedup(true).
+  uint32_t _dedup_hashes[COLLECTOR_DEDUP_SLOTS];
+  uint8_t _dedup_next;
+  uint8_t _dedup_count;
+  bool _dedup_enabled;
+
+  static uint32_t fnv1a(const uint8_t *data, uint16_t len, uint32_t h) {
+    for (uint16_t i = 0; i < len; i++) { h ^= data[i]; h *= 16777619u; }
+    return h;
+  }
+  bool dedupSeenOrInsert(uint32_t h) {
+    for (uint8_t i = 0; i < _dedup_count; i++) {
+      if (_dedup_hashes[i] == h) return true;
+    }
+    _dedup_hashes[_dedup_next] = h;
+    _dedup_next = (uint8_t)((_dedup_next + 1) % COLLECTOR_DEDUP_SLOTS);
+    if (_dedup_count < COLLECTOR_DEDUP_SLOTS) _dedup_count++;
+    return false;
+  }
 
   static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len) {
     uint16_t crc = 0xFFFF;
@@ -155,7 +182,8 @@ public:
   CollectorSerial()
     : _serial(nullptr), _ring(nullptr), _ring_size(0), _ring_valid(false),
       _head(0), _tail(0), _send_cursor(0), _next_seq(1), _acked_seq(0),
-      _dropped_count(0), _total_entries(0), _unsent_entries(0) {}
+      _dropped_count(0), _total_entries(0), _unsent_entries(0),
+      _dedup_next(0), _dedup_count(0), _dedup_enabled(false) {}
 
   void begin(Stream &serial) {
     _serial = &serial;
@@ -185,6 +213,8 @@ public:
     _dropped_count = 0;
     _total_entries = 0;
     _unsent_entries = 0;
+    _dedup_next = 0;
+    _dedup_count = 0;
   }
 
   // --- Ring buffer operations ---
@@ -421,14 +451,46 @@ public:
   // --- Frame senders (buffer payload, then write to ring) ---
 
   void sendRxRaw(float snr, float rssi, const uint8_t *raw, int raw_len) {
+    if (raw_len < 0) raw_len = 0;
+    if (raw_len > 258) raw_len = 258;  // buf = 2 header + 258 payload; clamp drives both copy and length
+
+    // Flood-duplicate collapse: the same message floods in on several paths as entries that differ
+    // only in path accumulation + SNR/RSSI. Hash the invariant part (header + payload, skipping the
+    // [path_len][path]); a recent match becomes a compact RX_DUP (keeps the path for topology, drops
+    // the redundant payload). Packet layout: [header(1)][path_len(1)][path(path_len)][payload...].
+    if (_dedup_enabled && raw_len >= 2) {
+      uint8_t path_len = raw[1];
+      uint16_t payload_off = (uint16_t)2 + path_len;
+      if (payload_off <= (uint16_t)raw_len) {
+        uint32_t h = fnv1a(raw, 1, 2166136261u);                              // header
+        h = fnv1a(raw + payload_off, (uint16_t)raw_len - payload_off, h);     // payload (after path)
+        if (dedupSeenOrInsert(h)) {
+          sendRxDup(snr, rssi, h, path_len, raw + 2);
+          return;
+        }
+      }
+    }
+
     uint8_t buf[260];
     buf[0] = (uint8_t)(int8_t)(snr * 4);
     buf[1] = (uint8_t)(int8_t)(rssi);
-    if (raw_len < 0) raw_len = 0;
-    if (raw_len > 258) raw_len = 258;  // buf = 2 header + 258 payload; clamp drives both copy and length
     if (raw_len > 0) memcpy(buf + 2, raw, raw_len);
     ringWrite(COLLECTOR_RX_RAW, buf, 2 + raw_len);
   }
+
+  // Compact duplicate: [snr(1)][rssi(1)][inv_hash(4 LE)][path_len(1)][path(path_len)].
+  void sendRxDup(float snr, float rssi, uint32_t inv_hash, uint8_t path_len, const uint8_t *path) {
+    if (path_len > 64) path_len = 64;   // MeshCore MAX_PATH_SIZE
+    uint8_t buf[72];
+    buf[0] = (uint8_t)(int8_t)(snr * 4);
+    buf[1] = (uint8_t)(int8_t)(rssi);
+    memcpy(buf + 2, &inv_hash, 4);
+    buf[6] = path_len;
+    if (path_len > 0) memcpy(buf + 7, path, path_len);
+    ringWrite(COLLECTOR_RX_DUP, buf, 7 + path_len);
+  }
+
+  void setDedup(bool on) { _dedup_enabled = on; }
 
   void sendTxRaw(const uint8_t *raw, int raw_len) {
     ringWrite(COLLECTOR_TX_RAW, raw, raw_len);

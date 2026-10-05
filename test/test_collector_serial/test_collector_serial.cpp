@@ -1256,6 +1256,82 @@ void test_spool_resume_zero_replays_all() {
 }
 
 // ============================================================
+// Flood-duplicate collapse (RX_DUP)
+// ============================================================
+
+// Feed a synthetic received packet: [header][path_len][path...][payload...].
+static void send_rx(CollectorSerial &cs, uint8_t header, const std::vector<uint8_t> &path,
+                    const std::vector<uint8_t> &payload, float snr = 5, float rssi = -80) {
+  std::vector<uint8_t> raw;
+  raw.push_back(header);
+  raw.push_back((uint8_t)path.size());
+  for (auto b : path) raw.push_back(b);
+  for (auto b : payload) raw.push_back(b);
+  cs.sendRxRaw(snr, rssi, raw.data(), (int)raw.size());
+}
+
+// Same header+payload on a different path collapses to a compact RX_DUP carrying that path.
+void test_dedup_collapses_flood_paths() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  cs.setDedup(true);
+  std::vector<uint8_t> payload = {0x11, 0x22, 0x33, 0x44, 0x55};
+  send_rx(cs, 0x12, {0xAA}, payload);         // first sighting: full RX_RAW
+  send_rx(cs, 0x12, {0xBB, 0xCC}, payload);   // flood on another path: RX_DUP
+
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame f1, f2;
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, f1));
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_RX_RAW, f1.type);
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, f2));
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_RX_DUP, f2.type);
+  TEST_ASSERT_TRUE(f2.valid_crc);
+  // RX_DUP payload: [snr][rssi][hash(4)][path_len][path...]
+  TEST_ASSERT_EQUAL_UINT32(2, f2.payload[6]);
+  TEST_ASSERT_EQUAL_HEX8(0xBB, f2.payload[7]);
+  TEST_ASSERT_EQUAL_HEX8(0xCC, f2.payload[8]);
+  TEST_ASSERT_TRUE(f2.payload.size() < f1.payload.size());   // compact
+}
+
+// Distinct payloads are never collapsed.
+void test_dedup_distinct_not_collapsed() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  cs.setDedup(true);
+  send_rx(cs, 0x12, {0xAA}, {0x01, 0x02, 0x03});
+  send_rx(cs, 0x12, {0xAA}, {0x09, 0x08, 0x07});   // different payload, same path
+
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame f1, f2;
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, f1));
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, f2));
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_RX_RAW, f1.type);
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_RX_RAW, f2.type);
+}
+
+// With dedup off, repeats pass through as full RX_RAW (no behavior change / no protocol surprise).
+void test_dedup_disabled_passthrough() {
+  CollectorSerial cs;
+  setup_cs(cs);
+  std::vector<uint8_t> payload = {0x11, 0x22, 0x33};
+  send_rx(cs, 0x12, {0xAA}, payload);
+  send_rx(cs, 0x12, {0xAA}, payload);   // identical, but dedup disabled
+
+  ms.written.clear();
+  while (cs.drain()) {}
+  size_t off = 0;
+  ParsedFrame f1, f2;
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, f1));
+  TEST_ASSERT_TRUE(parse_frame(ms.written, off, f2));
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_RX_RAW, f1.type);
+  TEST_ASSERT_EQUAL_HEX8(COLLECTOR_RX_RAW, f2.type);
+}
+
+// ============================================================
 // Two-tier integration: CollectorSerial + attached FlashSpool
 // ============================================================
 
@@ -1461,6 +1537,11 @@ int main(int argc, char **argv) {
   RUN_TEST(test_spool_ack_empties_returns_true);
   RUN_TEST(test_spool_resume_replays_from);
   RUN_TEST(test_spool_resume_zero_replays_all);
+
+  // Flood-duplicate collapse
+  RUN_TEST(test_dedup_collapses_flood_paths);
+  RUN_TEST(test_dedup_distinct_not_collapsed);
+  RUN_TEST(test_dedup_disabled_passthrough);
 
   // Two-tier integration (ring + spool)
   RUN_TEST(test_integration_spill_and_drain_in_order);

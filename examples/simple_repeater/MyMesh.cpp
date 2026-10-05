@@ -1073,6 +1073,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 #else
   _collector.begin(Serial);
 #endif
+  _collector.setDedup(true);   // collapse multi-path flood duplicates into compact RX_DUP frames
 #if defined(ESP32) && defined(COLLECTOR_SPOOL_SIZE) && (COLLECTOR_SPOOL_SIZE > 0)
   // Attach the flash overflow tier so evicted entries spill to flash instead of being dropped.
   // Back off the requested size until it fits the filesystem's free space (or give up quietly).

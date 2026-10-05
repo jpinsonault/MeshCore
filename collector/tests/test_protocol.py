@@ -21,6 +21,7 @@ from collector.protocol import (
     parse_handshake,
     parse_heartbeat,
     parse_rx_raw,
+    parse_rx_dup,
     parse_tx_raw,
     parse_advertisement,
     parse_boot_info,
@@ -164,6 +165,22 @@ class TestParseRxRaw:
     def test_too_short(self):
         result = parse_rx_raw(b"\x00\x00")
         assert "error" in result
+
+
+class TestParseRxDup:
+    def test_valid_rx_dup(self):
+        # [snr_x4=20][rssi=-80][inv_hash=0xDEADBEEF LE][path_len=2][path=AA BB]
+        payload = (struct.pack("b", 20) + struct.pack("b", -80)
+                   + struct.pack("<I", 0xDEADBEEF) + bytes([2, 0xAA, 0xBB]))
+        result = parse_rx_dup(payload)
+        assert result["snr"] == 5.0
+        assert result["rssi"] == -80
+        assert result["inv_hash"] == 0xDEADBEEF
+        assert result["path_len"] == 2
+        assert result["path"] == "aabb"
+
+    def test_too_short(self):
+        assert "error" in parse_rx_dup(b"\x00\x00\x00")
 
 
 class TestParseTxRaw:

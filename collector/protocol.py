@@ -19,6 +19,7 @@ FRAME_TYPE_ADVERTISEMENT = 0xD2
 FRAME_TYPE_HEARTBEAT = 0xD3
 FRAME_TYPE_DIAGNOSTICS = 0xD4
 FRAME_TYPE_BOOT_INFO = 0xD5
+FRAME_TYPE_RX_DUP = 0xD6   # compact duplicate of a recent RX_RAW (flood seen on another path)
 FRAME_TYPE_HANDSHAKE = 0xDF
 
 # BOOT_INFO reset causes (must match CollectorSerial.h).
@@ -47,6 +48,7 @@ FRAME_TYPE_NAMES = {
     FRAME_TYPE_HEARTBEAT: "HEARTBEAT",
     FRAME_TYPE_DIAGNOSTICS: "DIAGNOSTICS",
     FRAME_TYPE_BOOT_INFO: "BOOT_INFO",
+    FRAME_TYPE_RX_DUP: "RX_DUP",
     FRAME_TYPE_HANDSHAKE: "HANDSHAKE",
 }
 
@@ -161,6 +163,29 @@ def parse_rx_raw(payload):
     }
     result.update(parse_packet_header(raw))
     return result
+
+
+def parse_rx_dup(payload):
+    """Parse an RX_DUP frame: a compact re-sighting of a recent RX_RAW on a different path.
+
+    Layout: [snr_x4(1)][rssi(1)][inv_hash(4 LE)][path_len(1)][path(path_len)]. inv_hash is the
+    firmware's FNV-1a over the original packet's header+payload (path/SNR/RSSI excluded), so it ties
+    this sighting back to the full RX_RAW that carries the same invariant content.
+    """
+    if len(payload) < 7:
+        return {"error": "too short"}
+    snr_x4 = struct.unpack("b", payload[0:1])[0]
+    rssi = struct.unpack("b", payload[1:2])[0]
+    inv_hash = struct.unpack("<I", payload[2:6])[0]
+    path_len = payload[6]
+    path = payload[7:7 + path_len]
+    return {
+        "snr": snr_x4 / 4.0,
+        "rssi": rssi,
+        "inv_hash": inv_hash,
+        "path_len": path_len,
+        "path": path.hex(),
+    }
 
 
 def parse_tx_raw(payload):
@@ -326,6 +351,7 @@ FRAME_PARSERS = {
     FRAME_TYPE_HEARTBEAT: parse_heartbeat,
     FRAME_TYPE_DIAGNOSTICS: parse_diagnostics,
     FRAME_TYPE_BOOT_INFO: parse_boot_info,
+    FRAME_TYPE_RX_DUP: parse_rx_dup,
     FRAME_TYPE_HANDSHAKE: parse_handshake,
 }
 
