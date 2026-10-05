@@ -47,6 +47,22 @@ class FlashSpool {
   uint32_t _dropped;       // entries lost to spool overflow
   uint32_t _newest_seq;
 
+  // Durability (optional): a tiny separate store holds a CRC'd header of the index + the owner's
+  // next_seq, so a reboot recovers the spilled backlog instead of abandoning it. Entry bytes
+  // already persist in the data file; only the RAM index + seq counter need saving.
+  SpoolStore *_hdr;
+  bool _dirty;
+  uint32_t _restored_next_seq;
+
+  static uint16_t crc16(const uint8_t *data, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < len; i++) {
+      crc ^= (uint16_t)data[i] << 8;
+      for (uint8_t j = 0; j < 8; j++) crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+    return crc;
+  }
+
   uint16_t entryLenAt(uint32_t off) {
     uint8_t b[2];
     if (!_store->readAt(off, b, 2)) return 0;
@@ -76,6 +92,7 @@ class FlashSpool {
     _head += entry_len;
     _count--;
     _dropped++;
+    _dirty = true;
     // Never leave head resting on a trailing sentinel: the next append's fits-arithmetic reads
     // _head as the boundary of free space, so a sentinel there would let it overwrite live data.
     if (_count > 0 && _head != _tail && entryLenAt(_head) == SPOOL_SENTINEL) {
@@ -84,20 +101,73 @@ class FlashSpool {
     }
   }
 
+  // --- Durable header (magic + index + owner next_seq, CRC'd) ---
+  static const uint32_t HDR_MAGIC = 0x314C5053u;   // "SPL1"
+  bool restoreHeader() {
+    uint8_t b[34];
+    if (!_hdr->readAt(0, b, 34)) return false;
+    uint32_t magic;
+    memcpy(&magic, b, 4);
+    if (magic != HDR_MAGIC || b[4] != 1) return false;
+    uint16_t want = (uint16_t)(b[32] | (b[33] << 8));
+    if (crc16(b, 32) != want) return false;
+    uint32_t head, tail, count, newest, nextseq;
+    memcpy(&head, b + 8, 4); memcpy(&tail, b + 12, 4);
+    memcpy(&count, b + 20, 4); memcpy(&newest, b + 24, 4); memcpy(&nextseq, b + 28, 4);
+    if (head >= _size || tail >= _size) return false;   // corrupt / stale against this file size
+    _head = head; _tail = tail; _count = count; _newest_seq = newest; _restored_next_seq = nextseq;
+    _dropped = 0;
+    return true;
+  }
+
 public:
   FlashSpool() : _store(nullptr), _size(0), _valid(false), _head(0), _tail(0), _send_cursor(0),
-                 _count(0), _unsent(0), _dropped(0), _newest_seq(0) {}
+                 _count(0), _unsent(0), _dropped(0), _newest_seq(0),
+                 _hdr(nullptr), _dirty(false), _restored_next_seq(0) {}
 
-  void begin(SpoolStore *store) {
+  // hdr (optional) makes the spool durable across reboots: a valid header restores the spilled
+  // backlog; otherwise the spool starts empty (non-durable).
+  void begin(SpoolStore *store, SpoolStore *hdr = nullptr) {
     _store = store;
+    _hdr = hdr;
     _size = store ? store->capacity() : 0;
     _valid = (_store != nullptr && _size >= 64);
+    _dirty = false;
+    _restored_next_seq = 0;
+    if (_valid && _hdr && restoreHeader()) {
+      // Index recovered from flash. ACK state is RAM-only (lost on reboot), so replay the whole
+      // surviving backlog from the oldest entry; the host's RESUME trims what it already committed.
+      _send_cursor = _head;
+      _unsent = _count;
+      return;
+    }
     _head = _tail = _send_cursor = 0;
     _count = _unsent = _dropped = 0;
     _newest_seq = 0;
   }
 
+  // Write the current index + owner next_seq to the header store (small, call periodically when
+  // dirty()). Cheap enough for its own tiny file; clears the dirty flag.
+  void persistHeader(uint32_t owner_next_seq) {
+    if (!_hdr) return;
+    uint8_t b[34];
+    memset(b, 0, sizeof(b));
+    uint32_t magic = HDR_MAGIC;
+    memcpy(b, &magic, 4);
+    b[4] = 1;
+    memcpy(b + 8, &_head, 4); memcpy(b + 12, &_tail, 4); memcpy(b + 16, &_send_cursor, 4);
+    memcpy(b + 20, &_count, 4); memcpy(b + 24, &_newest_seq, 4); memcpy(b + 28, &owner_next_seq, 4);
+    uint16_t crc = crc16(b, 32);
+    b[32] = (uint8_t)(crc & 0xFF);
+    b[33] = (uint8_t)(crc >> 8);
+    _hdr->writeAt(0, b, 34);
+    _dirty = false;
+  }
+
   bool valid() const { return _valid; }
+  bool durable() const { return _hdr != nullptr; }
+  bool dirty() const { return _dirty; }
+  uint32_t restoredNextSeq() const { return _restored_next_seq; }
   bool hasUnsent() const { return _valid && _unsent > 0; }
   uint32_t count() const { return _count; }
   uint32_t unsent() const { return _unsent; }
@@ -136,6 +206,7 @@ public:
     _count++;
     _unsent++;
     _newest_seq = seq;
+    _dirty = true;
     return true;
   }
 
@@ -185,6 +256,7 @@ public:
       // recompute unsent: everything remaining is now unsent again from head
       _unsent = _count;
     }
+    _dirty = true;
     return _count == 0;
   }
 

@@ -423,8 +423,19 @@ public:
   }
 
   // Attach a flash overflow store (firmware: a preallocated file; tests: in-memory). Optional —
-  // without it, the ring drops on overflow exactly as before.
-  void attachSpool(SpoolStore *store) { _spool.begin(store); }
+  // without it, the ring drops on overflow exactly as before. Passing hdr makes it durable across
+  // reboots: a recovered spool resumes _next_seq from the persisted high-water mark so seqs are
+  // never reused (which would trip the host's seq-reset detection).
+  void attachSpool(SpoolStore *store, SpoolStore *hdr = nullptr) {
+    _spool.begin(store, hdr);
+    if (_spool.restoredNextSeq() > _next_seq) _next_seq = _spool.restoredNextSeq();
+    if (_spool.newestSeq() >= _next_seq) _next_seq = _spool.newestSeq() + 1;
+  }
+
+  // Persist the durable spool header (call periodically; cheap, no-op unless durable + dirty).
+  void persistSpool() {
+    if (_spool.durable() && _spool.dirty()) _spool.persistHeader(_next_seq);
+  }
 
   // --- Accessors ---
 

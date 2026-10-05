@@ -1079,11 +1079,16 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // Back off the requested size until it fits the filesystem's free space (or give up quietly).
   {
     static FsSpoolStore _spool_store;
+    static FsSpoolStore _spool_hdr_store;
     uint32_t want = COLLECTOR_SPOOL_SIZE, got = 0;
     while (want >= 32768 && (got = _spool_store.begin(*_fs, "/collector_spool", want)) == 0) want /= 2;
     if (got) {
-      _collector.attachSpool(&_spool_store);
-      MESH_DEBUG_PRINTLN("Collector spool: %u bytes on flash", (unsigned)got);
+      // A tiny header file makes the spool durable: a recovered header replays the spilled backlog
+      // after a reboot/power-blip (the entry bytes already persist in the data file).
+      SpoolStore *hdr = _spool_hdr_store.begin(*_fs, "/collector_spool_hdr", 64) ? &_spool_hdr_store
+                                                                                 : nullptr;
+      _collector.attachSpool(&_spool_store, hdr);
+      MESH_DEBUG_PRINTLN("Collector spool: %u bytes on flash%s", (unsigned)got, hdr ? " (durable)" : "");
     } else {
       MESH_DEBUG_PRINTLN("Collector spool: disabled (insufficient flash space)");
     }
@@ -1735,6 +1740,16 @@ void MyMesh::loop() {
       if (!_collector.drain()) break;
     }
   }
+
+#if defined(ESP32) && defined(COLLECTOR_SPOOL_SIZE) && (COLLECTOR_SPOOL_SIZE > 0)
+  // Periodically checkpoint the durable spool header (no-op unless durable + dirty). ~5s keeps
+  // flash wear negligible while bounding how much of a backlog a crash can lose.
+  static unsigned long next_spool_persist = 0;
+  if (millisHasNowPassed(next_spool_persist)) {
+    _collector.persistSpool();
+    next_spool_persist = futureMillis(5000);
+  }
+#endif
 
   // update uptime
   uint32_t now = millis();

@@ -1256,6 +1256,53 @@ void test_spool_resume_zero_replays_all() {
 }
 
 // ============================================================
+// Spool durability (header persist + recover across "reboot")
+// ============================================================
+
+// Persisted header lets a fresh FlashSpool (= reboot) recover the spilled backlog + next_seq.
+void test_spool_durable_recovers_after_reboot() {
+  MockSpoolStore data(4096);
+  MockSpoolStore hdr(64);
+  FlashSpool sp;
+  sp.begin(&data, &hdr);
+  TEST_ASSERT_TRUE(sp.durable());
+  for (uint32_t s = 1; s <= 5; s++) spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 10);
+  sp.persistHeader(100);   // owner next_seq high-water = 100
+
+  FlashSpool sp2;          // reboot: same backing stores, fresh index
+  sp2.begin(&data, &hdr);
+  TEST_ASSERT_EQUAL_UINT32(5, sp2.count());
+  TEST_ASSERT_EQUAL_UINT32(5, sp2.newestSeq());
+  TEST_ASSERT_EQUAL_UINT32(100, sp2.restoredNextSeq());
+  uint8_t fill;
+  for (uint32_t s = 1; s <= 5; s++) {
+    TEST_ASSERT_EQUAL_UINT32(s, spool_drain_one(sp2, &fill));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)s, fill);
+  }
+}
+
+// A garbage/blank header is rejected (CRC/magic) -> spool starts empty, never reads stale bytes.
+void test_spool_durable_bad_header_starts_empty() {
+  MockSpoolStore data(4096);
+  MockSpoolStore hdr(64);   // all zeros -> bad magic
+  FlashSpool sp;
+  sp.begin(&data, &hdr);
+  TEST_ASSERT_EQUAL_UINT32(0, sp.count());
+  TEST_ASSERT_FALSE(sp.hasUnsent());
+}
+
+// Without a header store, a reboot abandons the spool (non-durable v1 behavior).
+void test_spool_non_durable_no_recovery() {
+  MockSpoolStore data(4096);
+  FlashSpool sp;
+  sp.begin(&data);
+  for (uint32_t s = 1; s <= 3; s++) spool_append(sp, COLLECTOR_RX_RAW, s, (uint8_t)s, 10);
+  FlashSpool sp2;
+  sp2.begin(&data);        // no hdr -> fresh
+  TEST_ASSERT_EQUAL_UINT32(0, sp2.count());
+}
+
+// ============================================================
 // Flood-duplicate collapse (RX_DUP)
 // ============================================================
 
@@ -1447,6 +1494,39 @@ void test_integration_both_tiers_full_drops_oldest() {
   TEST_ASSERT_TRUE(first > 1);           // oldest was dropped (both tiers overflowed)
 }
 
+// Durable spool across a CollectorSerial "reboot": spilled entries survive and _next_seq resumes
+// above the high-water mark so a post-reboot write never reuses a seq.
+void test_integration_durable_reboot_resumes() {
+  MockSpoolStore data(8192);
+  MockSpoolStore hdr(64);
+
+  CollectorSerial cs;
+  setup_cs(cs);
+  cs.attachSpool(&data, &hdr);
+  uint8_t pay[20];
+  for (uint32_t s = 1; s <= 40; s++) { memset(pay, (uint8_t)s, 20); cs.ringWrite(COLLECTOR_RX_RAW, pay, 20); }
+  TEST_ASSERT_TRUE(cs.getSpoolCount() > 0);   // some spilled to flash
+  cs.persistSpool();
+
+  CollectorSerial cs2;                        // reboot: RAM ring gone, re-attach same flash
+  setup_cs(cs2);
+  cs2.attachSpool(&data, &hdr);
+
+  // Spilled backlog recovered + replayable.
+  ms.written.clear();
+  bool any = false;
+  uint32_t prev = 0;
+  while (cs2.drain()) {
+    any = true;
+  }
+  TEST_ASSERT_TRUE(any);
+  // A new capture must get a seq above everything ever assigned (no reuse -> no host seq-reset).
+  memset(pay, 0xEE, 20);
+  cs2.ringWrite(COLLECTOR_RX_RAW, pay, 20);
+  TEST_ASSERT_TRUE(cs2.getNewestSeq() > 40);
+  (void)prev;
+}
+
 // ============================================================
 // Unity test runner
 // ============================================================
@@ -1538,6 +1618,11 @@ int main(int argc, char **argv) {
   RUN_TEST(test_spool_resume_replays_from);
   RUN_TEST(test_spool_resume_zero_replays_all);
 
+  // Spool durability
+  RUN_TEST(test_spool_durable_recovers_after_reboot);
+  RUN_TEST(test_spool_durable_bad_header_starts_empty);
+  RUN_TEST(test_spool_non_durable_no_recovery);
+
   // Flood-duplicate collapse
   RUN_TEST(test_dedup_collapses_flood_paths);
   RUN_TEST(test_dedup_distinct_not_collapsed);
@@ -1548,6 +1633,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_integration_ack_across_tiers);
   RUN_TEST(test_integration_resume_replays_all);
   RUN_TEST(test_integration_both_tiers_full_drops_oldest);
+  RUN_TEST(test_integration_durable_reboot_resumes);
 
   // Bug fix regression tests
   RUN_TEST(test_full_ring_drain_works);
