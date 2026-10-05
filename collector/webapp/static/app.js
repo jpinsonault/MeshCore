@@ -240,7 +240,10 @@ function buildEntries() {
     for (const j of (st.queued || [])) jobs.push(j);
     for (const j of jobs) {
       if (j.kind === "sweep") sweeping = true;
-      else if (j.target_hash != null) crackingHashes.add(j.target_hash);
+      else if (j.kind === "multiword") {
+        if (j.target_hash != null) crackingHashes.add(j.target_hash);
+        else sweeping = true;
+      } else if (j.target_hash != null) crackingHashes.add(j.target_hash);
     }
     if (st.running && st.target_hash != null) crackingHashes.add(st.target_hash);
   }
@@ -277,7 +280,14 @@ function buildEntries() {
   // Unknown / exhausted come from /api/pending.
   for (const p of state.pending) {
     const isExh = !!p.exhausted;
-    const isCracking = sweeping || crackingHashes.has(p.hash);
+    // A running sweep only grinds bytes it's actually eligible to crack: not
+    // already exhausted (subsumed by a prior/equal sweep) and with >=2 distinct
+    // undecoded packets to corroborate a hit. Painting *every* pending byte as
+    // "cracking" during a sweep was misleading — it made already-swept bytes
+    // (incl. a named channel's collision sibling, e.g. Public's) look like they
+    // were being re-cracked.
+    const sweepEligible = sweeping && !isExh && (p.undecoded_distinct || 0) >= 2;
+    const isCracking = crackingHashes.has(p.hash) || sweepEligible;
     entries.push({
       key: "hash:" + p.hash,
       kind: isExh ? "exhausted" : "unknown",
