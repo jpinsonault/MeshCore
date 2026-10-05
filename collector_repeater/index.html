@@ -960,12 +960,16 @@ MESHCORE_PASSWORD=&lt;admin password&gt;
      verify_flash 0x10000 .pio/build/Heltec_v3_collector_wifi/firmware.bin</code>
    Settings, identity and ACL survive a firmware flash. <strong>Never run <code>pio run -t uploadfs</code></strong>: it replaces the whole
    filesystem, wiping the node's key, settings, ACL and WiFi config.</li>
+<li>Change the admin password from the default. <code>wifi on</code> <strong>refuses to start</strong> while the password is unset or
+   still the stock <code>password</code>, because the network links grant the full admin CLI plus firmware flashing behind
+   it, in cleartext over the LAN:
+   <code>password &lt;new admin password&gt;</code></li>
 <li>Join WiFi, either from the config page's WiFi card (below) or in a serial terminal:
    <code>wifi ssid &lt;network name&gt;
    wifi pass &lt;wifi password&gt;
    wifi on
    wifi status</code></li>
-<li>Change the admin password from the default (<code>password</code>), then <code>reboot</code>.</li>
+<li><code>reboot</code> so the new admin password also applies to network firmware updates (they use the password at boot).</li>
 <li>Fill in <code>.env</code>. From then on the cable is only needed for power.</li>
 </ol>
 <h2 id="day-to-day">Day to day</h2>
@@ -990,7 +994,7 @@ collector/.venv/Scripts/python -m collector.server --port socket://&lt;host&gt;:
 </code></pre>
 <p>The node keeps buffering while no collector is connected (128KB ring, roughly 1,000–2,500 packets) and replays
 from where the host left off when it reconnects.</p>
-<p><strong>Monitoring the link.</strong> The cracker web app's <strong>Device &amp; link</strong> view (and the topbar badge: <em>fresh</em> / <em>stale Nm</em> /
+<p><strong>Monitoring the link.</strong> The channel-tools web app's <strong>Device &amp; link</strong> view (and the topbar badge: <em>fresh</em> / <em>stale Nm</em> /
 <em>LINK DOWN</em>) shows how fresh the capture is, so a dropped device is obvious instead of surfacing as hours-old
 messages. If the device vanishes off WiFi, the host notices within ~45s (<code>core.LINK_IDLE_TIMEOUT</code>) and reconnects
 on its own once the node is back — no service restart needed. Link up/down events are logged to <code>connection_events</code>,
